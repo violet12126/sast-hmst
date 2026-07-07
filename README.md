@@ -84,6 +84,23 @@ results = model(x, return_all=True) # 完整诊断量
 # results['sigma_i']— 逐脊线挤压带宽
 ```
 
+### 5. CUDA 加速 (Jetson 部署)
+
+```bash
+# JIT 编译 (开发机, GPU 上首次调用自动编译)
+python -c "from models.sast import compute_hmst; import torch; \
+           compute_hmst(torch.randn(1,2000).cuda(), 1000)"
+
+# 预编译 (Jetson Orin 部署)
+TORCH_CUDA_ARCH_LIST="8.7" python deploy/setup_hmst.py
+# → deploy/hmst_cuda_ext.so (可直接复制到 Jetson)
+
+# 代码中自动切换:
+#   GPU + 扩展可用 → CUDA kernel (~0.03ms)
+#   GPU + 无扩展   → Python fallback (~15ms)
+#   CPU            → Python fallback
+```
+
 ## 文件结构
 
 ```

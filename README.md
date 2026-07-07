@@ -44,25 +44,43 @@ python plot_hmst_tfr.py
 
 ```bash
 python train_sast.py --epochs 20 --lr 0.001 --batch_size 4 --hmst_order 2
+# 输出: sast_checkpoints/sast_v2_model.pt
 ```
 
-### 3. API 调用
+### 3. 推理：用训练好的 SAST 绘制 TFR
+
+```bash
+# 三面板对比图 (STFT vs SAST TFR + C_i 决策曲线)
+python infer_sast.py -c sast_checkpoints/sast_v2_model.pt \
+    -d 5_dataset.npz --class 1 -o sast_tfr.png
+
+# 六面板全诊断 (含 σ_sq 带宽热力图 + A_ij 因果推理探针)
+python infer_sast.py -c sast_checkpoints/sast_v2_model.pt \
+    -d 5_dataset.npz --class 1 --mode full -o sast_full.png
+
+# 批量导出增强特征 → 下游分类/聚类
+python infer_sast.py -c sast_checkpoints/sast_v2_model.pt \
+    -d 5_dataset.npz --mode batch -o sast_features.npy
+```
+
+### 4. Python API 调用
 
 ```python
 import torch
 from models.sast import compute_hmst, compute_hmst_if, SAST
+from infer_sast import load_sast, infer_sast
 
 # --- HMST: 时频分析 ---
 x = torch.randn(1, 2000)  # [B, T]
 tfr, IF, mag = compute_hmst(x, fs=1000, order=2, M=2)
 
-# --- SAST: 自适应挤压 ---
-model = SAST(fs=1000, K_ridges=6, hmst_order=2)
-tfr_enhanced = model(x)  # [B, F_bins, T_frames]
-# 或获取完整诊断量:
-results = model(x, return_all=True)
-# results['C_i']    — Compressibility Token
-# results['A_ij']   — Edge Attention (诊断探针)
+# --- SAST: 加载训练好的模型 + 推理 ---
+model = load_sast('sast_v2_model.pt')
+tfr = infer_sast(model, x)         # 仅增强 TFR [F, T]
+results = model(x, return_all=True) # 完整诊断量
+# results['C_i']    — Compressibility Token (每条脊线的可信度)
+# results['A_ij']   — Edge Attention (因果推理诊断探针)
+# results['gate']   — 原型匹配门控
 # results['sigma_i']— 逐脊线挤压带宽
 ```
 
@@ -75,6 +93,7 @@ sast-hmst/
 │   └── sast_losses.py    # SAST 损失函数
 ├── plot_hmst_tfr.py      # WSST vs HMST N=1 vs N=2 可视化
 ├── train_sast.py         # SAST 训练脚本
+├── infer_sast.py         # SAST 推理 + 可视化 (训练后使用)
 ├── docs/
 │   ├── cuda_deploy_plan.md   # CUDA 部署方案
 │   ├── architecture.md       # 架构总览

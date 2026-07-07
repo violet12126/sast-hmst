@@ -28,21 +28,9 @@ Signal → HMST IF → BlindRidgeExtractor → Anonymous Graph
 
 GAT 不做 IF 修正（避免错位），只输出 Compressibility Token C_i 控制挤压带宽。
 
-## 安装
 
-```bash
-# conda 环境
-conda create -n sast python=3.10 -y
-conda activate sast
 
-# 依赖
-pip install torch>=2.1.0 numpy scipy matplotlib scikit-learn ssqueezepy
-
-# CUDA 部署 (可选)
-# 见 docs/cuda_deploy_plan.md
-```
-
-## 快速开始
+## 脚本说明
 
 ### 1. 绘制 HMST 时频图
 
@@ -104,6 +92,4 @@ sast-hmst/
 - Daubechies, I., Lu, J., & Wu, H.-T. "Synchrosqueezed wavelet transforms: An empirical mode decomposition-like tool." *Applied and Computational Harmonic Analysis*, 2011.
 - Veličković, P. et al. "Graph Attention Networks." *ICLR*, 2018.
 
-## License
 
-MIT

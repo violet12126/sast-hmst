@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 生成图片
+hmst_figures/
+
+# 训练产物
+sast_checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# 数据集 (太大, 不入库)
+*.npz
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 系统
+.DS_Store
+Thumbs.db

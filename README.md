@@ -1,0 +1,109 @@
+# SAST-HMST: Structure-Aware Synchrosqueezing with High-Order Multi-Synchrosqueezing
+
+基于高阶多同步压缩变换（HMST）的结构感知时频分析框架，面向旋转机械故障诊断的可解释自监督表征学习。
+
+## 概述
+
+本项目实现了两条互补的技术路线：
+
+| 模块 | 论文 | 功能 |
+|------|------|------|
+| **HMST** | Bao et al. (2023) "High-Order Multisynchrosqueezing Transform" | N 阶瞬时频率估计 + M 次幅值挤压 → 高精度 TFR |
+| **SAST** | 本项目原创 | 物理原型记忆 + 匿名全连接图 + GAT 信任分配 → 自适应挤压 |
+
+### HMST (High-Order Multi-Synchrosqueezing Transform)
+
+- **N=1**: 一阶 IF（标准 SST 级精度）
+- **N=2**: 二阶 IF（通过 2×2 上三角矩阵求解，对线性调频无偏）
+- **M 次挤压**: 迭代能量集中，sparsity 从 0% → 73%
+- **幅值累加**: 避免 PyTorch 非调制 STFT 的相位不一致问题（与 ssqueezepy 验证 corr=0.9999）
+
+### SAST (Structure-Aware Synchrosqueezing Transform)
+
+```
+Signal → HMST IF → BlindRidgeExtractor → Anonymous Graph
+  → PhysicsPrototypeMemory → EdgeConditionedGAT → C_i
+  → AdaptiveSqueeze → Physical TFR
+```
+
+GAT 不做 IF 修正（避免错位），只输出 Compressibility Token C_i 控制挤压带宽。
+
+## 安装
+
+```bash
+# conda 环境
+conda create -n sast python=3.10 -y
+conda activate sast
+
+# 依赖
+pip install torch>=2.1.0 numpy scipy matplotlib scikit-learn ssqueezepy
+
+# CUDA 部署 (可选)
+# 见 docs/cuda_deploy_plan.md
+```
+
+## 快速开始
+
+### 1. 绘制 HMST 时频图
+
+```bash
+# 需要 5_dataset.npz 在根目录
+python plot_hmst_tfr.py
+# 输出: hmst_figures/ (7 张图: 5×逐类 + IF 叠加 + 汇总)
+```
+
+### 2. 训练 SAST
+
+```bash
+python train_sast.py --epochs 20 --lr 0.001 --batch_size 4 --hmst_order 2
+```
+
+### 3. API 调用
+
+```python
+import torch
+from models.sast import compute_hmst, compute_hmst_if, SAST
+
+# --- HMST: 时频分析 ---
+x = torch.randn(1, 2000)  # [B, T]
+tfr, IF, mag = compute_hmst(x, fs=1000, order=2, M=2)
+
+# --- SAST: 自适应挤压 ---
+model = SAST(fs=1000, K_ridges=6, hmst_order=2)
+tfr_enhanced = model(x)  # [B, F_bins, T_frames]
+# 或获取完整诊断量:
+results = model(x, return_all=True)
+# results['C_i']    — Compressibility Token
+# results['A_ij']   — Edge Attention (诊断探针)
+# results['sigma_i']— 逐脊线挤压带宽
+```
+
+## 文件结构
+
+```
+sast-hmst/
+├── models/
+│   ├── sast.py           # HMST + SAST 完整实现 (~1500 行)
+│   └── sast_losses.py    # SAST 损失函数
+├── plot_hmst_tfr.py      # WSST vs HMST N=1 vs N=2 可视化
+├── train_sast.py         # SAST 训练脚本
+├── docs/
+│   ├── cuda_deploy_plan.md   # CUDA 部署方案
+│   ├── architecture.md       # 架构总览
+│   ├── parameters.md         # 参数参考
+│   └── visualization.md      # 可视化说明
+└── papers/
+    ├── HMST_paper.md         # Bao et al. 2023 论文笔记
+    ├── SAST_v2_design.md     # SAST v2 设计文档
+    └── 发展脉络_HMST_to_SAST.md  # 发展脉络
+```
+
+## 引用
+
+- Bao, W. et al. "Application of High-Order Multisynchrosqueezing Transform in Fault Diagnosis of Pump-Turbines." *Measurement*, 2023.
+- Daubechies, I., Lu, J., & Wu, H.-T. "Synchrosqueezed wavelet transforms: An empirical mode decomposition-like tool." *Applied and Computational Harmonic Analysis*, 2011.
+- Veličković, P. et al. "Graph Attention Networks." *ICLR*, 2018.
+
+## License
+
+MIT

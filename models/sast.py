@@ -127,6 +127,19 @@ def _gaussian_tw_window(n_fft, sigma, device='cpu', dtype=torch.float32):
     return t * g
 
 
+def _gaussian_t2w_window(n_fft, sigma, device='cpu', dtype=torch.float32):
+    """
+    二阶矩窗 t²·w(t)。
+    用于论文 eq (14) 的 a_{k,1} 系数 (k=3): V_x^{t²w}
+    注: t 用样本索引 (与 _gaussian_tw_window 一致), 与导数窗的 fs 缩放
+        在 a_{k,1}·P_k 乘积中相互抵消, 故 N=3 与 N=2 量纲自洽。
+    """
+    t = torch.arange(n_fft, device=device, dtype=dtype) - n_fft / 2.0 + 0.5
+    p = (math.pi * sigma ** 2) ** (-0.25)
+    g = p * torch.exp(-t ** 2 / (2.0 * sigma ** 2))
+    return t ** 2 * g
+
+
 def _fft_freq_axis(N, device='cpu', dtype=torch.float32):
     """
     频域微分用频率轴 (radians)。
@@ -147,7 +160,7 @@ def compute_hmst_if(x, fs, n_fft=512, hop_length=128, order=2, sigma=None):
     """
     HMST 高阶瞬时频率估计 (Bao et al., 2023, eq 16-18)。
 
-    参照 ssqueezepy 的实现规范:
+    参照 ssqueezepy 的实现:
       - STFT 用 PyTorch (非调制), 通过 jω 项补偿相位
       - 导数窗用 FFT 频域微分 + fs 缩放 (与 ssqueezepy _stft.py 一致)
       - 相位变换: w = Im(b₁)/(2π)  (含 jω 项), 等价于 ssqueezepy 的 phase_stft
@@ -157,13 +170,16 @@ def compute_hmst_if(x, fs, n_fft=512, hop_length=128, order=2, sigma=None):
         fs:         采样率 (Hz)
         n_fft:      FFT 点数
         hop_length: 帧移
-        order:      IF 估计阶数 (1 或 2)
+        order:      IF 估计阶数 (1, 2 或 3)
         sigma:      高斯窗 σ (样本数), 默认 n_fft/8
 
     Returns:
         IF:   [B, F_bins, T_if] 瞬时频率 (Hz)
         mag:  [B, F_bins, T_frames] STFT 幅度谱
     """
+    if order not in (1, 2, 3):
+        raise ValueError(f"order 必须为 1, 2 或 3, 收到 {order}")
+
     if x.dim() == 1:
         x = x.unsqueeze(0)
 
@@ -227,8 +243,24 @@ def compute_hmst_if(x, fs, n_fft=512, hop_length=128, order=2, sigma=None):
         return IF, mag
 
     # ══════════════════════════════════════════════════════════
-    # N=2: 二阶 HMST — N×N 上三角矩阵求解 Q₁
+    # N≥2: 高阶 HMST — N×N 上三角矩阵求解 Q₁ (论文 eq 16-17)
     # ══════════════════════════════════════════════════════════
+
+    # ── ∂_ω 沿频率轴中心差分 ──
+    def _freq_deriv(z):
+        """∂_ω 中心差分, dim=1 为频率轴, 二阶精度"""
+        z_pad = F.pad(z, (0, 0, 1, 1), mode='replicate')
+        return (z_pad[:, 2:, :] - z_pad[:, :-2, :]) / (2.0 * domega)
+
+    def _safe_cdiv(num, den):
+        """复数伪逆除法 num/den → num·conj(den)/(|den|²+eps)。
+        ★ den 是复数, 加实数 eps 无法防止 |den|→0 时发散, 故用伪逆。"""
+        den_abs2 = den.real ** 2 + den.imag ** 2 + eps
+        return num * den.conj() / den_abs2
+
+    def _clamp_c(z, lim):
+        """分别钳制复数实/虚部, 防止噪声区高阶修正项飞到几万 Hz。"""
+        return z.real.clamp(-lim, lim) + 1j * z.imag.clamp(-lim, lim)
 
     # ── V^{t·w}: 一阶矩窗 STFT (无需 fs 缩放, 非导数窗) ──
     w_tw = _gaussian_tw_window(n_fft, sigma, device=device)
@@ -239,37 +271,53 @@ def compute_hmst_if(x, fs, n_fft=512, hop_length=128, order=2, sigma=None):
         normalized=False, onesided=True,
         return_complex=True,
     )  # [B, F, T_frames]
-
     V_tw_mid = V_tw[:, :, 1:T_frames - 1]  # [B, F, T_if]
 
-    # ── a_{2,1} = V^{tw} / V^w (论文 eq 14, k=2) ──
-    a21 = V_tw_mid / V_w_safe  # [B, F, T_if]
+    # ── a_{2,1} = V^{tw}/V^w, b₂ = ∂_ω b₁ / ∂_ω a_{2,1} (论文 eq 14/16, k=2) ──
+    a21 = V_tw_mid / V_w_safe                    # [B, F, T_if]
+    d_b1 = _freq_deriv(b1)                       # ∂_ω b₁
+    d_a21 = _freq_deriv(a21)                     # ∂_ω a_{2,1}
+    b2 = _clamp_c(_safe_cdiv(d_b1, d_a21), fs)   # [B, F, T_if]
 
-    # ── ∂_ω 沿频率轴中心差分 ──
-    def _freq_deriv(z):
-        """∂_ω 中心差分, dim=1 为频率轴, 二阶精度"""
-        z_pad = F.pad(z, (0, 0, 1, 1), mode='replicate')
-        return (z_pad[:, 2:, :] - z_pad[:, :-2, :]) / (2.0 * domega)
+    if order == 2:
+        # ── 反向代入: Q₂ = b₂, Q₁ = b₁ - a₂₁·Q₂ (论文 eq 17, N=2) ──
+        Q1 = b1 - a21 * b2  # [B, F, T_if]
+    else:
+        # ══════════════════════════════════════════════════════
+        # N=3: 增加 t²w 窗, 上三角扩为 3×3 (论文 eq 16-17, N=3)
+        #   代价: 需两层 ∂_ω 频率微分, 对噪声比 N=2 更敏感
+        # ══════════════════════════════════════════════════════
 
-    d_b1 = _freq_deriv(b1)     # ∂_ω b₁  [B, F, T_if]
-    d_a21 = _freq_deriv(a21)   # ∂_ω a_{2,1}  [B, F, T_if]
+        # ── V^{t²·w}: 二阶矩窗 STFT (论文 eq 14, k=3) ──
+        w_t2w = _gaussian_t2w_window(n_fft, sigma, device=device)
+        V_t2w = torch.stft(
+            x, n_fft=n_fft, hop_length=hop_length,
+            win_length=n_fft, window=w_t2w,
+            center=True, pad_mode='reflect',
+            normalized=False, onesided=True,
+            return_complex=True,
+        )  # [B, F, T_frames]
+        V_t2w_mid = V_t2w[:, :, 1:T_frames - 1]  # [B, F, T_if]
 
-    # ── b₂ = ∂_ω b₁ / ∂_ω a_{2,1} (论文 eq 16, k=2) ──
-    # ★ 数值稳定性: d_a21 是复数, 加实数 eps 无法防止 |d_a21| → 0 时发散
-    #    → 使用复数伪逆: b₂ = d_b1 · conj(d_a21) / (|d_a21|² + eps)
-    d_a21_abs2 = d_a21.real ** 2 + d_a21.imag ** 2 + eps
-    b2 = d_b1 * d_a21.conj() / d_a21_abs2  # [B, F, T_if]
+        # ── a_{3,1} = V^{t²w}/V^w (论文 eq 14, i=3, j=1) ──
+        a31 = V_t2w_mid / V_w_safe               # [B, F, T_if]
 
-    # ★ 强制截断 b₂: 噪声区域的高阶修正项不可信, 防止 IF 飞到几万 Hz
-    #    b₂ 的量纲 ≈ 频率偏移/时间, 合理范围在 ±fs 内
-    b2_real = b2.real.clamp(-fs, fs)
-    b2_imag = b2.imag.clamp(-fs, fs)
-    b2 = b2_real + 1j * b2_imag
+        # ── a_{3,2} = ∂_ω a_{3,1} / ∂_ω a_{2,1} (论文 eq 16, i=3, j=2) ──
+        d_a31 = _freq_deriv(a31)
+        a32 = _safe_cdiv(d_a31, d_a21)           # [B, F, T_if]
 
-    # ── 反向代入: Q₂ = b₂, Q₁ = b₁ - a₂₁·Q₂ (论文 eq 17) ──
-    Q1 = b1 - a21 * b2  # [B, F, T_if]
+        # ── b₃ = ∂_ω b₂ / ∂_ω a_{3,2} (论文 eq 16, k=3) ──
+        d_b2 = _freq_deriv(b2)
+        d_a32 = _freq_deriv(a32)
+        b3 = _clamp_c(_safe_cdiv(d_b2, d_a32), fs)  # [B, F, T_if]
 
-    # ── ω̂_{[2]} = Im(Q₁) / 2π (论文 eq 18, N≥2 分支) ──
+        # ── 反向代入 (论文 eq 17, N=3) ──
+        #   P₃ = b₃;  P₂ = b₂ - a₃₂·P₃;  Q₁ = b₁ - a₂₁·P₂ - a₃₁·P₃
+        P3 = b3
+        P2 = b2 - a32 * P3
+        Q1 = b1 - a21 * P2 - a31 * P3  # [B, F, T_if]
+
+    # ── ω̂_{[N]} = Im(Q₁) / 2π (论文 eq 18, N≥2 分支) ──
     IF = torch.imag(Q1) / (2.0 * math.pi)
 
     # 钳制: 无效估计回退到 STFT 中心频率
@@ -421,7 +469,7 @@ def compute_hmst(x, fs, n_fft=512, hop_length=128, order=2, M=2,
         fs:      采样率 (Hz)
         n_fft:   FFT 点数
         hop_length: 帧移
-        order:   IF 估计阶数 (1 或 2)
+        order:   IF 估计阶数 (1, 2 或 3)
         M:       挤压迭代次数 (≥1)
         sigma:   高斯窗 σ
 
@@ -1450,7 +1498,8 @@ class SAST(nn.Module):
         K_ridges:         匿名脊线数
         sigma_min:        最小挤压带宽 (bin)
         sigma_max:        最大挤压带宽 (bin)
-        hmst_order:       HMST IF 估计阶数 (1=标准一阶, 2=二阶对线性调频无偏)
+        hmst_order:       HMST IF 估计阶数 (1=标准一阶, 2=二阶对线性调频无偏,
+                          3=三阶对二次调频/强时变 IF 无偏)
         hmst_sigma:       高斯窗 σ (样本数), 默认 n_fft/8
     """
 
@@ -1479,6 +1528,9 @@ class SAST(nn.Module):
         if hmst_order >= 2:
             self.register_buffer('_w_tw',
                                  _gaussian_tw_window(n_fft, self.hmst_sigma, dtype=dtype))
+        if hmst_order >= 3:
+            self.register_buffer('_w_t2w',
+                                 _gaussian_t2w_window(n_fft, self.hmst_sigma, dtype=dtype))
 
         # ── 8a. Blind Ridge Extractor ──
         self.ridge_extractor = BlindRidgeExtractor(K=K_ridges, fs=fs)

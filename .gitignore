@@ -6,6 +6,10 @@ __pycache__/
 dist/
 build/
 
+# 编译的 CUDA 扩展 (架构相关二进制, 各机器自行编译)
+*.pyd
+*.so
+
 # 生成图片
 hmst_figures/
 

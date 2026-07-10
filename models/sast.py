@@ -20,7 +20,6 @@ SAST: Structure-Aware Synchrosqueezing Transform
   SST 基线: ssqueezepy (Daubechies, J. & Brevdo, E.)
   GAT 架构: Veličković et al. "Graph Attention Networks" (ICLR 2018)
 
-Author: TFDCL Project
 """
 import torch
 import torch.nn as nn
@@ -351,9 +350,16 @@ def _load_hmst_cuda():
         return _hmst_cuda_ext
     _hmst_cuda_attempted = True
 
-    # 路径 1: 预编译扩展 (Jetson 部署)
+    # 路径 1: 预编译扩展 (deploy/ 或 sys.path 内 .pyd/.so)
+    #   优势: 直接 import 已编译的 .pyd, 绕开 torch.load() 的源码哈希步骤,
+    #   无需 MSVC, 也无需 PYTHONUTF8。在开发环境用 setup_hmst.py 或
+    #   compile_hmst_cuda.py (缓存→拷贝到 deploy/) 产出。
     try:
-        import importlib
+        import os, sys, importlib
+        _deploy_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', 'deploy')
+        if _deploy_dir not in sys.path:
+            sys.path.insert(0, _deploy_dir)
         _hmst_cuda_ext = importlib.import_module('hmst_cuda_ext')
         return _hmst_cuda_ext
     except ImportError:
@@ -371,7 +377,11 @@ def _load_hmst_cuda():
             _hmst_cuda_ext = load(
                 name='hmst_cuda_ext',
                 sources=[src_path],
-                extra_cuda_cflags=['-O3', '--use_fast_math'],
+                # -allow-unsupported-compiler: VS2019 + CUDA 11.8 组合必需,
+                #   否则报 "unsupported Microsoft Visual Studio version" 编译失败。
+                #   与 deploy/compile_hmst_cuda.py 的 flag 保持一致。
+                extra_cuda_cflags=['-O3', '--use_fast_math',
+                                   '-allow-unsupported-compiler'],
                 verbose=False,
             )
     except Exception:
@@ -533,7 +543,7 @@ def compute_sst_baseline(x_np, fs, n_fft=512, hop_length=128):
         x_np, fs=fs,
         window='hann', n_fft=n_fft,
         win_len=n_fft, hop_len=hop_length,
-        squeezing='full',
+        squeezing='sum',
         padtype='reflect',
     )
     return Tx, Wx, ssq_freqs
@@ -791,16 +801,20 @@ def compute_hmst_cwt(x_np, fs, nv=32, M=2, freq_max=200, F_bins=257, wavelet='mo
 # ============================================================
 
 PUMP_TURBINE_PROTOTYPES = {
+    # 本机参数: Z_r=9 (转轮叶片), Z_s=20 (活动导叶), f_r=5.56 Hz
+    # ν = floor(Z_s/Z_r) = floor(20/9) = 2
+    # RSI f_s = ν × BPF = 2 × 50 = 100 Hz (与 2×BPF 同频, 物理上为动静干涉)
     'prototypes': [
         {'name': 'fr',       'f_nom': 5.56,  'f_type': 'ROTATION',       'C_prior': 0.90},
         {'name': 'RSI_low',  'f_nom': 2.4,   'f_type': 'VORTEX_ROPE',    'C_prior': 0.30},
         {'name': 'RSI_turb', 'f_nom': 8.35,  'f_type': 'TURBULENCE',     'C_prior': 0.30},
         {'name': 'BPF',      'f_nom': 50.0,  'f_type': 'BLADE_PASS',     'C_prior': 1.00},
-        {'name': '2xBPF',    'f_nom': 100.0, 'f_type': 'BLADE_HARMONIC', 'C_prior': 1.00},
+        {'name': '2xBPF',    'f_nom': 100.0, 'f_type': 'RSI',
+         'C_prior': 1.00},   # 本机 ν=2 → RSI≡2×BPF; 
         {'name': 'GPF',      'f_nom': 111.1, 'f_type': 'GUIDE_VANE',     'C_prior': 0.95},
         {'name': '3xBPF',    'f_nom': 150.0, 'f_type': 'BLADE_HARMONIC', 'C_prior': 1.00},
     ],
-    'temperature': 0.08,  # 频率匹配温度: 越小 → gate 越陡峭 (τ=0.08 → 5%频偏时 gate衰减50%)
+    'temperature': 0.08,  # τ=0.08 → gate 在 ~9.4% 频偏处衰减至 50%
 }
 
 

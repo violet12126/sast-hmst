@@ -1,34 +1,41 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.so
 *.egg-info/
 dist/
 build/
+*.egg
 
-# 编译的 CUDA 扩展 (架构相关二进制, 各机器自行编译)
+# CUDA build artifacts
 *.pyd
-*.so
+*.exp
+*.lib
+*.obj
 
-# 生成图片
+# Figures
 hmst_figures/
 
-# 训练产物
-sast_checkpoints/
-*.pt
-*.pth
-*.onnx
-
-# 数据集 (太大, 不入库)
+# Data (large files)
 *.npz
+data/
 
 # IDE
 .vscode/
 .idea/
 
+# OS
+.DS_Store
+Thumbs.db
+
+# Third-party code copies
+MSST_Y/
+WSST2-master/
+Synchrosqueezed-chirplet-transforms-main/
+
 # Jupyter
 .ipynb_checkpoints/
 
-# 系统
-.DS_Store
-Thumbs.db
+# Temp
+*.swp
+*.swo

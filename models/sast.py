@@ -1,1142 +1,230 @@
 """
-SAST: Structure-Aware Synchrosqueezing Transform
-================================================
-物理原型记忆引导的盲脊线可压缩性评估与自适应同步压缩。
+SAST: Structure-Aware Synchrosqueezing Transform (v3)
+=====================================================
+异构物理图 + 静态原型软匹配 + 自适应阶数 SST + 稀疏高斯重排.
 
-三角色范式:
-  1. Blind Ridge Extraction:  回答 "哪些频率分量存在？"     → 匿名脊线提取
-  2. Physics Prototype Memory + GAT: 回答 "每条脊线有多可信？" → C_i ∈ (0,1]
-  3. Adaptive Squeeze:         回答 "基于可信度如何重分配？"  → 确定性高斯软核
+核心架构:
+  Signal -> MSST (N_max, save_trajectory) -> Node Features + omegas
+  -> StaticPrototypeMatcher (soft matching) -> OperatingToken
+  -> PPM (ratio-gated + type-embed) -> GAT (6 edges) -> w_i
+  -> PerBinOrderSelector (w_i + convergence + structure) -> N*(eta,b)
+  -> SparseGaussianReassigner (banded sparse A_n) -> TFR_sast
 
-核心架构原则:
-  - SAST 是物理保真的预处理步骤，不是分类器
-  - GAT 唯一职责：输出 Compressibility Token C_i ∈ (0,1]，表征每条脊线的物理可信度
-  - σ_sq = σ_min + (1-C_i)·(σ_max-σ_min) — 确定性映射，无可学习参数
-  - A_ij 是 GAT 内部诊断探针（因果推理过程），不驱动下游计算
-  - Physics Prototype Memory 是外挂知识库（不变量标准尺），不定义图拓扑
-  - 图是匿名全连接图——每帧盲提 K 条脊线作为节点，不问出身
+物理图 (异构, 4 节点 / 6 边):
+  OP (virtual) --CONDITION--> LOW_FREQ, BPF, 2xBPF
+  LOW_FREQ <--DRIFT--> BPF
+  BPF --HARMONIC(r=2.0)--> 2xBPF
 
-引用:
-  SST 基线: ssqueezepy (Daubechies, J. & Brevdo, E.)
-  GAT 架构: Veličković et al. "Graph Attention Networks" (ICLR 2018)
+GAT 输出 w_i -> 四参数策略:
+  w_i   : IF 可信度 (GAT 直接输出)
+  sigma_i: 核宽 = sigma_min + (1-w_i)*Delta_sigma (连续, 可微)
+  lambda_i: 迭代深度 = round(w_i * N_max) (离散, 推理用)
+  IF 阶数: omegas 索引 = round(w_i * (N_max-1)) (离散, 推理用)
 
+模块分工:
+  models/tfr.py        - MSST (omega estimation + trajectory)
+  models/sast_nodes.py - MSSTNodeExtractor (per-region aggregation)
+  models/sast_graph.py - Heterogeneous physics graph topology + edge features
+  models/sast.py       - StaticPrototypeMatcher + PPM + GAT + PerBinOrderSelector
+                         + SparseGaussianReassigner + SAST (this file)
 """
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-import ssqueezepy
+from typing import Optional, Dict, List, Tuple
+
+from models.tfr import msst
+from models.sast_nodes import (
+    MSSTNodeExtractor, NodeFeatures, PUMP_TURBINE_REGIONS,
+    N_PHYSICS_NODES, FreqRegion,
+)
+from models.sast_graph import (
+    PHYSICS_EDGES, N_EDGES, N_NODES,
+    PHYSICS_NODE_INDICES,
+    compute_edge_features, get_graph_summary,
+    HARMONIC_EDGE_INDICES, CONDITION_EDGE_INDICES, DRIFT_EDGE_INDICES,
+    COMPETITION_EDGE_INDICES,
+)
 
 
-# ============================================================
-# 1. STFT + IF 估计 + SST 基线工具函数
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+# 0. Static Prototypes (from EDA on 5_dataset.npz)
+# ═══════════════════════════════════════════════════════════════
 
-def compute_stft(x, fs, n_fft=512, hop_length=128, window='hann'):
+STATIC_PROTOTYPES = torch.tensor([
+    [0.037636, 0.208980, 0.026644, 0.986240],  # Class 0: No-load
+    [0.068068, 0.832580, 0.010149, 1.987957],  # Class 1: Low load
+    [0.046170, 0.269881, 0.303809, 0.001379],  # Class 2: Mid load
+    [0.013093, 0.153476, 0.652464, -0.651019], # Class 3: High load
+    [0.021357, 0.685910, 0.099116, 0.850605],  # Class 4: Pumping
+], dtype=torch.float64)
+
+N_PROTOTYPES = STATIC_PROTOTYPES.shape[0]  # 5
+PROTOTYPE_DIM = STATIC_PROTOTYPES.shape[1]  # 4
+
+
+# ═══════════════════════════════════════════════════════════════
+# 1. StaticPrototypeMatcher
+# ═══════════════════════════════════════════════════════════════
+
+class StaticPrototypeMatcher(nn.Module):
     """
-    计算 STFT 短时傅里叶变换。
+    离线统计的 5 个工况原型 -> 在线软匹配.
+
+    不预测工况类别. 仅计算当前帧的能量分布 V_obs 与 5 个 frozen prototype
+    的余弦相似度 -> softmax -> 注意力权重 alpha.
+    alpha 不直接使用, 而是用于加权混合可学习的 prototype 解释嵌入 P_embed.
 
     Args:
-        x: [B, T] 或 [T] 原始信号
-        fs: 采样率 (Hz)
-        n_fft: FFT 点数
-        hop_length: 帧移
-        window: 窗函数类型
-
-    Returns:
-        X:         [B, F_bins, T_frames] complex STFT
-        freqs:     [F_bins] 频率轴 (Hz)
-        t_frames:  [T_frames] 时间轴 (s)
-    """
-    if x.dim() == 1:
-        x = x.unsqueeze(0)
-
-    B, T = x.shape
-    device = x.device
-
-    if window == 'hann':
-        win = torch.hann_window(n_fft, device=device)
-    elif window == 'hamming':
-        win = torch.hamming_window(n_fft, device=device)
-    else:
-        win = torch.ones(n_fft, device=device)
-
-    X = torch.stft(
-        x, n_fft=n_fft, hop_length=hop_length,
-        win_length=n_fft, window=win,
-        center=True, pad_mode='reflect',
-        normalized=False, onesided=True,
-        return_complex=True
-    )  # [B, F_bins, T_frames]
-
-    F_bins = X.shape[1]
-    T_frames = X.shape[2]
-
-    freqs = torch.linspace(0, fs / 2, F_bins, device=device)  # [F_bins]
-    t_frames = torch.arange(T_frames, device=device).float() * hop_length / fs
- 
-    return X, freqs, t_frames
-
-
-# ============================================================
-# 1b. HMST 高阶 IF 估计: 窗函数工具
-# ============================================================
-
-def _gaussian_window(n_fft, sigma, device='cpu', dtype=torch.float32):
-    """
-    单位 L2 范数高斯窗。
-    w(t) = (πσ²)^{-1/4} · exp(-t²/(2σ²))
-    论文 eq (5): p = (πσ²)^{-1/4}, q = -1/σ²
-    """
-    t = torch.arange(n_fft, device=device, dtype=dtype) - n_fft / 2.0 + 0.5
-    p = (math.pi * sigma ** 2) ** (-0.25)
-    w = p * torch.exp(-t ** 2 / (2.0 * sigma ** 2))
-    return w
-
-
-def _gaussian_deriv_window(n_fft, sigma, fs, device='cpu', dtype=torch.float32):
-    """
-    高斯窗的时间导数, 频域微分法 (与 ssqueezepy 一致)。
-
-    w'(t) = IFFT{ j·ξ·FFT{w(t)} } · fs
-
-    FFT-based differentiation ensures exact derivative of the discrete window.
-    Scaling by `fs` converts from per-sample to per-second derivative,
-    与 ssqueezepy _stft.py:135 `diff_window * fs` 一致。
-    """
-    w = _gaussian_window(n_fft, sigma, device=device, dtype=dtype)
-    # FFT → multiply by j·ξ → IFFT (频域微分)
-    wf = torch.fft.fft(w)
-    xi = _fft_freq_axis(n_fft, device=device, dtype=dtype)
-    diff = torch.fft.ifft(wf * 1j * xi).real
-    # 换算为物理时间 (秒) 的导数
-    diff = diff * fs
-    return diff
-
-
-def _gaussian_tw_window(n_fft, sigma, device='cpu', dtype=torch.float32):
-    """
-    一阶矩窗 t·w(t)。
-    用于论文 eq (14) 的 a_{k,1} 系数: V_x^{t^{k-1}w}
-    """
-    t = torch.arange(n_fft, device=device, dtype=dtype) - n_fft / 2.0 + 0.5
-    p = (math.pi * sigma ** 2) ** (-0.25)
-    g = p * torch.exp(-t ** 2 / (2.0 * sigma ** 2))
-    return t * g
-
-
-def _gaussian_t2w_window(n_fft, sigma, device='cpu', dtype=torch.float32):
-    """
-    二阶矩窗 t²·w(t)。
-    用于论文 eq (14) 的 a_{k,1} 系数 (k=3): V_x^{t²w}
-    注: t 用样本索引 (与 _gaussian_tw_window 一致), 与导数窗的 fs 缩放
-        在 a_{k,1}·P_k 乘积中相互抵消, 故 N=3 与 N=2 量纲自洽。
-    """
-    t = torch.arange(n_fft, device=device, dtype=dtype) - n_fft / 2.0 + 0.5
-    p = (math.pi * sigma ** 2) ** (-0.25)
-    g = p * torch.exp(-t ** 2 / (2.0 * sigma ** 2))
-    return t ** 2 * g
-
-
-def _fft_freq_axis(N, device='cpu', dtype=torch.float32):
-    """
-    频域微分用频率轴 (radians)。
-    N even: [0, 1, ..., N/2, -(N/2-1), ..., -1] * 2π/N
-    与 ssqueezepy wavelets._xifn 一致。
-    """
-    xi = torch.zeros(N, device=device, dtype=dtype)
-    h = 2.0 * math.pi / N
-    half = N // 2
-    for i in range(half + 1):
-        xi[i] = i * h
-    for i in range(half + 1, N):
-        xi[i] = (i - N) * h
-    return xi
-
-
-def compute_hmst_if(x, fs, n_fft=512, hop_length=128, order=2, sigma=None):
-    """
-    HMST 高阶瞬时频率估计 (Bao et al., 2023, eq 16-18)。
-
-    参照 ssqueezepy 的实现:
-      - STFT 用 PyTorch (非调制), 通过 jω 项补偿相位
-      - 导数窗用 FFT 频域微分 + fs 缩放 (与 ssqueezepy _stft.py 一致)
-      - 相位变换: w = Im(b₁)/(2π)  (含 jω 项), 等价于 ssqueezepy 的 phase_stft
-
-    Args:
-        x:          [B, T] 或 [T] 原始信号
-        fs:         采样率 (Hz)
-        n_fft:      FFT 点数
-        hop_length: 帧移
-        order:      IF 估计阶数 (1, 2 或 3)
-        sigma:      高斯窗 σ (样本数), 默认 n_fft/8
-
-    Returns:
-        IF:   [B, F_bins, T_if] 瞬时频率 (Hz)
-        mag:  [B, F_bins, T_frames] STFT 幅度谱
-    """
-    if order not in (1, 2, 3):
-        raise ValueError(f"order 必须为 1, 2 或 3, 收到 {order}")
-
-    if x.dim() == 1:
-        x = x.unsqueeze(0)
-
-    B = x.shape[0]
-    device = x.device
-
-    if sigma is None:
-        sigma = n_fft / 8.0
-
-    eps = 1e-8
-
-    # ── 1. 窗函数 ──
-    # 关键: 导数窗通过 IFFT{j·ξ·FFT{w}} 生成 (匹配 ssqueezepy get_window)
-    # 关键: 导数窗 × fs → 物理时间导数 (匹配 ssqueezepy _stft.py L135)
-    w_gauss = _gaussian_window(n_fft, sigma, device=device)
-    w_deriv = _gaussian_deriv_window(n_fft, sigma, fs, device=device)
-
-    # ── 2. STFT: V^w (高斯窗) + V^{w'} (导数窗, 已含 fs 缩放) ──
-    V_w = torch.stft(
-        x, n_fft=n_fft, hop_length=hop_length,
-        win_length=n_fft, window=w_gauss,
-        center=True, pad_mode='reflect',
-        normalized=False, onesided=True,
-        return_complex=True,
-    )  # [B, F, T_frames]
-
-    V_wp = torch.stft(
-        x, n_fft=n_fft, hop_length=hop_length,
-        win_length=n_fft, window=w_deriv,
-        center=True, pad_mode='reflect',
-        normalized=False, onesided=True,
-        return_complex=True,
-    )  # [B, F, T_frames]
-
-    F_bins = V_w.shape[1]
-    T_frames = V_w.shape[2]
-    T_if = T_frames - 2
-
-    # ── 3. 频率轴 ──
-    freqs_hz = torch.linspace(0, fs / 2, F_bins, device=device)
-    omega = 2.0 * math.pi * freqs_hz            # [F] rad/s
-    domega = 2.0 * math.pi * fs / n_fft         # Δω rad/s
-
-    # ── 4. 时间对齐: 丢弃首尾各一帧 ──
-    V_w_mid = V_w[:, :, 1:T_frames - 1]       # [B, F, T_if]
-    V_wp_mid = V_wp[:, :, 1:T_frames - 1]     # [B, F, T_if] (已含 fs)
-    omega_grid = omega.view(1, F_bins, 1)      # [1, F, 1]
-
-    # ── 5. b₁ = -V^{w'}/V^w + jω (论文 eq 3, 已代入 fs 缩放) ──
-    V_w_safe = V_w_mid + eps * torch.sgn(V_w_mid)
-    b1 = -V_wp_mid / V_w_safe + 1j * omega_grid    # [B, F, T_if]
-
-    if order == 1:
-        # ── N=1: ω̂_{[1]} = Im(b₁) / 2π ──
-        # b₁ = -V^{w'}_scaled/V + jω = Im(b₁) = ω - Im(V^{w'}_scaled/V)
-        # 对于纯单频信号 f₀: Im(V^{w'}_scaled/V) = 2π(f-f₀)
-        #   → ω̂/(2π) = f - (f-f₀) = f₀  ✓
-        IF = torch.imag(b1) / (2.0 * math.pi)
-        IF = IF.clamp(0, fs / 2)
-        mag = V_w.abs()
-        return IF, mag
-
-    # ══════════════════════════════════════════════════════════
-    # N≥2: 高阶 HMST — N×N 上三角矩阵求解 Q₁ (论文 eq 16-17)
-    # ══════════════════════════════════════════════════════════
-
-    # ── ∂_ω 沿频率轴中心差分 ──
-    def _freq_deriv(z):
-        """∂_ω 中心差分, dim=1 为频率轴, 二阶精度"""
-        z_pad = F.pad(z, (0, 0, 1, 1), mode='replicate')
-        return (z_pad[:, 2:, :] - z_pad[:, :-2, :]) / (2.0 * domega)
-
-    def _safe_cdiv(num, den):
-        """复数伪逆除法 num/den → num·conj(den)/(|den|²+eps)。
-        ★ den 是复数, 加实数 eps 无法防止 |den|→0 时发散, 故用伪逆。"""
-        den_abs2 = den.real ** 2 + den.imag ** 2 + eps
-        return num * den.conj() / den_abs2
-
-    def _clamp_c(z, lim):
-        """分别钳制复数实/虚部, 防止噪声区高阶修正项飞到几万 Hz。"""
-        return z.real.clamp(-lim, lim) + 1j * z.imag.clamp(-lim, lim)
-
-    # ── V^{t·w}: 一阶矩窗 STFT (无需 fs 缩放, 非导数窗) ──
-    w_tw = _gaussian_tw_window(n_fft, sigma, device=device)
-    V_tw = torch.stft(
-        x, n_fft=n_fft, hop_length=hop_length,
-        win_length=n_fft, window=w_tw,
-        center=True, pad_mode='reflect',
-        normalized=False, onesided=True,
-        return_complex=True,
-    )  # [B, F, T_frames]
-    V_tw_mid = V_tw[:, :, 1:T_frames - 1]  # [B, F, T_if]
-
-    # ── a_{2,1} = V^{tw}/V^w, b₂ = ∂_ω b₁ / ∂_ω a_{2,1} (论文 eq 14/16, k=2) ──
-    a21 = V_tw_mid / V_w_safe                    # [B, F, T_if]
-    d_b1 = _freq_deriv(b1)                       # ∂_ω b₁
-    d_a21 = _freq_deriv(a21)                     # ∂_ω a_{2,1}
-    b2 = _clamp_c(_safe_cdiv(d_b1, d_a21), fs)   # [B, F, T_if]
-
-    if order == 2:
-        # ── 反向代入: Q₂ = b₂, Q₁ = b₁ - a₂₁·Q₂ (论文 eq 17, N=2) ──
-        Q1 = b1 - a21 * b2  # [B, F, T_if]
-    else:
-        # ══════════════════════════════════════════════════════
-        # N=3: 增加 t²w 窗, 上三角扩为 3×3 (论文 eq 16-17, N=3)
-        #   代价: 需两层 ∂_ω 频率微分, 对噪声比 N=2 更敏感
-        # ══════════════════════════════════════════════════════
-
-        # ── V^{t²·w}: 二阶矩窗 STFT (论文 eq 14, k=3) ──
-        w_t2w = _gaussian_t2w_window(n_fft, sigma, device=device)
-        V_t2w = torch.stft(
-            x, n_fft=n_fft, hop_length=hop_length,
-            win_length=n_fft, window=w_t2w,
-            center=True, pad_mode='reflect',
-            normalized=False, onesided=True,
-            return_complex=True,
-        )  # [B, F, T_frames]
-        V_t2w_mid = V_t2w[:, :, 1:T_frames - 1]  # [B, F, T_if]
-
-        # ── a_{3,1} = V^{t²w}/V^w (论文 eq 14, i=3, j=1) ──
-        a31 = V_t2w_mid / V_w_safe               # [B, F, T_if]
-
-        # ── a_{3,2} = ∂_ω a_{3,1} / ∂_ω a_{2,1} (论文 eq 16, i=3, j=2) ──
-        d_a31 = _freq_deriv(a31)
-        a32 = _safe_cdiv(d_a31, d_a21)           # [B, F, T_if]
-
-        # ── b₃ = ∂_ω b₂ / ∂_ω a_{3,2} (论文 eq 16, k=3) ──
-        d_b2 = _freq_deriv(b2)
-        d_a32 = _freq_deriv(a32)
-        b3 = _clamp_c(_safe_cdiv(d_b2, d_a32), fs)  # [B, F, T_if]
-
-        # ── 反向代入 (论文 eq 17, N=3) ──
-        #   P₃ = b₃;  P₂ = b₂ - a₃₂·P₃;  Q₁ = b₁ - a₂₁·P₂ - a₃₁·P₃
-        P3 = b3
-        P2 = b2 - a32 * P3
-        Q1 = b1 - a21 * P2 - a31 * P3  # [B, F, T_if]
-
-    # ── ω̂_{[N]} = Im(Q₁) / 2π (论文 eq 18, N≥2 分支) ──
-    IF = torch.imag(Q1) / (2.0 * math.pi)
-
-    # 钳制: 无效估计回退到 STFT 中心频率
-    freqs_exp = freqs_hz.view(1, F_bins, 1).expand(-1, -1, T_if)
-    IF = torch.where((IF >= 0) & (IF <= fs / 2), IF, freqs_exp)
-
-    mag = V_w.abs()
-
-    return IF, mag
-
-
-# ============================================================
-# 1b-extra. CUDA squeeze 加载器 (自动 fallback)
-# ============================================================
-
-_hmst_cuda_ext = None
-_hmst_cuda_attempted = False
-
-
-def _load_hmst_cuda():
-    """
-    懒加载 CUDA squeeze 扩展。
-
-    优先级:
-      1. 预编译的 hmst_cuda_ext (Jetson 部署: deploy/hmst_cuda_ext.so)
-      2. JIT 编译 (开发环境: 首次调用时自动编译 .cu → 缓存)
-      3. Fallback: Python 三重循环 (纯 CPU 或无 CUDA 工具链时)
-    """
-    global _hmst_cuda_ext, _hmst_cuda_attempted
-    if _hmst_cuda_attempted:
-        return _hmst_cuda_ext
-    _hmst_cuda_attempted = True
-
-    # 路径 1: 预编译扩展 (deploy/ 或 sys.path 内 .pyd/.so)
-    #   优势: 直接 import 已编译的 .pyd, 绕开 torch.load() 的源码哈希步骤,
-    #   无需 MSVC, 也无需 PYTHONUTF8。在开发环境用 setup_hmst.py 或
-    #   compile_hmst_cuda.py (缓存→拷贝到 deploy/) 产出。
-    try:
-        import os, sys, importlib
-        _deploy_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), '..', 'deploy')
-        if _deploy_dir not in sys.path:
-            sys.path.insert(0, _deploy_dir)
-        _hmst_cuda_ext = importlib.import_module('hmst_cuda_ext')
-        return _hmst_cuda_ext
-    except ImportError:
-        pass
-
-    # 路径 2: JIT 编译 (开发环境)
-    try:
-        from torch.utils.cpp_extension import load
-        import os
-        src_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            '..', 'deploy', 'hmst_squeeze.cu',
-        )
-        if os.path.exists(src_path):
-            _hmst_cuda_ext = load(
-                name='hmst_cuda_ext',
-                sources=[src_path],
-                # -allow-unsupported-compiler: VS2019 + CUDA 11.8 组合必需,
-                #   否则报 "unsupported Microsoft Visual Studio version" 编译失败。
-                #   与 deploy/compile_hmst_cuda.py 的 flag 保持一致。
-                extra_cuda_cflags=['-O3', '--use_fast_math',
-                                   '-allow-unsupported-compiler'],
-                verbose=False,
-            )
-    except Exception:
-        pass  # 静默 fallback
-
-    return _hmst_cuda_ext
-
-
-def _hmst_squeeze_cuda(mag, IF, freqs_hz, gamma=1e-6):
-    """
-    HMST 挤压, 自动选择 CUDA 或 Python 后端。
-
-    CUDA:  单次 kernel launch, 3,598 线程并行,  ~25μs
-    Python: 三重循环 scatter_add,             ~15ms (仅 CPU fallback)
-    """
-    # CPU tensor: 直接走 Python
-    if not mag.is_cuda:
-        return _hmst_squeeze(mag, IF, freqs_hz, gamma)
-
-    # CUDA tensor: 尝试加载扩展
-    ext = _load_hmst_cuda()
-    if ext is not None:
-        return ext.hmst_squeeze(mag, IF, freqs_hz, gamma)
-
-    # Fallback: CUDA tensor 但无扩展 → Python 循环 + GPU 数据搬运 (极慢, 仅保证正确性)
-    return _hmst_squeeze(mag, IF, freqs_hz, gamma)
-
-
-def _hmst_squeeze(mag, IF, freqs_hz, gamma=1e-6):
-    """
-    单次 HMST 挤压 (论文 eq 19 的一次迭代)。
-
-    离散挤压 = bin-to-bin 能量重分配, 不加 df:
-      - 离散 TFR 的每个 bin 已经代表该频率区间的能量, 挤压缩放的是 bin index,
-        不是连续积分 → 直接累加幅值, 不乘 df
-      - ssqueezepy 的 _ssqueeze 也是直接累加, 无 df 因子
-      - M 次迭代后能量守恒, 不会出现 (df)^M 幅度爆炸
-
-    使用幅值累加 (非复值):
-      - 幅值累加 ≡ 正确调制 STFT 的复值累加 (验证: corr=0.9999)
-      - 避免 PyTorch 非调制 STFT 的相位不一致问题
-
-    Args:
-        mag:      [B, F, T] 当前 TFR 幅值
-        IF:       [B, F, T] IF 估计 (Hz), 已取 abs, 所有迭代共用同一 IF
-        freqs_hz: [F] 频率网格 (Hz)
-        gamma:    绝对幅度阈值
-
-    Returns:
-        Tx: [B, F, T] 挤压后幅度 TFR
-    """
-    B, F, T = mag.shape
-    device = mag.device
-
-    f0 = freqs_hz[0].item()
-    df = (freqs_hz[1] - freqs_hz[0]).item()
-
-    Tx = torch.zeros(B, F, T, device=device, dtype=mag.dtype)
-
-    for b in range(B):
-        for j in range(T):
-            for i in range(F):
-                val = mag[b, i, j]
-                if val < gamma:
-                    continue
-                w = IF[b, i, j].item()
-                k = int(round((w - f0) / df))
-                if 0 <= k < F:
-                    # 离散 bin-to-bin 重分配, 不乘 df
-                    # (乘 df 会导致 M 次迭代后幅度 × df^M 指数爆炸)
-                    Tx[b, k, j] += val
-
-    return Tx
-
-
-def compute_hmst(x, fs, n_fft=512, hop_length=128, order=2, M=2,
-                 sigma=None):
-    """
-    完整 HMST (Bao et al., 2023, eq 19)。
-
-    实现方式:
-      1. 计算 N 阶 IF ω̂_{[N]} (论文 eq 16-18)
-      2. 取 abs(ω̂) 确保非负 (与 ssqueezepy 一致)
-      3. M 次顺序挤压: 每次将 TFR 能量重排到 ω̂_{[N]} 位置
-         (论文 eq 19: HMST^{[m]} = ∫ HMST^{[m-1]}(η) δ(ω-ω̂(η)) dη)
-
-    与 SST/MSST/HSST 的工程区别:
-      - SST: 1 阶 IF + 1 次挤压
-      - MSST: 1 阶 IF + M 次挤压 (IF 不变, 只是反复向同个 IF 聚拢)
-      - HSST: N 阶 IF + 1 次挤压 (同精度, 无多次迭代)
-      - HMST: N 阶 IF + M 次挤压 (同精度 + 同浓度 = 最优)
-
-    Args:
-        x:       [B, T] 或 [T] 原始信号
-        fs:      采样率 (Hz)
-        n_fft:   FFT 点数
-        hop_length: 帧移
-        order:   IF 估计阶数 (1, 2 或 3)
-        M:       挤压迭代次数 (≥1)
-        sigma:   高斯窗 σ
-
-    Returns:
-        tfr:   [B, F, T_if] HMST 时频表示 (幅度)
-        IF:    [B, F, T_if] 高阶 IF (Hz)
-        mag:   [B, F, T_frames] STFT 幅度
-    """
-    if x.dim() == 1:
-        x = x.unsqueeze(0)
-
-    B = x.shape[0]
-    device = x.device
-
-    if sigma is None:
-        sigma = n_fft / 8.0
-
-    # ── 1. N 阶 IF 估计 ──
-    IF, mag = compute_hmst_if(x, fs, n_fft=n_fft, hop_length=hop_length,
-                               order=order, sigma=sigma)
-    # IF: [B, F, T_if], mag: [B, F, T_frames]
-
-    F_bins = IF.shape[1]
-    T_if = IF.shape[2]
-    freqs_hz = torch.linspace(0, fs / 2, F_bins, device=device)
-
-    # ── 2. 绝对值 IF (与 ssqueezepy 一致, 确保非负) ──
-    IF_abs = IF.abs()
-
-    # ── 3. 初始幅值 TFR 对齐到 T_if ──
-    #     ★ 使用幅值累加, 避免 PyTorch 非调制 STFT 的相位不一致问题
-    #     幅值累加 ≡ 正确调制 STFT 的复值累加 (验证: corr=1.0)
-    TFR = mag[:, :, 1:-1]  # [B, F, T_if] 幅值
-
-    # ── 4. 绝对 gamma (参照 ssqueezepy) ──
-    gamma = TFR.max().item() * 1e-6
-
-    # ── 5. M 次顺序挤压 (论文 eq 19) ──
-    for m in range(M):
-        TFR = _hmst_squeeze_cuda(TFR, IF_abs, freqs_hz, gamma=gamma)
-
-    tfr_mag = TFR  # [B, F, T_if] 已是幅值
-
-    return tfr_mag, IF, mag
-
-
-def compute_sst_baseline(x_np, fs, n_fft=512, hop_length=128):
-    """
-    用 ssqueezepy 计算一阶 SST 作为"硬 δ 挤压"对比基线。
-    仅用于对比和可视化，不参与训练梯度。
-
-    Args:
-        x_np: [T] numpy 数组，单条信号
-
-    Returns:
-        Tx:    [F_bins, T_frames] SST 幅度谱
-        Wx:    [F_bins, T_frames] STFT 幅度谱
-        freqs: [F_bins] 频率轴 (Hz)
-    """
-    Tx, Wx, ssq_freqs, *_ = ssqueezepy.ssq_stft(
-        x_np, fs=fs,
-        window='hann', n_fft=n_fft,
-        win_len=n_fft, hop_len=hop_length,
-        squeezing='sum',
-        padtype='reflect',
-    )
-    return Tx, Wx, ssq_freqs
-
-
-# ============================================================
-# 1c. HMST-CWT: CWT 域高阶多同步压缩 (小波基)
-# ============================================================
-
-def _squeeze_cwt_to_linear(W_mag, IF_scales, freqs_linear, gamma=1e-6):
-    """
-    CWT 域→线性频率网格挤压。
-
-    从 (n_scales, T) 重分配到 (F_bins, T) 线性网格。
-    离散 bin-to-bin 重分配, 不乘 df, 能量守恒。
-
-    Args:
-        W_mag:        [n_scales, T] CWT 幅值
-        IF_scales:    [n_scales, T] IF 估计 (Hz), 与 W_mag 同 shape
-        freqs_linear: [F_bins] 线性频率网格
-        gamma:        幅度阈值
-
-    Returns:
-        Tx: [F_bins, T] 挤压后 TFR
-    """
-    n_scales, T = W_mag.shape
-    F_bins = len(freqs_linear)
-    f0 = freqs_linear[0]
-    df = freqs_linear[1] - freqs_linear[0]
-
-    Tx = np.zeros((F_bins, T), dtype=W_mag.dtype)
-
-    for t in range(T):
-        vals = W_mag[:, t]
-        mask = vals >= gamma
-        if not mask.any():
-            continue
-        ks = np.round((IF_scales[mask, t] - f0) / df).astype(np.int32)
-        valid = (ks >= 0) & (ks < F_bins)
-        if not valid.any():
-            continue
-        np.add.at(Tx[:, t], ks[valid], vals[mask][valid])
-
-    return Tx
-
-
-def _squeeze_cwt_within_scales(W_mag, IF_scales, freqs_scales, gamma=1e-6):
-    """
-    CWT 尺度域内挤压: 在 log 尺度网格内重分配能量。
-
-    对每个 (s, t): 将能量从尺度 s 移到尺度 s_target,
-    其中 freqs_scales[s_target] ≈ IF[s,t]。
-
-    Args:
-        W_mag:         [n_scales, T] 当前 TFR
-        IF_scales:     [n_scales, T] IF 估计 (Hz)
-        freqs_scales:  [n_scales] 各尺度中心频率 (升序)
-        gamma:         幅度阈值
-
-    Returns:
-        Tx: [n_scales, T] 挤压后 TFR (仍在尺度域)
-    """
-    n_scales, T = W_mag.shape
-
-    Tx = np.zeros_like(W_mag)
-
-    for t in range(T):
-        vals = W_mag[:, t]
-        mask = vals >= gamma
-        if not mask.any():
-            continue
-        IF_t = IF_scales[mask, t]  # [n_valid]
-
-        # 找每个 IF 值最近的尺度 bin
-        ks = np.searchsorted(freqs_scales, IF_t)
-        # 比较左/右邻居, 取更近者
-        ks_clip = np.clip(ks, 1, n_scales - 1).astype(np.int32)
-        left = np.abs(IF_t - freqs_scales[ks_clip - 1])
-        right = np.abs(IF_t - freqs_scales[ks_clip])
-        ks_final = np.where(left <= right, ks_clip - 1, ks_clip)
-
-        np.add.at(Tx[:, t], ks_final, vals[mask])
-
-    return Tx
-
-from scipy.interpolate import interp1d
-
-def _exact_time_derivative(x, fs):
-    """使用 FFT 计算信号的精确时间导数"""
-    N = len(x)
-    X = np.fft.fft(x)
-    freqs_fft = np.fft.fftfreq(N, d=1.0/fs)
-    dX = X * (1j * 2.0 * np.pi * freqs_fft)
-    return np.fft.ifft(dX).real
-
-def compute_hmst_cwt(x_np, fs, nv=32, M=2, freq_max=200, F_bins=257, wavelet='morlet', wavelet_width=6):
-    """
-    HMST-CWT 最终完美版
-    1. FFT 频域精确求导
-    2. 噪声区域 IF 强制回退
-    3. 【核心修复】引入 interp1d 解决对数网格迭代的量化误差 (蝴蝶效应)
-    4. 纯幅值挤压，保证物理能量守恒
-    """
-    # ── 1. CWT 与精确时间导数 ──
-    Wx, scales = ssqueezepy.cwt(x_np, wavelet=wavelet, scales='log', nv=nv, fs=fs)
-    
-    dx_dt = _exact_time_derivative(x_np, fs)
-    dWx, _ = ssqueezepy.cwt(dx_dt, wavelet=wavelet, scales=scales, fs=fs)
-    
-    n_scales, T = Wx.shape
-    freqs_scales = wavelet_width / (2.0 * np.pi * scales) * fs
-
-    # 升序重排以满足插值和绘图要求
-    sort_idx = np.argsort(freqs_scales)
-    freqs_scales = freqs_scales[sort_idx]
-    Wx = Wx[sort_idx, :]
-    dWx = dWx[sort_idx, :]
-
-    # ── 2. 瞬时频率 (IF) 估计与背景噪声镇压 ──
-    eps = 1e-8
-    W_abs2 = np.abs(Wx)**2 + eps
-    IF_scales = np.imag(dWx * np.conj(Wx) / W_abs2) / (2.0 * np.pi)
-    
-    mag_all = np.abs(Wx)
-    gamma = mag_all.max() * 1e-4  
-
-    # 噪声回退：防止迭代坍缩
-    mask_valid = mag_all > gamma
-    IF_scales = np.where(mask_valid, IF_scales, freqs_scales[:, None])
-    IF_scales = np.clip(IF_scales, 0, fs / 2)
-
-    # ── 3. MSWT 多重迭代 IF 映射 (平滑插值版) ──
-    IF_current = IF_scales.copy()
-    for m in range(1, M):
-        IF_next = np.zeros_like(IF_current)
-        for t in range(T):
-            # 【最关键修复】：在对数网格上使用线性插值，彻底消灭就近取整带来的量化灾难
-            f_interp = interp1d(freqs_scales, IF_scales[:, t], kind='linear', 
-                                bounds_error=False, fill_value='extrapolate')
-            IF_next[:, t] = f_interp(IF_current[:, t])
-        
-        # 限制越界，防止外推到奈奎斯特频率之外
-        IF_current = np.clip(IF_next, 0, fs / 2)
-
-    # ── 4. 单次最终挤压 (幅值挤压) ──
-    Tx = np.zeros_like(mag_all) 
-    
-    for t in range(T):
-        vals = mag_all[:, t]  
-        valid_mask = mag_all[:, t] > gamma
-        if not valid_mask.any():
-            continue
-            
-        IF_t = IF_current[valid_mask, t]
-        
-        # 最后一次落位，允许使用离散网格索引 (因为不再参与迭代运算)
-        ks = np.searchsorted(freqs_scales, IF_t)
-        ks_clip = np.clip(ks, 1, n_scales - 1)
-        left = np.abs(IF_t - freqs_scales[ks_clip - 1])
-        right = np.abs(IF_t - freqs_scales[ks_clip])
-        ks_final = np.where(left <= right, ks_clip - 1, ks_clip)
-        
-        np.add.at(Tx[:, t], ks_final, vals[valid_mask])
-
-    return Tx, freqs_scales, mag_all, IF_scales
-
-# def compute_hmst_cwt(x_np, fs, nv=32, M=2, freq_max=200, F_bins=257,
-#                      wavelet='morlet', wavelet_width=6):
-#     """
-#     CWT 域 HMST: 小波变换 + IF 估计 + 多重挤压。
-
-#     与 HMST-STFT 的对比:
-#       - STFT 版: 线性频率网格, 低频分辨率固定 (=fs/n_fft ≈ 1.95 Hz)
-#       - CWT 版:  对数尺度网格, 低频分辨率天然更高
-#                  (Morlet 小波在低频有更多 scales 覆盖)
-
-#     挤压策略:
-#       - 前 M-1 次挤压在 CWT 尺度域内进行 (bin-to-bin within log grid)
-#       - 最后 1 次挤压将尺度域映射到线性频率网格
-#       - 幅值累加, 不乘 df, 能量守恒
-
-#     Args:
-#         x_np:          [T] numpy 1D 信号
-#         fs:            采样率 (Hz)
-#         nv:            voices per octave (越大 → scale 越密, 默认32)
-#         M:             挤压迭代次数
-#         freq_max:      频率上限 (Hz), 用于输出网格
-#         F_bins:        输出频率 bin 数
-#         wavelet:       小波类型 (默认 'morlet')
-#         wavelet_width: Morlet ω₀ (默认 6, 近似解析)
-
-#     Returns:
-#         tfr_mag:      [F_bins, T-2] 挤压后 TFR
-#         freqs_linear: [F_bins] 线性频率网格 (Hz)
-#         Wx_mag:       [n_scales_sort, T] CWT 幅值 (按频率排序)
-#         IF_scales:    [n_scales_sort, T-2] IF 估计 (Hz)
-#     """
-#     # ── 1. CWT ──
-#     Wx, scales = ssqueezepy.cwt(x_np, wavelet=wavelet, scales='log',
-#                                  nv=nv, fs=fs)
-#     # Wx: [n_scales, T] complex
-#     n_scales, T = Wx.shape
-
-#     # Scale → 中心频率 (Morlet: f = ω₀/(2π·s)·fs)
-#     freqs_scales = wavelet_width / (2.0 * np.pi * scales) * fs
-
-#     # 按频率升序重排
-#     sort_idx = np.argsort(freqs_scales)
-#     freqs_scales = freqs_scales[sort_idx]
-#     Wx = Wx[sort_idx, :]
-
-#     # ── 2. IF 估计: 相位时间导数 (中心差分, 二阶精度) ──
-#     dt = 1.0 / fs
-#     dW_dt = (Wx[:, 2:] - Wx[:, :-2]) / (2.0 * dt)  # [n_scales, T-2]
-#     W_mid = Wx[:, 1:-1]                               # [n_scales, T-2]
-
-#     eps = 1e-8
-#     # IF = Im(∂_t W / W) / 2π — 复数除法的虚部
-#     IF_scales = np.imag(dW_dt / (W_mid + eps)) / (2.0 * np.pi)
-#     # 取绝对值 (与 ssqueezepy SST 一致)
-#     IF_scales = np.abs(IF_scales)  # [n_scales, T-2]
-
-#     # CWT 幅值 (对齐到 T-2)
-#     mag_mid = np.abs(W_mid)  # [n_scales, T-2]
-#     mag_all = np.abs(Wx)     # [n_scales, T] (全时间轴, 用于可视化)
-
-#     # ── 3. 输出线性频率网格 ──
-#     freqs_linear = np.linspace(0, freq_max, F_bins)
-
-#     # ── 4. M 次挤压 ──
-#     gamma = mag_mid.max() * 1e-6
-#     TFR = mag_mid.copy()
-
-#     if M > 1:
-#         # 前 M-1 次在尺度域内挤压 (能量在 log 尺度网格内向 IF 位置集中)
-#         for m in range(M - 1):
-#             TFR = _squeeze_cwt_within_scales(
-#                 TFR, IF_scales, freqs_scales, gamma=gamma,
-#             )
-#         # 最后一次: 尺度域 → 线性频率网格
-#         TFR = _squeeze_cwt_to_linear(
-#             TFR, IF_scales, freqs_linear, gamma=gamma,
-#         )
-#     else:
-#         # M=1: 直接尺度域 → 线性频率网格
-#         TFR = _squeeze_cwt_to_linear(
-#             TFR, IF_scales, freqs_linear, gamma=gamma,
-#         )
-
-#     return TFR, freqs_linear, mag_all, IF_scales
-
-
-# ============================================================
-# 2. Physics Prototype Memory 配置
-# ============================================================
-
-PUMP_TURBINE_PROTOTYPES = {
-    # 本机参数: Z_r=9 (转轮叶片), Z_s=20 (活动导叶), f_r=5.56 Hz
-    # ν = floor(Z_s/Z_r) = floor(20/9) = 2
-    # RSI f_s = ν × BPF = 2 × 50 = 100 Hz (与 2×BPF 同频, 物理上为动静干涉)
-    'prototypes': [
-        {'name': 'fr',       'f_nom': 5.56,  'f_type': 'ROTATION',       'C_prior': 0.90},
-        {'name': 'RSI_low',  'f_nom': 2.4,   'f_type': 'VORTEX_ROPE',    'C_prior': 0.30},
-        {'name': 'RSI_turb', 'f_nom': 8.35,  'f_type': 'TURBULENCE',     'C_prior': 0.30},
-        {'name': 'BPF',      'f_nom': 50.0,  'f_type': 'BLADE_PASS',     'C_prior': 1.00},
-        {'name': '2xBPF',    'f_nom': 100.0, 'f_type': 'RSI',
-         'C_prior': 1.00},   # 本机 ν=2 → RSI≡2×BPF; 
-        {'name': 'GPF',      'f_nom': 111.1, 'f_type': 'GUIDE_VANE',     'C_prior': 0.95},
-        {'name': '3xBPF',    'f_nom': 150.0, 'f_type': 'BLADE_HARMONIC', 'C_prior': 1.00},
-    ],
-    'temperature': 0.08,  # τ=0.08 → gate 在 ~9.4% 频偏处衰减至 50%
-}
-
-
-# ============================================================
-# 3. BlindRidgeExtractor: 盲脊线提取 (不问出身)
-# ============================================================
-
-class BlindRidgeExtractor(nn.Module):
-    """
-    每帧从幅度谱提取能量最强的 K 条脊线，不问"这条频率是什么物理分量"。
-
-    提取流程:
-      1. max_pool1d 找局部极大值
-      2. 按能量排序取 top-K
-      3. 帧间贪心匹配 → 累加 persistence 计数器
-      4. 归一化 persistence 到 [0, 1]
-
-    输出全部是观测量，不依赖任何先验字典。
+        d_cond:    cond_ctx 输出维度
+        temperature: softmax 温度 (越小越偏向 hard assignment)
     """
 
-    def __init__(self, K=6, min_dist=3, fs=1000):
-        """
-        Args:
-            K:         匿名脊线数量
-            min_dist:  峰值最小间距 (bin 数)
-            fs:        采样率
-        """
+    def __init__(self, d_cond: int = 32, temperature: float = 0.1):
         super().__init__()
-        self.K = K
-        self.min_dist = min_dist
-        self.fs = fs
+        self.d_cond = d_cond
+        self.temperature = temperature
 
-    def forward(self, mag, freqs):
+        # Frozen prototypes from EDA: [5, 4]
+        self.register_buffer('prototypes', STATIC_PROTOTYPES.clone())
+
+        # Learnable prototype interpretation embeddings: [5, d_cond]
+        # 模型学习"像原型 k"如何转化为挤压策略
+        self.P_embed = nn.Parameter(torch.randn(N_PROTOTYPES, d_cond) * 0.02)
+
+        # V_obs 投影: 4 -> d_cond (对齐到 prototype 空间)
+        self.obs_proj = nn.Sequential(
+            nn.Linear(PROTOTYPE_DIM, d_cond),
+            nn.LayerNorm(d_cond),
+            nn.GELU(),
+        )
+
+    def forward(self, V_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            mag:   [B, F, T] STFT 幅度谱
-            freqs: [F] 频率轴 (Hz)
+            V_obs: [B, T, 4]  每帧实时能量比例向量
+                   [R_LF, R_BPF, R_2xBPF, log10(E_BPF/E_2xBPF)]
 
         Returns:
-            ridge_freq:        [B, K, T] 脊线频率 (Hz)
-            ridge_energy:      [B, K, T] 脊线对数能量
-            ridge_bw:          [B, K, T] 脊线带宽 (Hz, 粗略估计)
-            ridge_persistence: [B, K, T] 跟踪持续性 (0-1)
+            cond_ctx: [B, T, d_cond]  工况上下文嵌入
+            alpha:    [B, T, 5]       原型注意力权重 (诊断用)
         """
-        B, F, T = mag.shape
-        device = mag.device
-        K = self.K
-        freq_res = freqs[1] - freqs[0]  # Hz per bin
+        B, T, _ = V_obs.shape
+        device = V_obs.device
 
-        ridge_freq = torch.zeros(B, K, T, device=device)
-        ridge_energy = torch.zeros(B, K, T, device=device)
-        ridge_bw = torch.zeros(B, K, T, device=device)
-        ridge_persistence = torch.zeros(B, K, T, device=device)
+        # 余弦相似度
+        proto = self.prototypes.to(device).to(V_obs.dtype)        # [5, 4]
+        proto_norm = F.normalize(proto, dim=-1)                    # [5, 4]
+        obs_norm = F.normalize(V_obs, dim=-1)                      # [B, T, 4]
 
-        # 持久性跟踪状态
-        track_freqs = None     # [B, K_tracked]
-        track_persist = None   # [B, K_tracked] 原始帧数计数
-        max_persist = 0
+        sim = torch.matmul(obs_norm, proto_norm.T)                 # [B, T, 5]
+        alpha = F.softmax(sim / self.temperature, dim=-1)          # [B, T, 5]
 
-        for t in range(T):
-            mag_t = mag[:, :, t]  # [B, F]
+        # 加权混合 prototype 解释嵌入
+        P_emb = self.P_embed.to(device).to(V_obs.dtype)            # [5, d_cond]
+        cond_ctx = torch.matmul(alpha, P_emb)                       # [B, T, d_cond]
 
-            # ── 3a. 找局部极大值 ──
-            peaks_mask = self._find_local_maxima(mag_t)  # [B, F]
+        return cond_ctx, alpha
 
-            # 只保留 peak 位置的值，其余为 -inf
-            masked_mag = torch.where(peaks_mask, mag_t,
-                                     torch.full_like(mag_t, -float('inf')))
-
-            # top-K peaks
-            topk_vals, topk_idx = torch.topk(masked_mag, K, dim=1)  # [B, K]
-
-            # 频率
-            ridge_freq[:, :, t] = freqs[topk_idx]  # [B, K]
-            # log 能量 (数值稳定)
-            ridge_energy[:, :, t] = torch.log(topk_vals.clamp(min=1e-8) + 1.0)
-            # 粗略带宽: 用 STFT 主瓣宽度作为初始估计
-            ridge_bw[:, :, t] = freq_res * 3.0
-
-            # ── 3b. 帧间跟踪 → persistence ──
-            cur_freqs = ridge_freq[:, :, t]  # [B, K]
-
-            if track_freqs is not None:
-                # 贪心匹配: 每个当前峰找最近的上一帧峰
-                # dist[b, k_cur, k_prev]
-                dist = (cur_freqs.unsqueeze(-1) -
-                        track_freqs.unsqueeze(1)).abs()  # [B, K, K_prev]
-
-                # 对每个当前峰，找最近的上帧峰
-                min_dist_val, min_dist_idx = dist.min(dim=-1)  # [B, K]
-
-                # 若距离 < 阈值(2×freq_res×min_dist)，则认为是同一脊线
-                match_threshold = 3.0 * freq_res * self.min_dist
-                matched = min_dist_val < match_threshold  # [B, K]
-
-                # 更新 persistence
-                B_idx = torch.arange(B, device=device).unsqueeze(-1).expand(-1, K)
-                new_persist = torch.zeros(B, K, device=device)
-                # 匹配上的继承上帧 persistence
-                for k in range(K):
-                    matched_prev = min_dist_idx[:, k]  # [B]
-                    new_persist[:, k] = torch.where(
-                        matched[:, k],
-                        track_persist[B_idx[:, 0], matched_prev] + 1,
-                        torch.ones(B, device=device)  # 新脊线
-                    )
-
-                track_persist = new_persist  # [B, K]
-            else:
-                track_persist = torch.ones(B, K, device=device)
-
-            track_freqs = cur_freqs
-            ridge_persistence[:, :, t] = track_persist
-            max_persist = max(max_persist, int(track_persist.max().item()))
-
-        # ── 3c. 归一化 persistence 到 [0, 1] ──
-        ridge_persistence = ridge_persistence / max(1, max_persist)
-
-        return ridge_freq, ridge_energy, ridge_bw, ridge_persistence
-
-    def _find_local_maxima(self, mag):
+    def compute_V_obs(self, node_energy: torch.Tensor,
+                       freqs: torch.Tensor) -> torch.Tensor:
         """
-        用 max_pool1d 找局部极大值。
+        从节点能量 + 频率轴实时计算 V_obs (4 维能量比例向量).
 
         Args:
-            mag: [B, F_bins] 单帧幅度
+            node_energy: [B, N_phys, T]  节点对数能量
+            freqs:       [F] 频率轴 (Hz)
 
         Returns:
-            mask: [B, F_bins] bool
+            V_obs: [B, T, 4]  [R_LF, R_BPF, R_2xBPF, log10(E_BPF/E_2xBPF)]
         """
-        mag_4d = mag.unsqueeze(1)  # [B, 1, F_bins]
-        kernel_size = 2 * self.min_dist + 1
-        mag_pooled = torch.nn.functional.max_pool1d(
-            mag_4d, kernel_size, stride=1, padding=self.min_dist)
-        is_peak = (mag_4d == mag_pooled).squeeze(1)  # [B, F_bins]
-        return is_peak
+        B, N, T = node_energy.shape
+        device = node_energy.device
+
+        # node_energy 已经是对数能量, 转回线性用于比例计算
+        E_lin = torch.exp(node_energy.clamp(max=20.0))  # [B, N, T]
+        E_total = E_lin.sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+        R_LF = E_lin[:, 0, :] / E_total[:, 0, :]      # [B, T]
+        R_BPF = E_lin[:, 1, :] / E_total[:, 0, :]     # [B, T]
+        R_2xBPF = E_lin[:, 2, :] / E_total[:, 0, :]   # [B, T]
+
+        eps = 1e-12
+        log_ratio = torch.log10(
+            E_lin[:, 1, :].clamp(min=eps) / E_lin[:, 2, :].clamp(min=eps)
+        )  # [B, T]
+
+        V_obs = torch.stack([R_LF, R_BPF, R_2xBPF, log_ratio], dim=-1)  # [B, T, 4]
+        return V_obs
 
 
-# ============================================================
-# 4. Anonymous Graph Builder: 全连接匿名图
-# ============================================================
-
-def build_anonymous_graph(ridge_freq, ridge_energy, ridge_persistence,
-                          window_size=5):
-    """
-    从匿名脊线构建全连接有向图 + 观测边特征。
-
-    边特征全是实测值，不包含标称比值 r_nom:
-      e_ij = [r_obs, r_std, energy_corr, confidence]
-
-    Args:
-        ridge_freq:        [B, K, T] 脊线频率 (Hz)
-        ridge_energy:      [B, K, T] 脊线对数能量
-        ridge_persistence: [B, K, T] 脊线持续性 (0-1)
-        window_size:       局部统计窗口半径 (帧数)
-
-    Returns:
-        edge_src:   [M] LongTensor 边起点
-        edge_dst:   [M] LongTensor 边终点
-        edge_feats: [B, M, T, 4] 边特征
-    """
-    B, K, T = ridge_freq.shape
-    device = ridge_freq.device
-    eps = 1e-8
-
-    # 全连接有向图: M = K*(K-1), 无自环
-    M = K * (K - 1)
-    src_list, dst_list = [], []
-    for i in range(K):
-        for j in range(K):
-            if i != j:
-                src_list.append(i)
-                dst_list.append(j)
-    edge_src = torch.tensor(src_list, dtype=torch.long, device=device)  # [M]
-    edge_dst = torch.tensor(dst_list, dtype=torch.long, device=device)  # [M]
-
-    # ── 逐边特征计算 ──
-    f_src = ridge_freq[:, edge_src, :]     # [B, M, T]
-    f_dst = ridge_freq[:, edge_dst, :]     # [B, M, T]
-    e_src = ridge_energy[:, edge_src, :]   # [B, M, T]
-    e_dst = ridge_energy[:, edge_dst, :]   # [B, M, T]
-    p_src = ridge_persistence[:, edge_src, :]  # [B, M, T]
-    p_dst = ridge_persistence[:, edge_dst, :]  # [B, M, T]
-
-    # r_obs: 观测频率比值 f_src / f_dst
-    r_obs = f_src / f_dst.clamp(min=eps)  # [B, M, T]
-
-    # r_std: r_obs 在局部窗口内的标准差 → 比值稳定性
-    r_std = _local_std(r_obs, window_size)  # [B, M, T]
-
-    # energy_corr: 局部窗口内能量包络的 Pearson 相关系数
-    energy_corr = _local_pearson_corr(e_src, e_dst, window_size)  # [B, M, T]
-
-    # confidence: 端点脊线的最小归一化持续性
-    confidence = torch.min(p_src, p_dst)  # [B, M, T]
-
-    # 组装: [r_obs, r_std, energy_corr, confidence]
-    edge_feats = torch.stack([r_obs, r_std, energy_corr, confidence], dim=-1)
-    # [B, M, T, 4]
-
-    return edge_src, edge_dst, edge_feats
-
-
-def _local_std(x, window_size):
-    """沿时间维计算局部窗口标准差。"""
-    B, M, T = x.shape
-    device = x.device
-    w = 2 * window_size + 1
-
-    if T < w:
-        return x.std(dim=-1, keepdim=True).expand(-1, -1, T)
-
-    x_flat = x.reshape(B * M, 1, T)  # [B*M, 1, T]
-    x_pad = F.pad(x_flat, (window_size, window_size), mode='replicate')
-    x_unfold = x_pad.unfold(-1, w, 1)  # [B*M, 1, T, w]
-
-    # 数值稳定的 std
-    x_mean = x_unfold.mean(dim=-1, keepdim=True)
-    x_var = ((x_unfold - x_mean) ** 2).mean(dim=-1)
-    result = torch.sqrt(x_var.clamp(min=1e-8)).squeeze(1)  # [B*M, T]
-    return result.reshape(B, M, T)
-
-
-def _local_pearson_corr(x, y, window_size):
-    """
-    沿时间维计算局部窗口 Pearson 相关系数。
-
-    Pearson(x,y) = Cov(x,y) / (σ_x · σ_y)
-    """
-    B, M, T = x.shape
-    device = x.device
-    w = 2 * window_size + 1
-    eps = 1e-8
-
-    if T < w:
-        return torch.zeros(B, M, T, device=device)
-
-    # reshape: [B*M, 1, T]
-    x_flat = x.reshape(B * M, 1, T)
-    y_flat = y.reshape(B * M, 1, T)
-
-    x_pad = F.pad(x_flat, (window_size, window_size), mode='replicate')
-    y_pad = F.pad(y_flat, (window_size, window_size), mode='replicate')
-
-    x_unfold = x_pad.unfold(-1, w, 1)  # [B*M, 1, T, w]
-    y_unfold = y_pad.unfold(-1, w, 1)  # [B*M, 1, T, w]
-
-    x_centered = x_unfold - x_unfold.mean(dim=-1, keepdim=True)
-    y_centered = y_unfold - y_unfold.mean(dim=-1, keepdim=True)
-
-    cov = (x_centered * y_centered).sum(dim=-1)  # [B*M, 1, T]
-    std_x = x_centered.norm(dim=-1).clamp(min=eps)
-    std_y = y_centered.norm(dim=-1).clamp(min=eps)
-
-    corr = (cov / (std_x * std_y)).squeeze(1)  # [B*M, T]
-    # 钳制到 [-1, 1]
-    corr = corr.clamp(-1.0, 1.0)
-
-    return corr.reshape(B, M, T)
-
-
-# ============================================================
-# 5. PhysicsPrototypeMemory: 物理原型记忆 (外挂知识注入)
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+# 2. PhysicsPrototypeMemory (updated for heterogeneous graph)
+# ═══════════════════════════════════════════════════════════════
 
 class PhysicsPrototypeMemory(nn.Module):
     """
-    物理原型记忆库: 存储已知物理分量的"不变量标准尺"。
+    物理原型记忆库 (异构图版).
 
-    不定义图拓扑——仅通过交叉注意力向匿名节点注入先验知识:
-      - 匹配上的节点 (gate → 1): 获得强先验引导
-      - 匹配不上的节点 (gate → 0): 完全依靠实测特征，自动退火
+    变更 (vs v2):
+      - 新增 OP 虚拟节点: 从 cond_ctx 投影得到 h_OP
+      - CONDITION 边门控: cond_sim = cosine(cond_ctx, node_proj)
+      - DRIFT 边门控: energy correlation based
+      - HARMONIC 边门控: ratio-gated (unchanged)
 
-    可插拔设计: 更换 prototype_config 即可适配不同旋转机械。
+    Args:
+        d_h:              隐层维度
+        f_type_embed_dim: 频率类型嵌入维度
+        temperature:       比值门控温度 tau
+        regions:           频率区域定义
     """
 
-    def __init__(self, prototype_config=None, d_h=128, f_type_embed_dim=16,
-                 fs=1000):
-        """
-        Args:
-            prototype_config: 原型配置字典 (默认水泵水轮机)
-            d_h:              隐层维度
-            f_type_embed_dim: 分量类型嵌入维度
-            fs:               采样率
-        """
+    def __init__(self, d_h: int = 128, f_type_embed_dim: int = 16,
+                 temperature: float = 0.08,
+                 regions: Optional[List[FreqRegion]] = None):
         super().__init__()
-        cfg = prototype_config if prototype_config is not None \
-            else PUMP_TURBINE_PROTOTYPES
+        self.regions = regions if regions is not None else PUMP_TURBINE_REGIONS
+        self.N_phys = len(self.regions)
+        self.N_total = N_NODES  # 4 (OP + 3 physical)
+        self.temperature = temperature
 
-        self.prototypes = cfg['prototypes']
-        self.M_proto = len(self.prototypes)
-        self.temperature = cfg.get('temperature', 0.08)
-        self.fs = fs
+        # ── C_prior: 每物理节点的先验信任度 (可学习 logit) ──
+        c_prior_init = torch.tensor([r.C_prior for r in self.regions])
+        self.C_prior_logit = nn.Parameter(
+            torch.logit(c_prior_init.clamp(0.01, 0.99))
+        )  # [N_phys]
 
-        # 标称频率 (不可学习, 注册为 buffer)
-        f_nom_list = [p['f_nom'] for p in self.prototypes]
-        self.register_buffer('f_nom', torch.tensor(f_nom_list))  # [M_proto]
-
-        # 先验可压缩性倾向 (不可学习)
-        C_prior_list = [p['C_prior'] for p in self.prototypes]
-        self.register_buffer('C_prior_proto', torch.tensor(C_prior_list))  # [M_proto]
-
-        # 频率类型嵌入
-        f_types = [p['f_type'] for p in self.prototypes]
+        # ── 频率类型嵌入 (仅物理节点) ──
+        f_types = [r.f_type for r in self.regions]
         unique_types = sorted(set(f_types))
         self.type_to_idx = {t: i for i, t in enumerate(unique_types)}
         self.f_type_embed = nn.Embedding(len(unique_types), f_type_embed_dim)
-        f_type_idx = torch.tensor([self.type_to_idx[t] for t in f_types])
-        self.register_buffer('f_type_idx', f_type_idx)  # [M_proto]
+        type_idx = torch.tensor([self.type_to_idx[t] for t in f_types])
+        self.register_buffer('type_idx', type_idx)  # [N_phys]
 
-        # 可学习原型嵌入: 每个原型一个 D 维向量
+        # ── 可学习原型嵌入 (物理节点) ──
         self.prototype_embed = nn.Parameter(
-            torch.randn(self.M_proto, d_h) * 0.02
-        )  # [M_proto, d_h]
+            torch.randn(self.N_phys, d_h) * 0.02
+        )  # [N_phys, d_h]
 
-        # 交叉注意力投影
-        self.W_q = nn.Linear(d_h, d_h, bias=False)   # node query
-        self.W_k = nn.Linear(d_h, d_h, bias=False)   # prototype key
-        self.W_v = nn.Linear(d_h, d_h, bias=False)   # prototype value
+        # ── OP 虚拟节点投影 ──
+        self.op_proj = nn.Sequential(
+            nn.Linear(32, d_h),  # cond_ctx dim
+            nn.LayerNorm(d_h),
+            nn.GELU(),
+        )
 
-        # 节点特征初始投影 (raw → d_h)
-        # raw: [f_norm, log_E, bw_norm, persistence]
+        # ── 标称比值 (仅 HARMONIC 边) ──
+        r_nom_list = [e.r_nom for e in PHYSICS_EDGES]
+        self.register_buffer('r_nom', torch.tensor(r_nom_list))  # [M]
+        self.register_buffer('w_type', torch.tensor(
+            [e.w_type for e in PHYSICS_EDGES]
+        ))  # [M]
+
+        # ── 节点特征投影 (物理节点: 4 -> d_h) ──
         self.node_proj = nn.Sequential(
             nn.Linear(4, d_h),
             nn.LayerNorm(d_h),
@@ -1144,121 +232,231 @@ class PhysicsPrototypeMemory(nn.Module):
             nn.Linear(d_h, d_h),
         )
 
-        # 原型类型嵌入投影 (用于增强 prototype_embed)
+        # 类型增强投影
         self.type_proj = nn.Linear(f_type_embed_dim, d_h, bias=False)
 
-    def forward(self, node_feats_raw, node_freqs):
+        # 交叉注意力: node -> prototype
+        self.W_q = nn.Linear(d_h, d_h, bias=False)
+        self.W_k = nn.Linear(d_h, d_h, bias=False)
+        self.W_v = nn.Linear(d_h, d_h, bias=False)
+
+        # CONDITION 边相似度投影
+        self.cond_sim_proj = nn.Linear(d_h, d_h, bias=False)
+
+        # GAT 输入投影 (h + C_prior)
+        self.gat_input_proj = nn.Linear(d_h + 1, d_h)
+
+    def get_C_prior(self) -> torch.Tensor:
+        """返回当前学习的 C_prior 值 [N_phys]."""
+        return torch.sigmoid(self.C_prior_logit).detach()
+
+    def compute_edge_gates(self, r_obs: torch.Tensor,
+                           h_phys: torch.Tensor,
+                           cond_ctx: torch.Tensor,
+                           drft_feats: torch.Tensor,
+                           comp_feats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
+        计算逐边门控 (异构: 不同类型使用不同门控).
+
         Args:
-            node_feats_raw: [B, K, 4] 匿名节点原始特征
-                            [f_norm, log_E, bw_norm, persistence]
-            node_freqs:     [B, K] 观测频率 (Hz)
+            r_obs:      [B, M, T] 实测比值 (仅 HARMONIC 边有意义)
+            h_phys:     [B, N_phys, d_h] 物理节点特征
+            cond_ctx:   [B, T, d_cond] 工况上下文
+            drft_feats: [B, M, T] DRIFT 边特征 (dim 0 = Corr_E)
+            comp_feats: [B, M, T] COMPETITION 边特征 (dim 0 = -Corr_E)
 
         Returns:
-            h_enhanced: [B, K, d_h] 原型增强的节点特征
-            gate:       [B, K]     原型匹配门控 (0-1)
-            C_prior:    [B, K]     先验可压缩性倾向
+            gate_edge: [B, M, T] 逐边门控 (0-1)
         """
-        B, K, _ = node_feats_raw.shape
+        B = r_obs.shape[0]
+        T = r_obs.shape[2]
+        M = r_obs.shape[1]
+        device = r_obs.device
+
+        gate_edge = torch.zeros(B, M, T, device=device)
+
+        # ── HARMONIC: 比值门控 ──
+        for m in HARMONIC_EDGE_INDICES:
+            r_nom_m = self.r_nom[m]
+            ratio_dist = (r_obs[:, m, :] - r_nom_m).abs() / max(r_nom_m, 1e-8)
+            gate_edge[:, m, :] = torch.exp(-ratio_dist / self.temperature)
+
+        # ── CONDITION: cond_ctx 相似度门控 ──
+        # h_phys projected for similarity with cond_ctx
+        h_for_cond = self.cond_sim_proj(h_phys)  # [B, N_phys, d_h]
+        cond_proj = self.op_proj(cond_ctx)        # [B, T, d_h]
+        cond_sim = torch.zeros(B, len(CONDITION_EDGE_INDICES), T, device=device)
+
+        for i, m in enumerate(CONDITION_EDGE_INDICES):
+            e = PHYSICS_EDGES[m]
+            dst_phys = e.dst - 1  # OP=0, physical nodes 1,2,3 -> 0,1,2
+
+            # cosine similarity: h_phys[dst] vs cond_ctx
+            h_dst = h_for_cond[:, dst_phys, :].unsqueeze(1)  # [B, 1, d_h]
+            cond_t = cond_proj                                   # [B, T, d_h]
+            sim = F.cosine_similarity(
+                h_dst.expand(-1, T, -1), cond_t, dim=-1
+            )  # [B, T]
+            gate_edge[:, m, :] = torch.sigmoid(sim / 0.1)
+            cond_sim[:, i, :] = sim  # raw cosine similarity (pre-sigmoid)
+
+        # ── DRIFT: 能量相关门控 ──
+        for m in DRIFT_EDGE_INDICES:
+            corr_e = drft_feats[:, m, :]  # [B, T]  dim 0 = Corr_E
+            # |Corr_E| -> gate: 高相关 -> 高门控
+            gate_edge[:, m, :] = torch.sigmoid((corr_e.abs() - 0.3) / 0.1)
+
+        # ── ENERGY_COMPETITION: 负能量相关门控 ──
+        # comp_feats[:, m, 0] = -Corr_E (越大越"此消彼长")
+        if comp_feats is not None:
+            for m in COMPETITION_EDGE_INDICES:
+                neg_corr = comp_feats[:, m, :]  # [B, T]
+                # -Corr_E > 0.3 -> 显著负相关 -> 竞争关系成立 -> gate -> 1
+                gate_edge[:, m, :] = torch.sigmoid((neg_corr - 0.3) / 0.1)
+
+        return gate_edge.clamp(0.0, 1.0), cond_sim
+
+    def forward(self, node_feats_raw: torch.Tensor,
+                node_if: torch.Tensor,
+                r_obs: torch.Tensor,
+                cond_ctx: torch.Tensor,
+                drft_feats: torch.Tensor,
+                comp_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
+        """
+        Args:
+            node_feats_raw: [B, N_phys, 4] 原始节点特征
+            node_if:        [B, N_phys] 节点 IF (Hz) — 当前帧
+            r_obs:          [B, M] 实测边比值 — 当前帧
+            cond_ctx:       [B, d_cond] 工况上下文 — 当前帧
+            drft_feats:     [B, M] DRIFT 边特征 — 当前帧
+            comp_feats:     [B, M] COMPETITION 边特征 — 当前帧 (dim=-Corr_E)
+
+        Returns:
+            h_enhanced:  [B, N_total, d_h]  含 OP + 物理节点
+            C_prior:     [B, N_phys]
+            gate_edge:   [B, M]
+            gate_node:   [B, N_total]
+        """
+        B = node_feats_raw.shape[0]
         device = node_feats_raw.device
-        M = self.M_proto
 
-        # ── 5a. 频率距离门控 ──
-        # |f_obs - f_nom| / f_nom
-        f_obs_exp = node_freqs.unsqueeze(-1)  # [B, K, 1]
-        f_nom_exp = self.f_nom.view(1, 1, M)   # [1, 1, M]
-        freq_dist = (f_obs_exp - f_nom_exp).abs() / f_nom_exp.clamp(min=1e-8)
-        # [B, K, M]
+        # ── C_prior (物理节点) ──
+        C_prior_raw = torch.sigmoid(self.C_prior_logit)  # [N_phys]
+        # 工况调制: cond_ctx -> per-node bias
+        cond_mod = self.op_proj(cond_ctx)[:, :self.N_phys]  # [B, N_phys]
+        cond_mod = cond_mod.mean(dim=-1, keepdim=True).expand(-1, self.N_phys)
+        # Simple additive modulation
+        C_prior = (C_prior_raw.unsqueeze(0) + 0.1 * torch.tanh(cond_mod)).clamp(0.01, 0.99)
+        # [B, N_phys]
 
-        # 频率门控: 最近原型匹配得分
-        match_score = torch.exp(-freq_dist / self.temperature)  # [B, K, M]
-        gate, _ = match_score.max(dim=-1)  # [B, K]
-        best_proto = match_score.argmax(dim=-1)  # [B, K]
+        # ── 物理节点特征投影 ──
+        h_raw = self.node_proj(node_feats_raw)  # [B, N_phys, d_h]
 
-        # ── 5b. 先验可压缩性 ──
-        C_prior = self.C_prior_proto[best_proto]  # [B, K]
-        # gate 很低时, C_prior 退火到中性值 0.5
-        C_prior = gate * C_prior + (1 - gate) * 0.5  # [B, K]
+        # ── OP 虚拟节点特征 ──
+        h_op = self.op_proj(cond_ctx)  # [B, d_h]
 
-        # ── 5c. 节点特征投影 ──
-        h_raw = self.node_proj(node_feats_raw)  # [B, K, d_h]
+        # ── 类型增强 ──
+        type_emb = self.f_type_embed(self.type_idx.to(device))    # [N_phys, f_dim]
+        type_feat = self.type_proj(type_emb)                       # [N_phys, d_h]
+        proto_feat = self.prototype_embed + type_feat              # [N_phys, d_h]
 
-        # ── 5d. 交叉注意力: anonymous node → prototype ──
-        # 增强原型嵌入: 加上类型信息
-        type_emb = self.f_type_embed(self.f_type_idx.to(device))  # [M, f_type_embed_dim]
-        type_feat = self.type_proj(type_emb)  # [M, d_h]
-        proto_feat = self.prototype_embed + type_feat  # [M, d_h]
+        # 交叉注意力: physical nodes -> prototypes
+        Q = self.W_q(h_raw)             # [B, N_phys, d_h]
+        K_p = self.W_k(proto_feat)      # [N_phys, d_h]
+        V_p = self.W_v(proto_feat)      # [N_phys, d_h]
 
-        Q = self.W_q(h_raw)  # [B, K, d_h]
-        K_p = self.W_k(proto_feat)  # [M, d_h]
-        V_p = self.W_v(proto_feat)  # [M, d_h]
-
-        # 注意力得分 (同时考虑语义 + 频率匹配)
         attn_scores = torch.matmul(Q, K_p.T) / math.sqrt(h_raw.shape[-1])
-        # [B, K, M]
+        self_bias = torch.eye(self.N_phys, device=device) * 3.0
+        attn_scores = attn_scores + self_bias.unsqueeze(0)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, N_phys, N_phys]
+        proto_context = torch.matmul(attn_weights, V_p)  # [B, N_phys, d_h]
 
-        # 频率偏置: 匹配得分高的原型获得注意力偏置
-        freq_bias = match_score * 3.0  # scale factor to influence attention
-        attn_scores = attn_scores + freq_bias
+        # ── 门控融合 ──
+        edge_src_t = torch.tensor([e.src for e in PHYSICS_EDGES], device=device)
+        edge_dst_t = torch.tensor([e.dst for e in PHYSICS_EDGES], device=device)
 
-        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, K, M]
+        # 边门控
+        comp_t = comp_feats.unsqueeze(-1) if comp_feats is not None else None
+        gate_edge, cond_sim = self.compute_edge_gates(
+            r_obs.unsqueeze(-1), h_raw, cond_ctx.unsqueeze(1),
+            drft_feats.unsqueeze(-1), comp_t
+        )
+        gate_edge = gate_edge.squeeze(-1)  # [B, M]
+        cond_sim = cond_sim.squeeze(-1)     # [B, len(CONDITION_EDGES)]
 
-        # 原型上下文
-        proto_context = torch.matmul(attn_weights, V_p)  # [B, K, d_h]
+        # 逐节点门控 (含 OP)
+        gate_node = torch.zeros(B, self.N_total, device=device)
+        for m in range(len(PHYSICS_EDGES)):
+            s, d = edge_src_t[m], edge_dst_t[m]
+            g = gate_edge[:, m]
+            gate_node[:, s] = torch.max(gate_node[:, s], g)
+            gate_node[:, d] = torch.max(gate_node[:, d], g)
+        gate_node = gate_node.clamp(0.0, 1.0)
 
-        # ── 5e. 门控融合 ──
-        # gate → 1: 原型上下文主导
-        # gate → 0: 原始特征主导
-        gate_exp = gate.unsqueeze(-1)  # [B, K, 1]
-        h_enhanced = (1 - gate_exp) * h_raw + gate_exp * proto_context
-        # [B, K, d_h]
+        # 门控融合物理节点
+        gate_exp = gate_node[:, 1:].unsqueeze(-1)  # [B, N_phys, 1]
+        h_phys_enhanced = (1 - gate_exp) * h_raw + gate_exp * proto_context
+        # [B, N_phys, d_h]
 
-        return h_enhanced, gate, C_prior
+        # 组装: [OP | PHYS_0 | PHYS_1 | PHYS_2]
+        h_enhanced = torch.cat([
+            h_op.unsqueeze(1),           # [B, 1, d_h]
+            h_phys_enhanced,             # [B, N_phys, d_h]
+        ], dim=1)  # [B, N_total, d_h]
+
+        return h_enhanced, C_prior, gate_edge, gate_node, cond_sim
 
 
-# ============================================================
-# 6. EdgeConditionedGAT: 边条件图注意力 → Compressibility Token
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+# 3. EdgeConditionedGAT (mostly unchanged)
+# ═══════════════════════════════════════════════════════════════
+
+def scatter_softmax(scores: torch.Tensor, indices: torch.Tensor,
+                    N: int) -> torch.Tensor:
+    """沿 scatter 索引做分组 softmax (多头并行)."""
+    B, M, H = scores.shape
+    device = scores.device
+    idx_exp = indices.view(1, M, 1).expand(B, -1, H)
+
+    max_per_group = torch.zeros(B, N, H, device=device)
+    max_per_group = max_per_group.scatter_reduce(
+        1, idx_exp, scores, reduce='amax', include_self=False
+    )
+    scores_max = scores - max_per_group[:, indices]
+    exp_scores = torch.exp(scores_max)
+
+    sum_exp = torch.zeros(B, N, H, device=device)
+    sum_exp = sum_exp.scatter_add(1, idx_exp, exp_scores)
+    probs = exp_scores / (sum_exp[:, indices].clamp(min=1e-8))
+    return probs
+
 
 class EdgeConditionedGATLayer(nn.Module):
-    """
-    单层边条件图注意力。
+    """单层边条件图注意力."""
 
-    α_ij = softmax_j( LeakyReLU( a^T [W_q h_i || W_k h_j || W_e e_ij] ) )
-    """
-
-    def __init__(self, d_h, d_e=4, n_heads=4, dropout=0.1):
+    def __init__(self, d_h: int, d_e: int = 5, n_heads: int = 4,
+                 dropout: float = 0.1):
         super().__init__()
         assert d_h % n_heads == 0
         self.d_h = d_h
         self.d_e = d_e
         self.n_heads = n_heads
         self.d_head = d_h // n_heads
-        self.scale = self.d_head ** -0.5
-        self.dropout = dropout
+        self.dropout_rate = dropout
 
         self.W_q = nn.Linear(d_h, d_h, bias=False)
         self.W_k = nn.Linear(d_h, d_h, bias=False)
         self.W_v = nn.Linear(d_h, d_h, bias=False)
         self.W_e = nn.Linear(d_e, d_h, bias=False)
 
-        self.attn_a = nn.Parameter(torch.randn(n_heads, 3 * self.d_head) * 0.02)
-
+        self.attn_a = nn.Parameter(
+            torch.randn(n_heads, 3 * self.d_head) * 0.02
+        )
         self.out_proj = nn.Linear(d_h, d_h)
-        self.dropout_layer = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, h, edge_feats, edge_src, edge_dst):
-        """
-        Args:
-            h:          [B, N, d_h]
-            edge_feats: [B, M, d_e]
-            edge_src:   [M]
-            edge_dst:   [M]
-
-        Returns:
-            h_out: [B, N, d_h]
-            attn:  [B, M, n_heads]  — A_ij 内部诊断探针
-        """
+    def forward(self, h: torch.Tensor, edge_feats: torch.Tensor,
+                edge_src: torch.Tensor, edge_dst: torch.Tensor):
         B, N, _ = h.shape
         M = edge_feats.shape[1]
         device = h.device
@@ -1268,67 +466,33 @@ class EdgeConditionedGATLayer(nn.Module):
         V = self.W_v(h).view(B, N, self.n_heads, self.d_head)
         E = self.W_e(edge_feats).view(B, M, self.n_heads, self.d_head)
 
-        Q_dst = Q[:, edge_dst]  # [B, M, H, d_head]
+        Q_dst = Q[:, edge_dst]
         K_src = K[:, edge_src]
-        cat_feat = torch.cat([Q_dst, K_src, E], dim=-1)  # [B, M, H, 3*d_head]
+        cat_feat = torch.cat([Q_dst, K_src, E], dim=-1)
 
         attn_logits = (cat_feat * self.attn_a.view(1, 1, self.n_heads, -1)
-                       ).sum(dim=-1)  # [B, M, H]
+                      ).sum(dim=-1)
         attn_scores = F.leaky_relu(attn_logits, negative_slope=0.2)
         attn_weights = scatter_softmax(attn_scores, edge_dst, N)
 
-        attn = attn_weights  # A_ij 诊断探针
-
-        V_src = V[:, edge_src]  # [B, M, H, d_head]
+        V_src = V[:, edge_src]
         msg = attn_weights.unsqueeze(-1) * V_src
 
         h_new = torch.zeros(B, N, self.n_heads, self.d_head, device=device)
-        dst_expanded = edge_dst.view(1, M, 1, 1).expand(B, -1, self.n_heads, self.d_head)
-        h_new = h_new.scatter_add(1, dst_expanded, msg)
+        dst_exp = edge_dst.view(1, M, 1, 1).expand(B, -1, self.n_heads, self.d_head)
+        h_new = h_new.scatter_add(1, dst_exp, msg)
         h_new = h_new.reshape(B, N, self.d_h)
 
         h_out = F.relu(self.out_proj(h_new))
-        h_out = self.dropout_layer(h_out)
-
-        return h_out, attn
-
-
-def scatter_softmax(scores, indices, N):
-    """
-    沿 scatter 索引做分组 softmax。
-    多头并行: scores [B, M, H], indices [M], N 为分组数。
-    """
-    B, M, H = scores.shape
-    device = scores.device
-
-    idx_exp = indices.view(1, M, 1).expand(B, -1, H)
-
-    # 每组的 max (数值稳定)
-    max_per_group = torch.zeros(B, N, H, device=device)
-    max_per_group = max_per_group.scatter_reduce(1, idx_exp, scores,
-                                                  reduce='amax', include_self=False)
-
-    scores_max = scores - max_per_group[:, indices]
-    exp_scores = torch.exp(scores_max)
-
-    sum_exp = torch.zeros(B, N, H, device=device)
-    sum_exp = sum_exp.scatter_add(1, idx_exp, exp_scores)
-
-    probs = exp_scores / (sum_exp[:, indices].clamp(min=1e-8))
-    return probs
+        h_out = self.dropout(h_out)
+        return h_out, attn_weights
 
 
 class EdgeConditionedGAT(nn.Module):
-    """
-    Edge-Conditioned GAT: L 层消息传递 → 单一 Compressibility Token 输出。
+    """L 层 Edge-Conditioned GAT -> w_i (IF trust)."""
 
-    输出:
-      C_i:  [B, N] ∈ (0, 1]  每条脊线的物理可压缩性令牌 (决策结果)
-      A_ij: [B, M, H]        最终层注意力权重 (因果推理过程, 诊断探针)
-    """
-
-    def __init__(self, d_h=128, d_e=4, n_heads=4, n_layers=2,
-                 dropout=0.1):
+    def __init__(self, d_h: int = 128, d_e: int = 5, n_heads: int = 4,
+                 n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_h = d_h
         self.n_layers = n_layers
@@ -1341,36 +505,22 @@ class EdgeConditionedGAT(nn.Module):
             nn.LayerNorm(d_h) for _ in range(n_layers)
         ])
 
-        # C_i 输出头: h_i^(L) → C_i ∈ (0, 1]
-        # 两层 MLP + sigmoid
-        self.mlp_compress = nn.Sequential(
+        # w_i 输出头: h_i^(L) -> w_i in (0, 1)  per physical node
+        self.mlp_w = nn.Sequential(
             nn.Linear(d_h, d_h // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_h // 2, 1),
         )
 
-        # 融合 gate 和 C_prior (来自 PPM) 的输入投影
-        self.input_proj = nn.Linear(d_h + 1, d_h)  # d_h features + C_prior
-
-    def forward(self, h, edge_feats, edge_src, edge_dst, C_prior):
+    def forward(self, h: torch.Tensor, edge_feats: torch.Tensor,
+                edge_src: torch.Tensor, edge_dst: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            h:          [B, N, d_h] PPM 增强的节点特征
-            edge_feats: [B, M, d_e] 观测边特征
-            edge_src:   [M]
-            edge_dst:   [M]
-            C_prior:    [B, N] 先验可压缩性 (来自 PPM)
-
         Returns:
-            C_i:  [B, N] Compressibility Token ∈ (0, 1]
-            A_ij: [B, M, H] 注意力权重 (诊断探针)
+            w_i:  [B, N_phys] IF 可信度 (仅物理节点, 不含 OP)
+            A_ij: [B, M, H] 注意力权重
         """
-        # 注入 C_prior 作为输入特征
-        h = torch.cat([h, C_prior.unsqueeze(-1)], dim=-1)  # [B, N, d_h+1]
-        h = self.input_proj(h)  # [B, N, d_h]
-
-        # ── 多层 GAT ──
         A_ij = None
         for i, (layer, norm) in enumerate(zip(self.layers, self.layer_norms)):
             residual = h
@@ -1379,326 +529,581 @@ class EdgeConditionedGAT(nn.Module):
             if i == self.n_layers - 1:
                 A_ij = attn
 
-        # ── C_i 输出 ──
-        C_logits = self.mlp_compress(h).squeeze(-1)  # [B, N]
-        C_i = torch.sigmoid(C_logits)  # (0, 1) → 自然满足 (0, 1]
-        # C_i → 1: 高可信度, 可激进挤压
-        # C_i → 0: 低可信度, 保守保留
-
-        return C_i, A_ij
+        # 仅从物理节点输出 w_i
+        h_phys = h[:, 1:, :]  # [B, N_phys, d_h] — skip OP
+        w_logits = self.mlp_w(h_phys).squeeze(-1)  # [B, N_phys]
+        w_i = torch.sigmoid(w_logits)
+        return w_i, A_ij
 
 
-# ============================================================
-# 7. AdaptiveSqueeze: 自适应高斯核挤压 (确定性映射)
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+# 4. SqueezeIterationController (formerly PerBinOrderSelector)
+# ═══════════════════════════════════════════════════════════════
 
-class AdaptiveSqueeze(nn.Module):
+class SqueezeIterationController(nn.Module):
     """
-    高斯软核自适应同步压缩。
+    挤压迭代次数控制.
 
-    σ_sq(t,η) = σ_min + (1 - C_{i*(t,η)}(t)) · (σ_max - σ_min)
+    关键洞察: MSST 的 lookup 迭代对所有 bin 无害 (总是朝能量集中方向走),
+    因此所有 bin 统一用 omega_5 (最优 IF)。GAT 控制的是挤压轮数:
+      - 2xBPF: lambda=1 (一轮到位, 已收敛)
+      - BPF:    lambda=3~5 (多轮, 每轮重估 IF 提升 SNR)
+      - LOW_FREQ: lambda=0 (不挤)
 
-    σ 映射是确定性的——无学习参数，梯度通过 C_i 回传。
+    节点级 lambda_i = round(w_i * N_max)
+    bin 级 ridge_factor = energy_ratio * ridge_decay (脊线 bin→全参与, 远离 bin→跳过)
     """
 
-    def __init__(self, freq_bins, sigma_min=0.5, sigma_max=15.0, kernel_size=31):
+    def __init__(self, N_max: int = 5):
         super().__init__()
-        self.freq_bins = freq_bins
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.kernel_size = kernel_size
-        self.pad = kernel_size // 2
+        self.N_max = N_max
 
-    def forward(self, mag, C_i, node_if, freqs):
+    def forward(self, w_i: torch.Tensor,
+                tfr_mag: torch.Tensor, freqs: torch.Tensor,
+                node_if: torch.Tensor, bw_expected: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            mag:     [B, F, T] 幅度谱
-            C_i:     [B, K, T] 可压缩性令牌 (已时间对齐)
-            node_if: [B, K, T] 匿名脊线频率 (已时间对齐)
-            freqs:   [F] 频率轴
+            w_i:         [B, N_phys, T]  IF 可信度
+            tfr_mag:     [B, F, T]  STFT 幅值
+            freqs:       [F] 频率轴 (Hz)
+            node_if:     [B, N_phys, T]  节点 IF (Hz)
+            bw_expected: [N_phys] 预期带宽 (Hz)
 
         Returns:
-            tfr_enhanced: [B, F, T]  挤压后 TFR
-            sigma_sq:     [B, F, T]  逐 bin 带宽
+            lambda_i:     [B, N_phys, T]  节点级挤压轮数 (0..N_max)
+            ridge_factor: [B, F, T]  逐 bin 挤压参与因子 (0..1)
         """
-        B, F, T = mag.shape
-        device = mag.device
+        B, N_phys, T = w_i.shape
+        F = freqs.shape[0]
+        device = w_i.device
+        eps = 1e-8
 
-        # ── 确定性 σ 映射 ──
-        # σ_i = σ_min + (1 - C_i) · (σ_max - σ_min)
-        delta = self.sigma_max - self.sigma_min
-        sigma_i = self.sigma_min + (1.0 - C_i) * delta  # [B, K, T]
+        # ── lambda_i: 节点级挤压轮数 ──
+        lambda_i = torch.round(w_i * self.N_max).long()  # [B, N_phys, T]
+        lambda_i = lambda_i.clamp(0, self.N_max)
 
-        # ── TF bin → 脊线分配 ──
-        # 每个 TF bin 归属到最近的匿名脊线 (argmin, detach)
+        # ── ridge_factor: bin 级参与因子 ──
+        # 逐 bin 分配到最近物理节点
         freqs_exp = freqs.view(1, 1, F, 1)           # [1, 1, F, 1]
-        node_if_exp = node_if.unsqueeze(2)           # [B, K, 1, T]
-        dist = (freqs_exp - node_if_exp).abs()       # [B, K, F, T]
-        i_star = dist.argmin(dim=1)                  # [B, F, T] (detach)
+        node_if_exp = node_if.unsqueeze(2)             # [B, N_phys, 1, T]
+        dist = (freqs_exp - node_if_exp).abs()         # [B, N_phys, F, T]
+        i_star = dist.argmin(dim=1)                     # [B, F, T]
 
-        # 继承 σ: 每个 bin 使用其归属脊线的挤压带宽
-        B_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, F, T)
-        T_idx = torch.arange(T, device=device).view(1, 1, T).expand(B, F, -1)
-        sigma_sq = sigma_i[B_idx, i_star, T_idx]  # [B, F, T]
-        sigma_sq = sigma_sq.clamp(min=0.3)
+        # 每帧, 每个节点频段内的脊线位置 (能量最大 bin)
+        # 需要在节点频段内找 argmax — 简化为全局频段内能量最大
+        ridge_factor = torch.zeros(B, F, T, device=device)
+        bw_exp = bw_expected.view(1, N_phys, 1).to(device)  # [1, N_phys, 1]
 
-        # ── 高斯模糊 ──
-        tfr_enhanced = self._gaussian_blur_along_freq(mag, sigma_sq)
+        for n in range(N_phys):
+            node_mask = (i_star == n)  # [B, F, T]
 
-        return tfr_enhanced, sigma_sq
+            # 该节点的脊线 (逐帧, 在 assigned bin 内找 max energy)
+            tfr_masked = tfr_mag.clone()
+            tfr_masked[~node_mask] = 0.0
 
-    def _gaussian_blur_along_freq(self, mag, sigma_sq):
+            # 脊线位置 (energy-weighted mean 而非 argmax, 更鲁棒)
+            ridge_energy = tfr_masked.max(dim=1).values  # [B, T] — 脊线能量
+            ridge_pos_f = (tfr_masked * freqs_exp.squeeze(1).squeeze(1).view(1, F, 1)).sum(dim=1) / \
+                          tfr_masked.sum(dim=1).clamp(min=eps)  # [B, T] — energy-weighted freq
+
+            # 对所有 bin 计算到脊线的距离
+            f_all = freqs.view(1, F, 1)  # [1, F, 1]
+            ridge_f_exp = ridge_pos_f.unsqueeze(1)  # [B, 1, T]
+            ridge_dist = (f_all - ridge_f_exp).abs() / bw_exp[:, n:n+1, :].clamp(min=eps)  # [B, F, T]
+            ridge_decay = torch.exp(-ridge_dist ** 2 / 2.0)
+
+            # 能量比
+            max_e = ridge_energy.unsqueeze(1).clamp(min=eps)  # [B, 1, T]
+            energy_ratio = tfr_mag / max_e
+
+            ridge_factor = ridge_factor + node_mask.float() * energy_ratio * ridge_decay
+
+        ridge_factor = ridge_factor.clamp(0.0, 1.0)
+
+        return lambda_i, ridge_factor
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. SparseGaussianReassigner (replaces AdaptiveSqueeze)
+# ═══════════════════════════════════════════════════════════════
+
+class SparseGaussianReassigner(nn.Module):
+    """
+    论文式稀疏矩阵软重排: s_n = A_n(sigma, N*) · f_n
+
+    每列 m 的重排矩阵 A_n 仅有 2*ceil(3*sigma)+1 个非零元素,
+    沿频率轴呈高斯分布, 中心位于 omega_hat[N*(m)].
+
+    实现: scatter_add with pre-computed Gaussian weights.
+
+    Args:
+        sigma_min:     最小核宽 (bin)
+        sigma_max:     最大核宽 (bin)
+        n_sigma_levels: sigma 量化级别
+        kernel_radius: 核半径倍数 (default 3.0 -> 3*sigma)
+    """
+
+    def __init__(self, sigma_min: float = 0.5, sigma_max: float = 15.0,
+                 n_sigma_levels: int = 20, kernel_radius: float = 3.0):
+        super().__init__()
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.n_sigma_levels = n_sigma_levels
+        self.kernel_radius = kernel_radius
+
+    def forward(self, tfr_mag: torch.Tensor, omegas: torch.Tensor,
+                sigma_sq: torch.Tensor, freqs: torch.Tensor,
+                ridge_factor: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        沿频率轴做可变带宽高斯模糊 (离散化到 L 级别 → conv1d 批量执行)。
+        Args:
+            tfr_mag:      [B, F, T] STFT 幅值
+            omegas:       [B, N_max, F, T] IF 轨迹 (int32 bin indices, 1-indexed)
+            sigma_sq:     [B, F, T] 逐 bin 核宽 (bin)
+            freqs:        [F] 频率轴
+            ridge_factor: [B, F, T] 逐 bin 挤压参与因子 (0..1, 可选)
+
+        Returns:
+            tfr_enhanced: [B, F, T] 稀疏重排后的 TFR
         """
-        B, F_bins, T = mag.shape
-        device = mag.device
+        B, F, T = tfr_mag.shape
+        device = tfr_mag.device
 
-        n_levels = 20
-        sigma_min_eff = 0.5
-        sigma_max_eff = float(self.kernel_size) / 3.0
+        # ── 所有 bin 统一使用 omega_5 (最优 IF) ──
+        # MSST lookup 对所有 bin 无害, 不需要选层
+        omega_final = omegas[:, -1, :, :]  # [B, F, T] — 5 次 lookup 的 IF
+        omega_hat = (omega_final.float() - 1.0).clamp(0, F - 1)  # [B, F, T]
 
-        sigma_clipped = sigma_sq.clamp(sigma_min_eff, sigma_max_eff)
-        levels = torch.linspace(sigma_min_eff, sigma_max_eff, n_levels, device=device)
+        # ── ridge_factor: 逐 bin 挤压参与权重 ──
+        if ridge_factor is not None:
+            tfr_weighted = tfr_mag * ridge_factor  # 远离脊线的 bin 能量被衰减
+        else:
+            tfr_weighted = tfr_mag
 
-        dist = (sigma_clipped.unsqueeze(-1) - levels.view(1, 1, 1, -1)).abs()
-        level_idx = dist.argmin(dim=-1)  # [B, F, T]
+        # ── sigma_clipped 量化到 levels ──
+        sigma_clipped = sigma_sq.clamp(self.sigma_min, self.sigma_max)
+        levels = torch.linspace(self.sigma_min, self.sigma_max,
+                                self.n_sigma_levels, device=device)
 
-        x = torch.arange(-self.pad, self.pad + 1, device=device).float()
-        kernels = []
-        for l_idx in range(n_levels):
+        dist_to_level = (sigma_clipped.unsqueeze(-1)
+                        - levels.view(1, 1, 1, -1)).abs()
+        level_idx = dist_to_level.argmin(dim=-1)  # [B, F, T]
+
+        # ── 对每个 level 预计算高斯核 ──
+        max_k = int(np.ceil(self.kernel_radius * self.sigma_max))
+        x_offsets = torch.arange(-max_k, max_k + 1, device=device).float()
+
+        tfr_enhanced = torch.zeros(B, F, T, device=device, dtype=tfr_mag.dtype)
+
+        for l_idx in range(self.n_sigma_levels):
             sigma_l = levels[l_idx]
-            k = torch.exp(-0.5 * (x / sigma_l.clamp(min=0.1)) ** 2)
-            k = k / (k.sum() + 1e-8)
-            kernels.append(k)
-        kernel_weights = torch.stack(kernels, dim=0).unsqueeze(1)  # [L, 1, K_size]
+            k_limit = int(np.ceil(self.kernel_radius * sigma_l.item()))
+            x_window = x_offsets[max_k - k_limit:max_k + k_limit + 1]
 
-        mag_bt = mag.permute(0, 2, 1).reshape(B * T, 1, F_bins)
-        mag_pad = F.pad(mag_bt, (self.pad, self.pad), mode='replicate')
-        blurred_all = F.conv1d(mag_pad, kernel_weights, groups=1)  # [B*T, L, F]
+            # Gaussian weights
+            weights = torch.exp(-0.5 * (x_window / sigma_l.clamp(min=0.1)) ** 2)
+            weights = weights / (weights.sum() + 1e-8)
 
-        blurred_all = blurred_all.reshape(B, T, n_levels, F_bins).permute(0, 2, 3, 1)
-        # [B, L, F, T]
+            # 找到使用该 level 的所有 bin
+            mask = (level_idx == l_idx)  # [B, F, T]
+            if not mask.any():
+                continue
 
-        B_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, F_bins, T)
-        F_idx = torch.arange(F_bins, device=device).view(1, F_bins, 1).expand(B, -1, T)
-        T_idx = torch.arange(T, device=device).view(1, 1, T).expand(B, F_bins, -1)
-        result = blurred_all[B_idx, level_idx, F_idx, T_idx]
+            # 对每个匹配的 bin: 目标位置 = omega_hat + x_window
+            omega_masked = omega_hat[mask]  # [N_active]
+            # Clamp target positions
+            for k, offset in enumerate(x_window):
+                target = (omega_masked + offset.item()).round().long().clamp(0, F - 1)
+                w = weights[k]
+                # Scatter add
+                b_idx_active, f_idx_active, t_idx_active = torch.where(mask)
+                tfr_enhanced[
+                    b_idx_active, target, t_idx_active
+                ] += w * tfr_weighted[b_idx_active, f_idx_active, t_idx_active]
 
-        return result
+        return tfr_enhanced
 
 
-# ============================================================
-# 8. SAST: 顶层模块
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+# 6. SAST — Top-level Module
+# ═══════════════════════════════════════════════════════════════
 
 class SAST(nn.Module):
     """
-    Structure-Aware Synchrosqueezing Transform.
+    Structure-Aware Synchrosqueezing Transform (v3).
 
     数据流:
-      Signal → HMST 高阶 IF 估计 → BlindRidgeExtractor → Anonymous Graph
-      → PhysicsPrototypeMemory → EdgeConditionedGAT → C_i
-      → AdaptiveSqueeze → Physical TFR
+      Signal -> MSST (N_max=5, save_trajectory) -> NodeFeatures + omegas
+      -> V_obs from node energy -> StaticPrototypeMatcher -> cond_ctx, alpha
+      -> Per-frame: PPM (OP + phys nodes) -> GAT (6 edges) -> w_i
+      -> sigma_i = sigma_min + (1-w_i)*Delta_sigma
+      -> PerBinOrderSelector -> N_star (推理用)
+      -> SparseGaussianReassigner(omegas[N_star], sigma_i) -> TFR_sast
+
+    训练时: 统一使用 omegas[-1] (最高阶), 仅 sigma_i 可微
+    推理时: 四参数全启用 (sigma_i + lambda_i + IF order + w_i)
 
     Args:
-        prototype_config: 物理原型配置 (默认水泵水轮机)
-        fs:               采样率
-        n_fft:            FFT 点数
-        hop_length:       帧移
+        fs:               采样率 (Hz)
+        freq_regions:     物理节点频率区域定义
         d_h:              GAT 隐层维度
         n_heads:          注意力头数
         n_layers:         GAT 层数
-        K_ridges:         匿名脊线数
-        sigma_min:        最小挤压带宽 (bin)
-        sigma_max:        最大挤压带宽 (bin)
-        hmst_order:       HMST IF 估计阶数 (1=标准一阶, 2=二阶对线性调频无偏,
-                          3=三阶对二次调频/强时变 IF 无偏)
-        hmst_sigma:       高斯窗 σ (样本数), 默认 n_fft/8
+        sigma_min:        最小核宽 (bin)
+        sigma_max:        最大核宽 (bin)
+        N_max:            MSST 最大迭代次数
+        msst_num:         MSST 迭代次数 (训练时使用, 应 >= N_max)
+        d_cond:           工况上下文维度
+        prototype_temperature: 原型匹配 softmax 温度
     """
 
-    def __init__(self, prototype_config=None, fs=1000, n_fft=512,
-                 hop_length=128, d_h=128, n_heads=4, n_layers=2,
-                 K_ridges=6, sigma_min=0.5, sigma_max=15.0,
-                 f_type_embed_dim=16, dropout=0.1,
-                 hmst_order=2, hmst_sigma=None):
+    def __init__(self, fs: int = 1000,
+                 freq_regions: Optional[List[FreqRegion]] = None,
+                 d_h: int = 128, n_heads: int = 4, n_layers: int = 2,
+                 sigma_min: float = 0.5, sigma_max: float = 15.0,
+                 N_max: int = 5, msst_num: int = 5,
+                 msst_hlength: Optional[int] = None,
+                 d_cond: int = 32,
+                 f_type_embed_dim: int = 16,
+                 ppn_temperature: float = 0.08,
+                 prototype_temperature: float = 0.1,
+                 dropout: float = 0.1):
         super().__init__()
         self.fs = fs
-        self.n_fft = n_fft
-        self.hop_length = hop_length
         self.d_h = d_h
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
-        self.K_ridges = K_ridges
-        self.hmst_order = hmst_order
-        self.hmst_sigma = hmst_sigma if hmst_sigma is not None else n_fft / 8.0
+        self.N_max = N_max
+        self.msst_num = max(msst_num, N_max)
 
-        # HMST 高斯窗 buffer (预计算, 避免每次 forward 重新生成)
-        dtype = torch.float32
-        self.register_buffer('_w_gauss',
-                             _gaussian_window(n_fft, self.hmst_sigma, dtype=dtype))
-        self.register_buffer('_w_deriv',
-                             _gaussian_deriv_window(n_fft, self.hmst_sigma, fs, dtype=dtype))
-        if hmst_order >= 2:
-            self.register_buffer('_w_tw',
-                                 _gaussian_tw_window(n_fft, self.hmst_sigma, dtype=dtype))
-        if hmst_order >= 3:
-            self.register_buffer('_w_t2w',
-                                 _gaussian_t2w_window(n_fft, self.hmst_sigma, dtype=dtype))
+        # ── 频率区域 ──
+        self.regions = freq_regions if freq_regions is not None else PUMP_TURBINE_REGIONS
+        self.N_phys = len(self.regions)
 
-        # ── 8a. Blind Ridge Extractor ──
-        self.ridge_extractor = BlindRidgeExtractor(K=K_ridges, fs=fs)
-
-        # ── 8b. Physics Prototype Memory ──
-        self.ppm = PhysicsPrototypeMemory(
-            prototype_config=prototype_config,
-            d_h=d_h,
-            f_type_embed_dim=f_type_embed_dim,
-            fs=fs,
+        # ── MSST Node Extractor (CPU, numpy) ──
+        self.node_extractor = MSSTNodeExtractor(
+            fs=fs, freq_regions=self.regions,
+            msst_hlength=msst_hlength, msst_num=self.msst_num,
         )
 
-        # ── 8c. Edge-Conditioned GAT ──
+        # ── Physics Graph ──
+        self.edges = PHYSICS_EDGES
+        self.M_edges = N_EDGES
+        edge_src_list = [e.src for e in self.edges]
+        edge_dst_list = [e.dst for e in self.edges]
+        self.register_buffer('edge_src',
+                            torch.tensor(edge_src_list, dtype=torch.long))
+        self.register_buffer('edge_dst',
+                            torch.tensor(edge_dst_list, dtype=torch.long))
+
+        # ── Static Prototype Matcher ──
+        self.prototype_matcher = StaticPrototypeMatcher(
+            d_cond=d_cond, temperature=prototype_temperature,
+        )
+
+        # ── Physics Prototype Memory ──
+        self.ppm = PhysicsPrototypeMemory(
+            d_h=d_h, f_type_embed_dim=f_type_embed_dim,
+            temperature=ppn_temperature, regions=self.regions,
+        )
+
+        # ── Edge-Conditioned GAT ──
         self.gat = EdgeConditionedGAT(
-            d_h=d_h, d_e=4, n_heads=n_heads,
+            d_h=d_h, d_e=5, n_heads=n_heads,
             n_layers=n_layers, dropout=dropout,
         )
 
-        # ── 8d. Adaptive Squeeze ──
-        F_bins = n_fft // 2 + 1
-        self.squeeze = AdaptiveSqueeze(F_bins, sigma_min, sigma_max)
-        self.F_bins = F_bins
+        # ── Squeeze Iteration Controller (推理用) ──
+        self.sqz_controller = SqueezeIterationController(N_max=N_max)
 
-        # 边特征维度固定为 4: [r_obs, r_std, energy_corr, confidence]
-        self.d_e = 4
+        # ── Sparse Gaussian Reassigner ──
+        self.reassigner = SparseGaussianReassigner(
+            sigma_min=sigma_min, sigma_max=sigma_max,
+        )
 
-    def to(self, device):
-        super().to(device)
-        return self
+    def _extract_nodes_single(self, x_np: np.ndarray) -> NodeFeatures:
+        """对单条信号运行 MSST + 节点特征提取 (CPU, numpy)."""
+        return self.node_extractor(x_np)
 
-    def forward(self, x, return_all=False):
+    def forward(self, x: torch.Tensor,
+                training: bool = True,
+                return_all: bool = False) -> Dict[str, torch.Tensor]:
         """
         Args:
-            x:          [B, T] 原始信号
-            return_all: 是否返回所有诊断量 (A_ij, C_i, gate 等)
+            x:          [B, T] 或 [T] 原始信号
+            training:   是否训练模式 (True: 固定 N_max 阶; False: 逐 bin 自适应)
+            return_all: 是否返回完整诊断量
 
         Returns:
-            若 return_all=False: tfr_enhanced [B, F_bins, T_frames]
-            若 return_all=True:  dict 含 tfr_enhanced, C_i, A_ij, gate 等
+            dict with keys:
+              tfr_enhanced  [B, F, T]  SAST 增强 TFR
+              tfr_raw       [B, F, T]  原始 STFT 幅度
+              w_i           [B, N_phys, T]  IF 可信度
+              sigma_sq      [B, F, T]     逐 bin 核宽
+              alpha         [B, T, 5]      原型注意力权重
+              A_ij          [B, M, H, T]   注意力权重
+              gate_edge     [B, M, T]      边门控
+              ...
         """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
         B, T_in = x.shape
         device = x.device
 
-        # ── 1. HMST: 高阶 IF 估计 + 幅度谱 ──
-        # 替代原来的 STFT → 一阶相位差分 IF
-        IF, mag = compute_hmst_if(
-            x, self.fs, n_fft=self.n_fft, hop_length=self.hop_length,
-            order=self.hmst_order, sigma=self.hmst_sigma,
-        )
-        # IF:  [B, F_bins, T_if]   (T_if = T_frames - 2)
-        # mag: [B, F_bins, T_frames]
+        # ═══════════════════════════════════════════════════════
+        # Step 1: Per-sample MSST + Node Extraction (CPU, numpy)
+        # ═══════════════════════════════════════════════════════
+        all_nodes: List[NodeFeatures] = []
+        all_tfr_mag = []
+        all_freqs = None
 
-        F_bins = IF.shape[1]
-        T_frames = mag.shape[2]
-        T_if = IF.shape[2]
-        freqs = torch.linspace(0, self.fs / 2, F_bins, device=device)
+        for b in range(B):
+            x_np = x[b].cpu().numpy()
+            nodes = self._extract_nodes_single(x_np)
+            all_nodes.append(nodes)
+            all_tfr_mag.append(np.abs(nodes.tfr_stft))
+            if all_freqs is None:
+                all_freqs = nodes.freqs.copy()
 
-        # mag 对齐到 T_if (丢弃首尾各一帧, 与 IF 对齐)
-        mag_aligned = mag[:, :, 1:-1]  # [B, F_bins, T_if]
+        T_msst = all_nodes[0].T
+        F_bins = len(all_freqs)
 
-        # ── 3. 盲脊线提取 ──
-        ridge_freq, ridge_energy, ridge_bw, ridge_persistence = \
-            self.ridge_extractor(mag_aligned, freqs)
-        # 所有: [B, K, T_if]
+        # ═══════════════════════════════════════════════════════
+        # Step 2: Convert to torch tensors
+        # ═══════════════════════════════════════════════════════
+        node_if_np = np.stack([n.if_hz for n in all_nodes])          # [B, N_phys, T]
+        node_energy_np = np.stack([n.energy for n in all_nodes])     # [B, N_phys, T]
+        node_bw_np = np.stack([n.bandwidth for n in all_nodes])      # [B, N_phys, T]
+        node_persist_np = np.stack([n.persistence for n in all_nodes])  # [B, N_phys]
+        tfr_mag_np = np.stack(all_tfr_mag)  # [B, F, T]
 
-        # ── 4. 匿名全连接图 ──
-        edge_src, edge_dst, edge_feats = build_anonymous_graph(
-            ridge_freq, ridge_energy, ridge_persistence, window_size=5
-        )
-        # edge_src/dst: [M] where M = K*(K-1)
-        # edge_feats:    [B, M, T_if, 4]
-        M = edge_src.shape[0]
+        # omegas: list of [F, T] per sample -> [B, N_max, F, T]
+        N_max_actual = len(all_nodes[0].omegas) if all_nodes[0].omegas else 0
+        omegas_np = np.stack([np.stack(n.omegas) for n in all_nodes])  # [B, N_max, F, T]
 
-        # ── 5. 逐帧: PPM → GAT ──
-        C_i_all = []
-        A_ij_all = []
-        gate_all = []
+        node_if = torch.from_numpy(node_if_np).float().to(device)
+        node_energy = torch.from_numpy(node_energy_np).float().to(device)
+        node_bw = torch.from_numpy(node_bw_np).float().to(device)
+        node_persist = torch.from_numpy(node_persist_np).float().to(device)
+        tfr_mag = torch.from_numpy(tfr_mag_np).float().to(device)
+        omegas = torch.from_numpy(omegas_np).long().to(device)
+        freqs = torch.from_numpy(all_freqs).float().to(device)
 
         fs_half = self.fs / 2.0
 
-        for t in range(T_if):
-            # ── 构建匿名节点原始特征 ──
-            # [f_norm, log_E, bw_norm, persistence]
-            f_norm = ridge_freq[:, :, t] / fs_half       # [B, K]
-            log_E = ridge_energy[:, :, t]                 # [B, K]
-            bw_norm = ridge_bw[:, :, t] / fs_half         # [B, K]
-            persist = ridge_persistence[:, :, t]          # [B, K]
+        # ═══════════════════════════════════════════════════════
+        # Step 3: V_obs -> StaticPrototypeMatcher -> cond_ctx
+        # ═══════════════════════════════════════════════════════
+        V_obs = self.prototype_matcher.compute_V_obs(node_energy, freqs)
+        cond_ctx, alpha = self.prototype_matcher(V_obs)  # [B, T, d_cond], [B, T, 5]
+
+        # ═══════════════════════════════════════════════════════
+        # Step 4: Edge features (numpy -> torch, with cond_ctx)
+        # ═══════════════════════════════════════════════════════
+        edge_feats_list = []
+        r_obs_list = []
+        for b in range(B):
+            ef = compute_edge_features(
+                node_if_np[b], node_energy_np[b], node_persist_np[b],
+                node_bw=node_bw_np[b], edges=self.edges,
+                window_size=5, fs=self.fs,
+            )
+            edge_feats_list.append(ef['edge_feats'])  # [M, T, 5]
+            r_obs_list.append(ef['edge_feats'][:, :, 0])  # [M, T] — HARMONIC uses dim 0
+
+        edge_feats_np = np.stack(edge_feats_list)  # [B, M, T, 5]
+        r_obs_np = np.stack(r_obs_list)            # [B, M, T]
+        edge_feats_t = torch.from_numpy(edge_feats_np).float().to(device)
+        r_obs_t = torch.from_numpy(r_obs_np).float().to(device)
+
+        # ═══════════════════════════════════════════════════════
+        # Step 5: Per-frame PPM -> GAT -> w_i
+        # ═══════════════════════════════════════════════════════
+        w_i_frames = []
+        A_ij_frames = []
+        gate_edge_frames = []
+        gate_node_frames = []
+
+        for t in range(T_msst):
+            # 原始节点特征: [f_norm, log_E, bw_norm, persistence]
+            f_norm = node_if[:, :, t] / fs_half          # [B, N_phys]
+            log_E = node_energy[:, :, t]                  # [B, N_phys]
+            bw_norm = node_bw[:, :, t] / fs_half          # [B, N_phys]
+            persist = node_persist                        # [B, N_phys]
 
             raw_feats = torch.stack([f_norm, log_E, bw_norm, persist], dim=-1)
-            # [B, K, 4]
+            # [B, N_phys, 4]
 
-            # PPM: 原型增强
-            h_enhanced, gate, C_prior = self.ppm(raw_feats, ridge_freq[:, :, t])
-            # h_enhanced: [B, K, d_h], gate: [B, K], C_prior: [B, K]
+            # PPM: 原型增强 + 边门控
+            # drft_feats: edge_feats dim 0 (Corr_E for DRIFT edges)
+            # comp_feats: edge_feats dim 0 (-Corr_E for COMPETITION edges)
+            h_enhanced, C_prior_t, gate_edge_t, gate_node_t, cond_sim_t = self.ppm(
+                raw_feats,
+                node_if[:, :, t],           # [B, N_phys]
+                r_obs_t[:, :, t],           # [B, M]
+                cond_ctx[:, t, :],          # [B, d_cond]
+                edge_feats_t[:, :, t, 0],   # [B, M] — DRIFT dim 0
+                edge_feats_t[:, :, t, 0],   # [B, M] — COMPETITION dim 0 (-Corr_E)
+            )
+            # h_enhanced: [B, N_total, d_h]
 
-            # 边特征
-            e_t = edge_feats[:, :, t, :]  # [B, M, 4]
+            # 注入 C_prior -> h_enhanced (OP padded, 物理节点 concatenated)
+            h_op_padded = F.pad(h_enhanced[:, :1, :], (0, 1))     # [B, 1, d_h+1]
+            h_phys_cat = torch.cat([
+                h_enhanced[:, 1:, :], C_prior_t.unsqueeze(-1)
+            ], dim=-1)                                             # [B, N_phys, d_h+1]
+            h_cat = torch.cat([h_op_padded, h_phys_cat], dim=1)   # [B, N_total, d_h+1]
 
-            # GAT: 输出 C_i
-            C_i_t, A_ij_t = self.gat(h_enhanced, e_t, edge_src, edge_dst, C_prior)
-            # C_i_t: [B, K], A_ij_t: [B, M, H]
+            h_gat_in = self.ppm.gat_input_proj(h_cat)  # [B, N_total, d_h]
 
-            C_i_all.append(C_i_t)
-            A_ij_all.append(A_ij_t)
-            gate_all.append(gate)
+            # ── Inject cond_sim into CONDITION edge features ──
+            edge_feats_frame = edge_feats_t[:, :, t, :].clone()  # [B, M, 5]
+            for i, m in enumerate(CONDITION_EDGE_INDICES):
+                edge_feats_frame[:, m, 0] = cond_sim_t[:, i]   # raw cos sim
 
-        C_i = torch.stack(C_i_all, dim=-1)    # [B, K, T_if]
-        A_ij = torch.stack(A_ij_all, dim=-1)  # [B, M, H, T_if]
-        gate = torch.stack(gate_all, dim=-1)  # [B, K, T_if]
+            # GAT
+            w_i_t, A_ij_t = self.gat(
+                h_gat_in, edge_feats_frame,
+                self.edge_src, self.edge_dst,
+            )
 
-        # ── 6. Adaptive Squeeze ──
-        # 时间对齐: 填充到 T_frames
-        C_i_padded = F.pad(C_i, (1, 1), mode='replicate')
-        ridge_freq_padded = F.pad(ridge_freq, (1, 1), mode='replicate')
+            w_i_frames.append(w_i_t)
+            A_ij_frames.append(A_ij_t)
+            gate_edge_frames.append(gate_edge_t)
+            gate_node_frames.append(gate_node_t)
 
-        tfr_enhanced, sigma_sq = self.squeeze(
-            mag, C_i_padded, ridge_freq_padded, freqs
+        w_i = torch.stack(w_i_frames, dim=-1)              # [B, N_phys, T]
+        A_ij = torch.stack(A_ij_frames, dim=-1)            # [B, M, H, T]
+        gate_edge = torch.stack(gate_edge_frames, dim=-1)  # [B, M, T]
+        gate_node = torch.stack(gate_node_frames, dim=-1)  # [B, N_total, T]
+
+        # ═══════════════════════════════════════════════════════
+        # Step 6: w_i -> sigma_i, N_star, order_idx
+        # ═══════════════════════════════════════════════════════
+        # sigma_i: per-node -> broadcast to per-bin
+        delta = self.sigma_max - self.sigma_min
+        sigma_i = self.sigma_min + (1.0 - w_i) * delta  # [B, N_phys, T]
+
+        # 逐 bin sigma: 分配到最近物理节点
+        freqs_exp = freqs.view(1, 1, F_bins, 1).to(device)
+        node_if_exp = node_if.unsqueeze(2)
+        dist = (freqs_exp - node_if_exp).abs()
+        i_star = dist.argmin(dim=1)  # [B, F_bins, T]
+
+        B_idx_f = torch.arange(B, device=device).view(B, 1, 1).expand(-1, F_bins, T_msst)
+        T_idx_f = torch.arange(T_msst, device=device).view(1, 1, T_msst).expand(B, F_bins, -1)
+        sigma_sq = sigma_i[B_idx_f, i_star, T_idx_f]  # [B, F_bins, T]
+
+        # ── Squeeze iteration control (推理时) ──
+        if not training:
+            bw_expected = torch.tensor([r.bw_expected for r in self.regions],
+                                      device=device, dtype=torch.float32)
+            lambda_sqz, ridge_factor = self.sqz_controller(
+                w_i, tfr_mag, freqs, node_if, bw_expected)
+        else:
+            ridge_factor = None  # 训练时所有 bin 全参与
+
+        # ═══════════════════════════════════════════════════════
+        # Step 7: Sparse Gaussian Reassignment
+        # 所有 bin 统一使用 omega_5 (最优 IF), sigma + ridge_factor 控制挤压
+        # ═══════════════════════════════════════════════════════
+        tfr_enhanced = self.reassigner(
+            tfr_mag, omegas, sigma_sq, freqs, ridge_factor,
         )
 
-        if return_all:
-            # 确定性 σ 映射 (用于诊断)
-            delta = self.sigma_max - self.sigma_min
-            sigma_i = self.sigma_min + (1.0 - C_i) * delta  # [B, K, T_if]
+        # ── 输出 ──
+        result = {
+            'tfr_enhanced': tfr_enhanced,
+            'tfr_raw': tfr_mag,
+            'w_i': w_i,
+            'sigma_sq': sigma_sq,
+            'alpha': alpha,            # [B, T, 5] 原型注意力
+            'cond_ctx': cond_ctx,      # [B, T, d_cond]
+            'A_ij': A_ij,
+            'gate_edge': gate_edge,
+            'gate_node': gate_node,
+            'node_if': node_if,
+            'node_energy': node_energy,
+            'node_bw': node_bw,
+            'freqs': freqs,
+            't_axis': torch.from_numpy(all_nodes[0].t_axis).float().to(device),
+            'edge_src': self.edge_src,
+            'edge_dst': self.edge_dst,
+            'edge_feats': edge_feats_t,
+        }
+        if not training:
+            result['lambda_sqz'] = lambda_sqz       # [B, N_phys, T] — 挤压轮数
+            result['ridge_factor'] = ridge_factor   # [B, F, T] — bin 参与因子
+        return result
 
-            return {
-                'tfr_enhanced': tfr_enhanced,
-                'tfr_raw': mag,
-                'C_i': C_i,              # Compressibility Token (决策)
-                'A_ij': A_ij,            # 注意力权重 (因果推理, 诊断探针)
-                'gate': gate,            # 原型匹配门控 (匹配质量)
-                'sigma_i': sigma_i,      # 逐脊线挤压带宽
-                'sigma_sq': sigma_sq,    # 逐 TF bin 带宽
-                'ridge_freq': ridge_freq,  # 匿名脊线频率
-                'edge_src': edge_src,
-                'edge_dst': edge_dst,
-                'edge_feats': edge_feats,  # 观测边特征
-                'freqs': freqs,
-                't_frames': torch.arange(T_frames, device=device).float()
-                            * self.hop_length / self.fs,
-            }
-        return tfr_enhanced
-
-    def get_freq_features(self, x):
-        """
-        DCMR 桥接: 时间池化 SAST TFR → 增强频域特征。
-
-        Args:
-            x: [B, T] 原始信号
-
-        Returns:
-            freq_feat: [B, F_bins] 增强频域特征
-        """
-        tfr = self.forward(x, return_all=False)
-        freq_feat_mean = tfr.mean(dim=-1)
-        freq_feat_max = tfr.max(dim=-1).values
-        freq_feat = freq_feat_mean + freq_feat_max
+    def get_freq_features(self, x: torch.Tensor) -> torch.Tensor:
+        """DCMR 桥接: 时间池化 SAST TFR -> 增强频域特征."""
+        out = self.forward(x)
+        tfr = out['tfr_enhanced']
+        freq_feat = tfr.mean(dim=-1) + tfr.max(dim=-1).values
         return freq_feat
+
+    def get_C_prior(self) -> torch.Tensor:
+        """返回当前学习的 C_prior 值."""
+        return self.ppm.get_C_prior()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7. Quick test
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("SAST v3 — Smoke Test (heterogeneous graph)")
+    print("=" * 60)
+    print(get_graph_summary())
+
+    # 合成测试信号
+    fs = 1000
+    T_end = 1.0
+    t = np.arange(0, T_end, 1 / fs)
+    N_sig = len(t)
+
+    sig = (np.sin(2 * np.pi * 48 * t + 0.15 * np.sin(2 * np.pi * 3 * t)) +
+           0.6 * np.sin(2 * np.pi * 96 * t) +
+           0.25 * np.sin(2 * np.pi * 12 * t) * (1 + 0.3 * np.sin(2 * np.pi * 0.5 * t)))
+    sig = sig.astype(np.float64)
+
+    print(f"\nSignal: T={N_sig}, fs={fs} Hz")
+    print("Components: BPF(~48 Hz, FM) + 2xBPF(96 Hz, clean) + LOW_FREQ(~12 Hz)")
+    print("Running SAST v3 forward pass...")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    model = SAST(fs=fs, d_h=64, n_heads=4, n_layers=2, N_max=3, msst_num=3).to(device)
+    model.eval()
+
+    x_t = torch.from_numpy(sig).float().unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        result = model(x_t, training=True, return_all=True)
+
+    print(f"\nResults:")
+    print(f"  tfr_enhanced: {result['tfr_enhanced'].shape}")
+    print(f"  w_i:          {result['w_i'].shape}")
+    print(f"  alpha:        {result['alpha'].shape}  (prototype attention)")
+    print(f"  sigma_sq:     {result['sigma_sq'].shape}")
+    print(f"  A_ij:         {result['A_ij'].shape}")
+    print(f"  gate_edge:    {result['gate_edge'].shape}")
+    print(f"  gate_node:    {result['gate_node'].shape}")
+
+    w_i = result['w_i'][0].cpu().numpy()  # [N_phys, T]
+    alpha = result['alpha'][0].cpu().numpy()  # [T, 5]
+
+    print(f"\nPer-node w_i (time-mean):")
+    node_names_phys = ['LOW_FREQ', 'BPF', '2xBPF']
+    for i, name in enumerate(node_names_phys):
+        print(f"  {name:<12s} w_i={w_i[i].mean():.3f} +/- {w_i[i].std():.3f}")
+
+    print(f"\nPrototype attention (time-mean):")
+    proto_names = ['No-load', 'Low load', 'Mid load', 'High load', 'Pumping']
+    for k, name in enumerate(proto_names):
+        print(f"  Proto {k} ({name:<12s}): alpha={alpha[:, k].mean():.3f}")
+
+    print("\nDone!")

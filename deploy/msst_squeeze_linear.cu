@@ -1,43 +1,45 @@
 /*
- * hmst_squeeze.cu — HMST 同步压缩 CUDA kernel
- * ==============================================
+ * msst_squeeze_linear.cu — MSST 线性插值挤压 (Linear Interpolation Squeeze)
+ * ========================================================================
  *
- * 替代 Python 三重循环，将 3,598 次独立 GPU kernel launch 合并为 1 次。
+ * 升级版 MSST 挤压: 连续 IF + 线性插值分配到相邻双 bin.
+ *
+ * 与硬最近邻的区别:
+ *   硬最近邻: IF 被 round 到整数 → 每个系数 → 1 个 bin → 量化阶梯/散斑
+ *   线性插值: IF 保留连续 Hz → 每个系数 → 2 个 bin → 平滑 TFR, 抑制阶梯
  *
  * 输入:
- *   mag:      [B, F, T]   STFT 幅值 (或前次挤压结果)
- *   IF:       [B, F, T]   瞬时频率估计 (Hz)，所有 M 次迭代共用
- *   freqs_hz: [F]         频率网格 (Hz)，均匀间隔
+ *   mag:      [B, F, T]   STFT 幅值 (float32)
+ *   IF:       [B, F, T]   瞬时频率 (Hz, float32, 连续值)
+ *   freqs_hz: [F]         频率网格 (Hz), 均匀间隔, f0..f0+(F-1)*df
  *   gamma:                幅度阈值
  *
  * 输出:
- *   Tx: [B, F, T]  挤压后 TFR
+ *   Tx: [B, F, T]  挤压后 TFR (float32)
  *
  * 每个 (b,i,j) 元素由一个 CUDA 线程处理:
- *   1. 读取 mag[b,i,j], IF[b,i,j]
- *   2. 若 mag < gamma → 跳过 (噪声 bin)
- *   3. k_float = (IF - f0) / df → 目标 bin (浮点)
- *   4. 线性插值: Tx[k_floor] += (1-alpha)*mag, Tx[k_ceil] += alpha*mag
- *      (避免最近邻量化产生的阶梯/断裂/散斑)
+ *   1. 读取 mag[b,i,j], IF[b,i,j] (Hz)
+ *   2. 若 mag < gamma → 跳过 (噪声)
+ *   3. k_float = (IF - f0) / df → 连续 bin 索引
+ *   4. k_floor = floor(k_float), alpha = k_float - k_floor
+ *   5. Tx[k_floor]     += (1 - alpha) * val
+ *      Tx[k_floor + 1] += alpha * val
  *
- * 编译 (x86):
- *   见 deploy/setup_hmst.py
+ * 编译:
+ *   python deploy/setup_msst_kernels.py
  *
- * 编译 (Jetson Orin, sm_87):
- *   TORCH_CUDA_ARCH_LIST="8.7" python deploy/setup_hmst.py
- *
- * Author: TFDCL Project
+ * Author: SAST Project (refactored from hmst_squeeze.cu)
  */
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cmath>
 
-// ── CUDA Kernel ─────────────────────────────────────────────
+// ── CUDA Kernel: Linear Interpolation Squeeze ──────────────────
 
-__global__ void hmst_squeeze_kernel(
+__global__ void msst_squeeze_linear_kernel(
     const float* __restrict__ mag,      // [B, F, T]
-    const float* __restrict__ IF,       // [B, F, T]
+    const float* __restrict__ IF,       // [B, F, T] — IF in Hz (continuous)
     float* __restrict__ Tx,             // [B, F, T] (output, zero-initialized)
     int B, int F, int T,
     float f0, float inv_df,             // f0 = freqs[0], inv_df = 1.0 / df
@@ -53,18 +55,20 @@ __global__ void hmst_squeeze_kernel(
     int f = (idx / T) % F;
     int b = idx / (F * T);
 
-    // ── 读输入 ──
+    // ── 读幅值 ──
     float val = mag[idx];
     if (val < gamma) return;  // 噪声 bin, 跳过
 
+    // ── 读 IF (Hz) → 连续 bin 索引 ──
     float w = IF[idx];  // 瞬时频率 (Hz)
+    if (w <= 0.0f) return;  // invalid IF
 
-    // ── 频率 → bin 索引 (线性插值, 避免最近邻量化的阶梯/断裂) ──
     // k_float = (w - f0) / df
     float k_float = (w - f0) * inv_df;
     int k_floor = __float2int_rd(k_float);  // floor
     float alpha = k_float - (float)k_floor;  // 小数部分 ∈ [0, 1)
 
+    // ── 线性插值分配到两个相邻 bin ──
     // Tx[k_floor] += (1 - alpha) * val
     if (k_floor >= 0 && k_floor < F) {
         int dst_lo = b * F * T + k_floor * T + t;
@@ -78,9 +82,9 @@ __global__ void hmst_squeeze_kernel(
 }
 
 
-// ── PyTorch 包装函数 (CPU 端) ──────────────────────────────
+// ── PyTorch 包装函数 (CPU 端) ──────────────────────────────────
 
-torch::Tensor hmst_squeeze_cuda(
+torch::Tensor msst_squeeze_linear_cuda(
     torch::Tensor mag,
     torch::Tensor IF,
     torch::Tensor freqs_hz,
@@ -92,7 +96,7 @@ torch::Tensor hmst_squeeze_cuda(
     TORCH_CHECK(mag.dim() == 3, "mag must be [B, F, T]");
     TORCH_CHECK(IF.sizes() == mag.sizes(), "IF shape must match mag");
 
-    // 确保连续内存布局 (避免 stride 导致的非法访存)
+    // 确保连续内存布局
     auto mag_contig = mag.contiguous();
     auto IF_contig  = IF.contiguous();
 
@@ -112,7 +116,7 @@ torch::Tensor hmst_squeeze_cuda(
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
-    hmst_squeeze_kernel<<<blocks, threads>>>(
+    msst_squeeze_linear_kernel<<<blocks, threads>>>(
         mag_contig.data_ptr<float>(),
         IF_contig.data_ptr<float>(),
         Tx.data_ptr<float>(),
@@ -123,25 +127,29 @@ torch::Tensor hmst_squeeze_cuda(
 
     // ── 检查 kernel 错误 ──
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "hmst_squeeze_kernel failed: ",
+    TORCH_CHECK(err == cudaSuccess, "msst_squeeze_linear_kernel failed: ",
                 cudaGetErrorString(err));
 
     return Tx;
 }
 
 
-// ── pybind11 模块注册 ──────────────────────────────────────
+// ── pybind11 模块注册 ──────────────────────────────────────────
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hmst_squeeze", &hmst_squeeze_cuda,
-          "HMST synchrosqueezing (CUDA-accelerated)\n\n"
+    m.def("msst_squeeze_linear", &msst_squeeze_linear_cuda,
+          "MSST linear interpolation squeeze (continuous IF, 2-bin assignment)\n\n"
           "Args:\n"
-          "  mag:      [B, F, T] magnitude TFR\n"
-          "  IF:       [B, F, T] IF estimates (Hz)\n"
-          "  freqs_hz: [F] frequency grid (Hz)\n"
-          "  gamma:    amplitude threshold\n\n"
+          "  mag:      [B, F, T] magnitude TFR (float32)\n"
+          "  IF:       [B, F, T] IF estimates in Hz (float32, continuous)\n"
+          "  freqs_hz: [F] frequency grid (Hz), uniformly spaced\n"
+          "  gamma:    amplitude threshold (default 1e-6)\n\n"
           "Returns:\n"
-          "  Tx: [B, F, T] squeezed TFR",
+          "  Tx: [B, F, T] squeezed TFR (float32)\n\n"
+          "Note: IF values are continuous Hz (NOT rounded to integer bins).\n"
+          "      Each coefficient is split between two adjacent bins via\n"
+          "      linear interpolation, suppressing quantization artifacts\n"
+          "      that occur with hard nearest-neighbor squeeze.",
           py::arg("mag"),
           py::arg("IF"),
           py::arg("freqs_hz"),

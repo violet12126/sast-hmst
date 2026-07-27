@@ -22,8 +22,8 @@ import torch
 import time
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent / 'deploy'))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'deploy'))
 
 from models.tfr import msst, compute_renyi
 from ssqueezepy import ssq_stft

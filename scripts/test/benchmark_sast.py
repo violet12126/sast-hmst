@@ -8,7 +8,7 @@ import torch
 import time
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from models.tfr import msst
 from models.sast_nodes import MSSTNodeExtractor

@@ -19,7 +19,7 @@ import sys
 import argparse
 from scipy.signal import find_peaks
 import ssqueezepy as ssq
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from models.tfr import wsst2, msst, compute_renyi
 
 plt.rcParams['font.family'] = 'sans-serif'

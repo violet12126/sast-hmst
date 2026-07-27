@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
 import ssqueezepy as ssq
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from models.tfr import wsst2, msst, compute_renyi
 
 plt.rcParams['font.family'] = 'sans-serif'

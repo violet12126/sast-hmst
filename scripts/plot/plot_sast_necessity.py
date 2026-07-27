@@ -20,7 +20,7 @@ import sys
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from models.tfr import wsst2, renyi_entropy
 
 plt.rcParams['font.family'] = 'sans-serif'

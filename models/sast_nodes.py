@@ -19,7 +19,7 @@ SAST Node Feature Extraction — 从 MSST omega_final 直接提取物理节点�
     5. LOW_FREQ (11-15 Hz): 水力来源 (涡带/压力脉动), 与 BPF 不成整数倍
 
   保留节点:
-    LOW_FREQ: 8-20 Hz   — 水力分量, 独立于机械路径
+    LOW_FREQ: 2-25 Hz   — 水力分量, 独立于机械路径
     BPF:      42-55 Hz  — 叶片通过频率, 宽峰 (工况调制)
     2xBPF:    90-105 Hz — 二倍叶片通过频率, 尖峰, 极度稳定
 
@@ -59,9 +59,9 @@ class FreqRegion:
 
 
 PUMP_TURBINE_REGIONS: List[FreqRegion] = [
-    # LOW_FREQ: 水力来源 (涡带/压力脉动), 8-20 Hz
-    #   预期宽频 (10 Hz), 中低持续性 (涡带仅部分工况显著)
-    FreqRegion('LOW_FREQ',  8.0, 20.0,  'HYDRAULIC',       0.30, 10.0, 0.50),
+    # LOW_FREQ: 水力来源 (涡带/压力脉动), 2-25 Hz
+    #   预期宽频 (12 Hz), 中低持续性 (涡带仅部分工况显著)
+    FreqRegion('LOW_FREQ',  2.0, 25.0,  'HYDRAULIC',       0.30, 12.0, 0.50),
     # BPF: 叶片通过频率, 42-55 Hz
     #   预期宽频 (~12 Hz), 高持续性 (有水就有)
     #   工况调制致宽: 水头/负荷/导叶开度变化 → IF 在 42-55 Hz 内漂移

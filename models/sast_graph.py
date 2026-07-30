@@ -28,7 +28,7 @@ SAST Physics Graph — 异构物理图 (工况上下文 + 倍频 + 能量耦合)
 
 节点 (4 个):
   [0] OP:        虚拟节点, 来自 StaticPrototypeMatcher 的 soft matching 嵌入
-  [1] LOW_FREQ:  水力分量 (涡带/压力脉动), 8-20 Hz
+  [1] LOW_FREQ:  水力分量 (涡带/压力脉动), 2-25 Hz
   [2] BPF:       叶片通过频率, 42-55 Hz
   [3] 2×BPF:     二倍叶片通过频率, 90-105 Hz
 

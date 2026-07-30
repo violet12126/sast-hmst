@@ -13,14 +13,14 @@ sast-hmst/
 │   ├── sast.py               # SAST 主模块 (PPM + GAT + SqueezeIterationController)
 │   └── sast_losses.py        # 损失函数 (RE_2D + L_physics + L_smooth + L_balance)
 ├── deploy/                    # CUDA kernel
-│   ├── msst_stft.cu          # cuFFT modulated-form STFT (精确匹配 numpy)
+│   ├── msst_stft.cu          # cuFFT modulated-form STFT 
 │   ├── msst_squeeze_hard.cu  # 硬最近邻挤压
 │   ├── msst_squeeze_linear.cu# 线性插值挤压
 │   └── setup_msst_kernels.py # 编译脚本
 ├── train_sast.py              # 训练入口
 ├── infer_sast.py              # 推理入口
 ├── papers/                    # 设计文档
-│   ├── SAST_完整设计文档.md   # 主设计文档 (25 章)
+│   ├── SAST_完整设计文档.md   # 主设计文档 
 │   └── # Adaptive order synchrosqueezing transform.md  # Colominas & Meignen 2025 论文笔记
 ├── scripts/
 │   ├── plot/                 # 可视化
@@ -53,10 +53,4 @@ python scripts/plot/plot_sst_order_compare.py        # N=1~5 阶对比
 python scripts/plot/plot_dataset_tfr_cuda.py         # 真实 5 类样本
 ```
 
-### 核心设计
 
-详见 `papers/SAST_完整设计文档.md`
-
-## License
-
-MIT

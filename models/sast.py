@@ -759,7 +759,7 @@ class SAST(nn.Module):
                  freq_regions: Optional[List[FreqRegion]] = None,
                  d_h: int = 128, n_heads: int = 4, n_layers: int = 2,
                  sigma_min: float = 0.5, sigma_max: float = 15.0,
-                 N_max: int = 5, msst_num: int = 5,
+                 N_max: int = 4, msst_num: int = 4,
                  msst_hlength: Optional[int] = None,
                  d_cond: int = 32,
                  f_type_embed_dim: int = 16,

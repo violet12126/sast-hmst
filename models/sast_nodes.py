@@ -230,7 +230,7 @@ class MSSTNodeExtractor:
               freqs:        [F]             freq axis (Hz)
               omegas:       [B, N_max, F, T]  IF trajectory (int32)
         """
-        from models.msst_gpu import msst_gpu
+        from models.msst_torch import msst_torch as msst_gpu
 
         B, T_sig = x.shape
         device = x.device
@@ -247,7 +247,8 @@ class MSSTNodeExtractor:
             # ── GPU MSST (single sample) ──
             x_b = x[b]  # [T]
             result = msst_gpu(x_b, self.fs, hlength=self.msst_hlength,
-                              num=self.msst_num, save_trajectory=True)
+                              num=self.msst_num, save_trajectory=True,
+                              skip_squeeze=True)
 
             tfr_stft = result['STFT']          # [F, T] complex64
             omega_final = result['omega_final'] # [F, T] int32

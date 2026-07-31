@@ -47,7 +47,7 @@ class SastConfig:
     n_layers: int = 2
     sigma_min: float = 0.5
     sigma_max: float = 15.0
-    msst_num: int = 3
+    msst_num: int = 4
     d_cond: int = 32
     f_type_embed_dim: int = 16
     ppn_temperature: float = 0.08

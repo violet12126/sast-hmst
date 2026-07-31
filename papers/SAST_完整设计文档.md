@@ -3,6 +3,7 @@
 ## —— 设计原理、完整流程与可解释性分析
 
 > 2026-07-26 | 整合自 SAST_MSST_必要性分析.md + SAST_完整流程说明.md
+> **v4 更新 (2026-07-31)**: 损失函数与可微性重大重构，详见各章节"v4 更新"标注及 `SAST_v4_design.md`
 
 ---
 
@@ -840,7 +841,11 @@ A_n(p, m; sigma, N*) = (1/Z) * exp[-(p - omega_hat[N*(m)])^2 / (2*sigma^2)]
 
 **梯度路径**: L_total -> TFR_sast -> sigma_i -> w_i -> GAT -> PPM -> (P_embed, C_prior_logit)
 
+> **v4 更新**: 梯度路径已修复。v3 中 `tfr_enhanced` 对 `sigma_sq` 不可微导致梯度断裂；v4 连续高斯核使 TFR loss 经 `sigma_sq → w_i → GAT` 正常回流。主监督从 RE_2D 改为 SupCon（经 TFR → sigma → w_i 监督 GAT）。L_physics 约束 A_ij（非 w_i）提供独立梯度路径。
+
 **训练/推理差异**: 训练时 lambda_i=1（单轮挤压），推理时启用多轮挤压迭代。lambda_i 的离散选择不可微，但在推理时直接继承 w_i 的排序。所有 bin 统一使用 omegas[-1]（5 次 lookup 的最优 IF）。
+
+> **v4 更新**: 训练主监督改为 SupCon（监督对比），需 batch≥8 保证 batch 内同工况正样本对。评估改 KNN 近邻到类中心（无分类头）。训练命令 `python train_sast.py --batch_size 8`。
 
 #### 20.2 推理
 
@@ -865,6 +870,18 @@ L_total = lambda_e*RE_2D + lambda_p*L_physics + lambda_s*L_smooth + lambda_b*L_b
 | L_balance | w_mean 区间约束 [0.3, 0.8] | 正则化 | 否 | 0.01 |
 
 **没有分类交叉熵**: 训练完全自监督，不需要故障标签。每个节点都有至少 3 条入边，静态原型已将工况知识编码为软匹配。
+
+> **v4 更新 (2026-07)**: 以上为 v3 原始设计。v4 损失函数做以下重构，完整设计见 `SAST_v4_design.md`：
+> - **可微性修复（关键）**：`SparseGaussianReassigner`(models/sast.py) 原用 `argmin` 把 sigma 量化到离散 level，导致 `tfr_enhanced` 对 `sigma_sq` 不可微 (`requires_grad=False`)，`L_task`/`RE_2D` 梯度到不了 GAT，w_i 实际无监督。改为**连续可微高斯核**：`sigma_sq` 直接进权重 `w=exp(-0.5*(k/sigma)^2)/Z`，归一化，两遍循环（Pass1 算 Z，Pass2 scatter；避免 [2K+1,B,F,T] 大张量 OOM）。验证 `tfr_enhanced.requires_grad=True`，TFR loss 能回流 w_i（grad 9.7e-4，修复前为 0）。
+> - **gate_node 修复**：inplace `gate_node[:,s]=max(...)` 改为 `scatter_reduce(amax)`，autograd 安全。
+> - **L_task → SupCon（监督对比）**：去掉分类 CE，改用 SupCon (Khosla et al. 2020)：同工况 TFR 表示 z_freq 拉近、不同工况推远。用工况标签定义正负对但**不分类**。梯度经 `z_freq → FreqEncoder → TFR → sigma → w_i` 监督 GAT。`TFRClassifier` → `FreqEncoder`（TFR→z_freq，LayerNorm 替代 BatchNorm 修 batch 小不稳）。评估改 KNN（z_freq 到工况中心最近邻，无分类头）。新增 `compute_class_centroids`（训练集 z_freq 均值）。
+> - **去掉合成预训练**：曾实现合成信号+理想 w_i 直接监督（pretrain_sast.py），后改 SupCon 自监督，已删除。方案A（信号重建）也弃用（SST 归一化软核频率求和守恒，重建损失平凡，梯度~1e-7）。
+> - **RE_2D 修复**：全局 Rényi 熵 → **per-region 选择性**。HARMONIC/BLADE_PASS 频段（BPF, 2xBPF）最小化熵（该集中硬挤），HYDRAULIC（LOW_FREQ）不惩罚（保留展宽软挤）。修复全局熵"鼓励所有能量集中"与选择性挤压的冲突。
+> - **L_physics 修复**：约束对象 `w_i` → `A_ij`（GAT注意力）。`L_physics = sum[w(type)*A_ij*ℓ_ij]/sum A_ij`。按边类型差异化 ℓ：HARMONIC=`|r_obs-r_nom|/r_nom`，CONDITION=`1-cond_sim`，DRIFT=`1-Corr_E`，COMPETITION=`1-(-Corr_E)`。修复 v3 的 `gate_edge × ratio_dev` 互消导致 ≈0（现在非零，0.31，且 GAT 通过 A_ij 收到梯度）。
+> - **总损失**：`L = λ_sc·L_supcon + λ_e·RE_2D + λ_p·L_physics + λ_s·L_smooth + λ_b·L_balance`。SupCon 主监督，其余辅。w_i 通过 TFR→sigma 可微被 SupCon/RE_2D 监督，通过 A_ij 被 L_physics 监督。
+> - **工况匹配（StaticPrototypeMatcher）固定不学习**：`alpha=softmax(cosine(V_obs, frozen_prototypes))`，`obs_proj` 是 dead code，alpha 无可学习参数。职责分离：原型负责工况识别（固定），GAT 负责挤压策略（学习）。工况标签不用于"教识别"，而用于 SupCon 定义正负对。
+> - **显存评估**（max_len=2000, F=1000, T=2000）：MSST ~320 MB/样本（线性），大头是 per-sample `tfr_pre`/FFT 中间张量。8GB GPU 建议 batch≤16。reassigner 两遍循环已省内存。
+> - **训练**：`python train_sast.py --batch_size 8`。SupCon 需 batch 内同工况正样本对（batch≥8）。验证准确率=KNN。
 
 #### 21.1 RE_2D — 全局 TFR 集中度
 
@@ -916,7 +933,10 @@ L_physics = mean_edges [ w_type * |r_obs - r_nom|/r_nom * w_src * w_dst * gate_e
 - [x] 损失函数 (RE_2D + L_physics + L_smooth + L_balance) — `models/sast_losses.py`
 - [x] CUDA squeeze kernel (hard + linear) — `deploy/msst_squeeze_*.cu`
 - [x] 挤压方式对比 + 速度测试 — `test_squeeze_compare.py` / `plot_squeeze_compare.py`
-- [x] 设计文档整合
+- [x] 设计文档整合 (v3 + v4)
+- [x] **v4 可微性修复**: 连续高斯核替代 argmin 量化, 两遍循环避免 OOM
+- [x] **v4 损失函数重构**: SupCon 自监督 + per-region RE_2D + L_physics on A_ij
+- [x] **v4 FreqEncoder** (LayerNorm) + compute_class_centroids + KNN 评估
 
 #### 22.2 待完成
 

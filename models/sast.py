@@ -384,13 +384,14 @@ class PhysicsPrototypeMemory(nn.Module):
         gate_edge = gate_edge.squeeze(-1)  # [B, M]
         cond_sim = cond_sim.squeeze(-1)     # [B, len(CONDITION_EDGES)]
 
-        # 逐节点门控 (含 OP)
+        # 逐节点门控 (含 OP) - scatter_reduce (非 inplace, autograd 安全)
+        src_idx = edge_src_t.unsqueeze(0).expand(B, -1)  # [B, M]
+        dst_idx = edge_dst_t.unsqueeze(0).expand(B, -1)
         gate_node = torch.zeros(B, self.N_total, device=device)
-        for m in range(len(PHYSICS_EDGES)):
-            s, d = edge_src_t[m], edge_dst_t[m]
-            g = gate_edge[:, m]
-            gate_node[:, s] = torch.max(gate_node[:, s], g)
-            gate_node[:, d] = torch.max(gate_node[:, d], g)
+        gate_node = gate_node.scatter_reduce(
+            1, src_idx, gate_edge, reduce='amax', include_self=True)
+        gate_node = gate_node.scatter_reduce(
+            1, dst_idx, gate_edge, reduce='amax', include_self=True)
         gate_node = gate_node.clamp(0.0, 1.0)
 
         # 门控融合物理节点
@@ -656,70 +657,67 @@ class SparseGaussianReassigner(nn.Module):
                 sigma_sq: torch.Tensor, freqs: torch.Tensor,
                 ridge_factor: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
+        连续可微稀疏高斯重排.
+
+        s_n(target) = sum_eta w_k(eta; sigma) * f_n(eta)
+        其中 w_k = exp(-0.5*(k/sigma)^2) / Z, sigma = sigma_sq[eta] (连续, 可微).
+
+        可微性 (修复 v3 旧实现的梯度断裂):
+          - 权重 w_k 连续依赖 sigma_sq -> 梯度可经高斯核流向 sigma_sq -> w_i
+          - 目标位置 omega_hat 来自 MSST (离散, 常量), 不携带梯度 (符合设计:
+            "scatter index detach", IF 本身不参与梯度, 见 SAST_v2_design §可微性)
+          - 归一化核 (sum_k w_k = 1): 频率求和守恒, 不改变每帧总能量
+
+        替代旧的 argmin level 量化 (level_idx=argmin -> 离散, tfr_enhanced 对
+        sigma_sq 的梯度恒为 0, tfr_enhanced.requires_grad==False).
+
         Args:
             tfr_mag:      [B, F, T] STFT 幅值
-            omegas:       [B, N_max, F, T] IF 轨迹 (int32 bin indices, 1-indexed)
-            sigma_sq:     [B, F, T] 逐 bin 核宽 (bin)
-            freqs:        [F] 频率轴
+            omegas:       [B, N_max, F, T] IF 轨迹 (int, 1-indexed, 0=invalid)
+            sigma_sq:     [B, F, T] 逐 bin 核宽 (bin) - 可微
+            freqs:        [F] 频率轴 (保留接口, 未使用)
             ridge_factor: [B, F, T] 逐 bin 挤压参与因子 (0..1, 可选)
 
         Returns:
-            tfr_enhanced: [B, F, T] 稀疏重排后的 TFR
+            tfr_enhanced: [B, F, T] 重排后的 TFR (对 sigma_sq 可微)
         """
         B, F, T = tfr_mag.shape
         device = tfr_mag.device
+        eps = 1e-8
 
-        # ── 所有 bin 统一使用 omega_5 (最优 IF) ──
-        # MSST lookup 对所有 bin 无害, 不需要选层
-        omega_final = omegas[:, -1, :, :]  # [B, F, T] — 5 次 lookup 的 IF
-        omega_hat = (omega_final.float() - 1.0).clamp(0, F - 1)  # [B, F, T]
+        # ── IF 目标位置 (来自 MSST, 常量, 不参与梯度) ──
+        # 所有 bin 统一使用 omega_final (最高阶 MSST lookup 的 IF)
+        omega_final = omegas[:, -1, :, :].float()                # [B, F, T]
+        omega_hat = (omega_final - 1.0).clamp(0, F - 1)          # 0-indexed
+        omega_hat_int = omega_hat.round().long()                 # 离散目标 bin
 
-        # ── ridge_factor: 逐 bin 挤压参与权重 ──
+        # ── 加权输入 ──
         if ridge_factor is not None:
-            tfr_weighted = tfr_mag * ridge_factor  # 远离脊线的 bin 能量被衰减
+            tfr_weighted = tfr_mag * ridge_factor                # 远离脊线的 bin 被衰减
         else:
             tfr_weighted = tfr_mag
 
-        # ── sigma_clipped 量化到 levels ──
-        sigma_clipped = sigma_sq.clamp(self.sigma_min, self.sigma_max)
-        levels = torch.linspace(self.sigma_min, self.sigma_max,
-                                self.n_sigma_levels, device=device)
+        # ── 连续高斯核: sigma_sq 直接进权重 (可微) ──
+        sigma = sigma_sq.clamp(self.sigma_min, self.sigma_max)   # [B, F, T]
+        K = int(np.ceil(self.kernel_radius * self.sigma_max))    # 固定最大半径
+        offsets_int = torch.arange(-K, K + 1, device=device).to(torch.long).tolist()
 
-        dist_to_level = (sigma_clipped.unsqueeze(-1)
-                        - levels.view(1, 1, 1, -1)).abs()
-        level_idx = dist_to_level.argmin(dim=-1)  # [B, F, T]
-
-        # ── 对每个 level 预计算高斯核 ──
-        max_k = int(np.ceil(self.kernel_radius * self.sigma_max))
-        x_offsets = torch.arange(-max_k, max_k + 1, device=device).float()
+        # 两遍循环 (避免 [2K+1, B, F, T] 大张量, 省 ~91x 内存):
+        #   Pass 1: Z = sum_k exp(-0.5*(k/sigma)^2)   [B, F, T]
+        #   Pass 2: scatter w_k = exp(...)/Z * tfr_weighted
+        # w_k 连续依赖 sigma -> 梯度回流到 sigma_sq -> w_i
+        Z = torch.zeros(B, F, T, device=device, dtype=sigma.dtype)
+        for k in offsets_int:
+            ratio = (k / sigma).clamp(-30.0, 30.0)
+            Z = Z + torch.exp(-0.5 * ratio ** 2)
+        Z = Z + eps
 
         tfr_enhanced = torch.zeros(B, F, T, device=device, dtype=tfr_mag.dtype)
-
-        for l_idx in range(self.n_sigma_levels):
-            sigma_l = levels[l_idx]
-            k_limit = int(np.ceil(self.kernel_radius * sigma_l.item()))
-            x_window = x_offsets[max_k - k_limit:max_k + k_limit + 1]
-
-            # Gaussian weights
-            weights = torch.exp(-0.5 * (x_window / sigma_l.clamp(min=0.1)) ** 2)
-            weights = weights / (weights.sum() + 1e-8)
-
-            # 找到使用该 level 的所有 bin
-            mask = (level_idx == l_idx)  # [B, F, T]
-            if not mask.any():
-                continue
-
-            # 对每个匹配的 bin: 目标位置 = omega_hat + x_window
-            omega_masked = omega_hat[mask]  # [N_active]
-            # Clamp target positions
-            for k, offset in enumerate(x_window):
-                target = (omega_masked + offset.item()).round().long().clamp(0, F - 1)
-                w = weights[k]
-                # Scatter add
-                b_idx_active, f_idx_active, t_idx_active = torch.where(mask)
-                tfr_enhanced[
-                    b_idx_active, target, t_idx_active
-                ] += w * tfr_weighted[b_idx_active, f_idx_active, t_idx_active]
+        for k in offsets_int:
+            ratio = (k / sigma).clamp(-30.0, 30.0)
+            w_k = torch.exp(-0.5 * ratio ** 2) / Z              # [B, F, T] 可微
+            target = (omega_hat_int + k).clamp(0, F - 1)        # [B, F, T] long
+            tfr_enhanced.scatter_add_(1, target, w_k * tfr_weighted)
 
         return tfr_enhanced
 
@@ -848,46 +846,62 @@ class SAST(nn.Module):
         if x.dim() == 1:
             x = x.unsqueeze(0)
         B, T_in = x.shape
-        device = x.device
+        device = next(self.parameters()).device  # model's device
 
         # ═══════════════════════════════════════════════════════
-        # Step 1: Per-sample MSST + Node Extraction (CPU, numpy)
+        # Step 1+2: MSST + Node Extraction
         # ═══════════════════════════════════════════════════════
-        all_nodes: List[NodeFeatures] = []
-        all_tfr_mag = []
-        all_freqs = None
+        if x.is_cuda:
+            # ── GPU fast path: batch MSST + node extraction on GPU ──
+            gpu_nodes = self.node_extractor.extract_gpu(x)
+            node_if = gpu_nodes['node_if']               # [B, N_phys, T]
+            node_energy = gpu_nodes['node_energy']       # [B, N_phys, T]
+            node_bw = gpu_nodes['node_bw']               # [B, N_phys, T]
+            node_persist = gpu_nodes['node_persist']     # [B, N_phys]
+            tfr_mag = gpu_nodes['tfr_stft'].abs()        # [B, F, T]
+            freqs = gpu_nodes['freqs']                   # [F]
+            omegas = gpu_nodes['omegas'].long()          # [B, N_max, F, T]
 
-        for b in range(B):
-            x_np = x[b].cpu().numpy()
-            nodes = self._extract_nodes_single(x_np)
-            all_nodes.append(nodes)
-            all_tfr_mag.append(np.abs(nodes.tfr_stft))
-            if all_freqs is None:
-                all_freqs = nodes.freqs.copy()
+            F_bins = len(freqs)
+            T_msst = tfr_mag.shape[-1]
 
-        T_msst = all_nodes[0].T
-        F_bins = len(all_freqs)
+            # Edge features (CPU compute_graph still needs numpy — transfer once)
+            node_if_np = node_if.cpu().numpy()
+            node_energy_np = node_energy.cpu().numpy()
+            node_persist_np = node_persist.cpu().numpy()
+            node_bw_np = node_bw.cpu().numpy()
+        else:
+            # ── CPU fallback: per-sample numpy MSST ──
+            all_nodes: List[NodeFeatures] = []
+            all_tfr_mag = []
+            all_freqs = None
 
-        # ═══════════════════════════════════════════════════════
-        # Step 2: Convert to torch tensors
-        # ═══════════════════════════════════════════════════════
-        node_if_np = np.stack([n.if_hz for n in all_nodes])          # [B, N_phys, T]
-        node_energy_np = np.stack([n.energy for n in all_nodes])     # [B, N_phys, T]
-        node_bw_np = np.stack([n.bandwidth for n in all_nodes])      # [B, N_phys, T]
-        node_persist_np = np.stack([n.persistence for n in all_nodes])  # [B, N_phys]
-        tfr_mag_np = np.stack(all_tfr_mag)  # [B, F, T]
+            for b in range(B):
+                x_np = x[b].cpu().numpy()
+                nodes = self._extract_nodes_single(x_np)
+                all_nodes.append(nodes)
+                all_tfr_mag.append(np.abs(nodes.tfr_stft))
+                if all_freqs is None:
+                    all_freqs = nodes.freqs.copy()
 
-        # omegas: list of [F, T] per sample -> [B, N_max, F, T]
-        N_max_actual = len(all_nodes[0].omegas) if all_nodes[0].omegas else 0
-        omegas_np = np.stack([np.stack(n.omegas) for n in all_nodes])  # [B, N_max, F, T]
+            T_msst = all_nodes[0].T
+            F_bins = len(all_freqs)
 
-        node_if = torch.from_numpy(node_if_np).float().to(device)
-        node_energy = torch.from_numpy(node_energy_np).float().to(device)
-        node_bw = torch.from_numpy(node_bw_np).float().to(device)
-        node_persist = torch.from_numpy(node_persist_np).float().to(device)
-        tfr_mag = torch.from_numpy(tfr_mag_np).float().to(device)
-        omegas = torch.from_numpy(omegas_np).long().to(device)
-        freqs = torch.from_numpy(all_freqs).float().to(device)
+            node_if_np = np.stack([n.if_hz for n in all_nodes])
+            node_energy_np = np.stack([n.energy for n in all_nodes])
+            node_bw_np = np.stack([n.bandwidth for n in all_nodes])
+            node_persist_np = np.stack([n.persistence for n in all_nodes])
+            tfr_mag_np = np.stack(all_tfr_mag)
+            N_max_actual = len(all_nodes[0].omegas) if all_nodes[0].omegas else 0
+            omegas_np = np.stack([np.stack(n.omegas) for n in all_nodes])
+
+            node_if = torch.from_numpy(node_if_np).float().to(device)
+            node_energy = torch.from_numpy(node_energy_np).float().to(device)
+            node_bw = torch.from_numpy(node_bw_np).float().to(device)
+            node_persist = torch.from_numpy(node_persist_np).float().to(device)
+            tfr_mag = torch.from_numpy(tfr_mag_np).float().to(device)
+            omegas = torch.from_numpy(omegas_np).long().to(device)
+            freqs = torch.from_numpy(all_freqs).float().to(device)
 
         fs_half = self.fs / 2.0
 
@@ -995,6 +1009,7 @@ class SAST(nn.Module):
         sigma_sq = sigma_i[B_idx_f, i_star, T_idx_f]  # [B, F_bins, T]
 
         # ── Squeeze iteration control (推理时) ──
+        lambda_sqz = None
         if not training:
             bw_expected = torch.tensor([r.bw_expected for r in self.regions],
                                       device=device, dtype=torch.float32)
@@ -1026,7 +1041,7 @@ class SAST(nn.Module):
             'node_energy': node_energy,
             'node_bw': node_bw,
             'freqs': freqs,
-            't_axis': torch.from_numpy(all_nodes[0].t_axis).float().to(device),
+            't_axis': torch.arange(T_msst, device=device, dtype=torch.float32) / self.fs,
             'edge_src': self.edge_src,
             'edge_dst': self.edge_dst,
             'edge_feats': edge_feats_t,

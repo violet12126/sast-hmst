@@ -1,22 +1,23 @@
 """
-SAST 损失函数 (v3 — 自适应阶数 SST + 异构物理图)
+SAST 损失函数 (v4 - SupCon 自监督)
 ===================================================
 
-L_total = L_task + lambda_e * RE_2D + lambda_p * L_physics + lambda_s * L_smooth + lambda_b * L_balance
+L_total = λ_sc * L_supcon + λ_e * RE_2D + λ_p * L_physics
+        + λ_s * L_smooth + λ_b * L_balance
 
 五项各司其职:
-  L_task:    下游分类任务 (唯一有 GT 监督的项) — "TFR 必须对诊断有用"
-  RE_2D:     Rényi 2D 熵 (自监督, Colominas & Meignen 2025 Eq.19) — "TFR 越集中越好"
-             替代 v2 的逐节点加权 Rényi. 更简洁: GAT 通过最小化全局 RE_2D 学到
-             "该挤的 bin 挤, 不该挤的不挤", 无需 per-region splitting.
-  L_physics: 比值偏差 * 边类型权重 * 两端信任度 — "物理关系被满足时才可信任"
-  L_smooth:  时序平滑 — 防止 w_i 在毫秒间剧烈跳变
-  L_balance: 防退化 — 防止所有 w_i -> 0 或所有 w_i -> 1
+  L_supcon:  监督对比 (Khosla 2020) - 同工况 TFR 表示拉近, 不同工况推远.
+             用工况标签定义正负对但不分类. 经 z_freq->TFR->σ->w_i 监督 GAT.
+  RE_2D:     Rényi 2D 熵 (自监督) - "TFR 越集中越好"
+  L_physics: 比值偏差 * 边类型权重 * 两端信任度 - "物理关系被满足时才可信任"
+  L_smooth:  时序平滑 - 防止 w_i 在毫秒间剧烈跳变
+  L_balance: 防退化 - 防止所有 w_i -> 0 或所有 w_i -> 1
 
-变更 (v2 -> v3):
-  - C_i -> w_i: 语义从"可压缩性"变为"IF信任度"
-  - L_entropy: 加权 Rényi (per-region, C_i controlled) -> RE_2D (全局, 自监督)
-  - 边数: M=1 -> M=6
+变更 (v3 -> v4):
+  - L_task (分类 CE) -> L_supcon (监督对比, 工况标签定义正负对但不分类)
+  - TFRClassifier -> FreqEncoder (TFR -> z_freq, LayerNorm 替代 BN, batch 小时更稳)
+  - 去掉合成预训练 L_w (方案B 弃用)
+  - 可微 reassigner 修复后, SupCon 经 TFR->σ->w_i 监督 GAT (此前梯度断裂)
 """
 
 import torch
@@ -27,122 +28,180 @@ import math
 from typing import Dict, Tuple, Optional, List
 
 from models.sast_nodes import FreqRegion, PUMP_TURBINE_REGIONS
-from models.sast_graph import PHYSICS_EDGES
+from models.sast_graph import PHYSICS_EDGES, EdgeType
 
 
 # ═══════════════════════════════════════════════════════════════
-# 0. Simple TFR Classifier (for L_task)
+# 1. FreqEncoder (for L_supcon) - TFR -> 归一化 z_freq
 # ═══════════════════════════════════════════════════════════════
 
-class TFRClassifier(nn.Module):
+class FreqEncoder(nn.Module):
     """
-    轻量 TFR 分类器: GlobalAvgPool -> MLP -> class logits.
+    TFR -> 单位球面 embedding z_freq (供 SupCon 对比).
+
+    GlobalAvgPool(T) -> log1p -> MLP -> L2 normalize.
+    用 LayerNorm 替代 BatchNorm (batch 小时统计更稳).
     """
 
-    def __init__(self, n_freq_bins: int, n_classes: int = 5,
+    def __init__(self, n_freq_bins: int, embed_dim: int = 128,
                  hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
-        self.n_freq_bins = n_freq_bins
-        self.n_classes = n_classes
-
-        self.classifier = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(n_freq_bins, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, n_classes),
+            nn.Linear(hidden_dim // 2, embed_dim),
         )
 
     def forward(self, tfr: torch.Tensor) -> torch.Tensor:
         """
         Args:
             tfr: [B, F, T] 时频表示 (非负幅值)
-
         Returns:
-            logits: [B, n_classes]
+            z_freq: [B, embed_dim] L2 归一化 embedding
         """
-        feat = tfr.mean(dim=-1)
+        feat = tfr.mean(dim=-1)        # [B, F] GlobalAvgPool over time
         feat = torch.log1p(feat)
-        return self.classifier(feat)
+        z = self.encoder(feat)         # [B, embed_dim]
+        return F.normalize(z, dim=-1)  # 单位球面
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1. L_task — 下游任务损失
+# 2. L_supcon - 监督对比损失 (Khosla et al. 2020)
 # ═══════════════════════════════════════════════════════════════
 
-def task_loss(tfr: torch.Tensor, y_true: torch.Tensor,
-              classifier: nn.Module) -> torch.Tensor:
-    """下游分类交叉熵损失."""
-    logits = classifier(tfr)
-    return F.cross_entropy(logits, y_true)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 2. RE_2D — Rényi 2D 熵 (Colominas & Meignen 2025, Eq.19)
-# ═══════════════════════════════════════════════════════════════
-
-def renyi_2d_loss(tfr: torch.Tensor, alpha: int = 2,
-                   eps: float = 1e-8) -> torch.Tensor:
+def supcon_loss(z: torch.Tensor, labels: torch.Tensor,
+                temperature: float = 0.1) -> torch.Tensor:
     """
-    Rényi 2D 熵 — 全局 TFR 集中度度量.
+    Supervised Contrastive Loss.
 
-    RE_2D(M) = 1/(1-alpha) * log sum_m sum_n (|M[m,n]|/sum|M|)^alpha
-
-    替代 v2 的 weighted_renyi_entropy_loss.
-    优势:
-      - 无需 per-region splitting
-      - 无需 C_i/w_i 加权 (GAT 通过最小化 RE_2D 自然学到正确的 w_i)
-      - 与 L_physics + L_task 交叉约束: 三者来自不同监督域
+    同工况样本的 z 拉近, 不同工况推远. 用工况标签定义正负对, 但不做分类
+    (无分类头, 学的是工况判别表示).
 
     Args:
-        tfr:   [B, F, T] TFR 幅值 (非负)
-        alpha: Rényi 阶数 (default 2, 论文推荐)
-        eps:   数值保护
+        z:           [B, D] L2 归一化 embedding
+        labels:      [B] 工况标签
+        temperature: 温度 (越小越聚焦硬正样本)
 
     Returns:
-        scalar loss (lower = more concentrated)
+        scalar loss
     """
-    B, F, T = tfr.shape
-    tfr_pos = tfr.clamp(min=eps)
-    total = tfr_pos.sum(dim=(1, 2), keepdim=True).clamp(min=eps)
-    p = tfr_pos / total
-    p_alpha = p ** alpha
-    h = torch.log(p_alpha.sum(dim=(1, 2)).clamp(min=eps)) / (1.0 - alpha)
-    return h.mean()
+    device = z.device
+    B = z.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # 相似度矩阵 (z 已归一化, cos sim = z@z^T)
+    sim = torch.matmul(z, z.T) / temperature          # [B, B]
+    # 数值稳定
+    sim_max, _ = sim.max(dim=1, keepdim=True)
+    logits = sim - sim_max.detach()
+
+    # 排除自身
+    mask_self = torch.eye(B, dtype=torch.bool, device=device)
+    logits = logits.masked_fill(mask_self, -1e9)
+
+    # log p(j|i) = logits(i,j) - log(sum_a exp logits(i,a))
+    exp = torch.exp(logits)
+    log_prob = logits - torch.log(exp.sum(dim=1, keepdim=True) + 1e-8)
+
+    # 正样本: 同工况 (且非自身)
+    labels = labels.view(-1, 1)
+    pos_mask = (labels == labels.T) & ~mask_self      # [B, B]
+    has_pos = pos_mask.sum(dim=1) > 0
+
+    if not has_pos.any():
+        # batch 内无同工况正样本对 -> 不贡献
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # 对每个 anchor, 在正样本上平均 log p
+    pos_log_prob = (pos_mask.float() * log_prob).sum(dim=1) / \
+                   pos_mask.sum(dim=1).clamp(min=1)
+    loss = -pos_log_prob[has_pos].mean()
+    return loss
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. L_physics — 比值偏差物理一致性
+# 3. RE_2D - Rényi 2D 熵 (Colominas & Meignen 2025, Eq.19)
 # ═══════════════════════════════════════════════════════════════
 
-def physics_consistency_loss(w_i: torch.Tensor,
+def renyi_2d_loss(tfr: torch.Tensor,
+                   freqs: torch.Tensor,
+                   regions: Optional[List[FreqRegion]] = None,
+                   alpha: int = 2,
+                   eps: float = 1e-8) -> torch.Tensor:
+    """
+    Per-region 选择性 Renyi 2D 熵.
+
+    HARMONIC/BLADE_PASS 节点频段 (BPF, 2xBPF): 最小化熵 (鼓励集中, 该硬挤)
+    HYDRAULIC 节点频段 (LOW_FREQ): 不惩罚 (保留展宽, 该软挤)
+
+    修复 v3 全局熵"鼓励所有能量集中"与选择性挤压的冲突:
+    全局 RE_2D 会惩罚 LOW_FREQ 涡带展宽 (本应保留), 破坏选择性.
+
+    Args:
+        tfr:     [B, F, T] TFR 幅值 (非负)
+        freqs:   [F] 频率轴 (Hz)
+        regions: 物理节点频段 (默认 PUMP_TURBINE_REGIONS)
+        alpha:   Renyi 阶数
+        eps:     数值保护
+
+    Returns:
+        scalar (lower = HARMONIC 频段更集中; LOW_FREQ 不计入)
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    device = tfr.device
+    loss = torch.zeros((), device=device)
+    n_squeeze = 0
+    for region in regions:
+        if region.f_type == 'HYDRAULIC':
+            continue  # LOW_FREQ: 保留展宽, 不惩罚
+        f_mask = (freqs >= region.f_min) & (freqs <= region.f_max)
+        if not f_mask.any():
+            continue
+        tfr_r = tfr[:, f_mask, :]                      # [B, F_r, T]
+        tfr_pos = tfr_r.clamp(min=eps)
+        total = tfr_pos.sum(dim=(1, 2), keepdim=True).clamp(min=eps)
+        p = tfr_pos / total
+        h = torch.log((p ** alpha).sum(dim=(1, 2)).clamp(min=eps)) / (1.0 - alpha)
+        loss = loss + h.mean()
+        n_squeeze += 1
+    return loss / max(1, n_squeeze)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. L_physics - 比值偏差物理一致性
+# ═══════════════════════════════════════════════════════════════
+
+def physics_consistency_loss(A_ij: torch.Tensor,
                               edge_feats: torch.Tensor,
-                              gate_edge: torch.Tensor,
                               edge_src: torch.Tensor,
                               edge_dst: torch.Tensor,
                               r_nom: Optional[torch.Tensor] = None,
                               eps: float = 1e-8) -> torch.Tensor:
     """
-    比值偏差 * 边类型权重 * 两端信任度.
+    约束 GAT 注意力 A_ij 与物理一致性对齐 (设计文档 SAST_v2_design S4.3).
 
-    L_physics = mean_edges [ w(type) * |r_obs - r_nom|/r_nom * w_src * w_dst ]
+    L_physics = sum_edges [ w(type) * A_ij * l_ij ] / sum A_ij
 
-    自适应效应:
-      - 整数倍频 (r_obs ~ r_nom): 偏差小 -> L 小 -> 允许高 w
-      - 滑差 (r_obs 漂移): 偏差大 -> L 大 -> 迫使 w 降低
-      - w 已降低: w_src*w_dst -> 0 -> L 自动变小 -> 梯度自消失
+    高注意力 + 物理不一致 -> 大惩罚 -> 推动 GAT 学会利用边特征分配注意力.
+    按边类型差异化 l_ij (edge_feats dim0 语义按边类型):
+      INTEGER_HARMONIC: |r_obs - r_nom|/r_nom   (比值须等于整数)
+      CONDITION:        1 - cond_sim            (上下文匹配应高)
+      DRIFT:            1 - Corr_E              (能量共变应正相关)
+      ENERGY_COMPETITION: 1 - (-Corr_E)         (此消彼长应负相关; dim0=-Corr_E)
 
-    注意: 仅 HARMONIC 边参与比值偏差计算.
-          CONDITION 和 DRIFT 边由门控 (gate_edge) 处理.
+    修复 v3: 约束 A_ij (非 w_i), 避免 gate_edge x ratio_dev 互消导致 ~0.
 
     Args:
-        w_i:        [B, N_phys, T] IF 可信度
+        A_ij:       [B, M, H, T] 或 [B, M, T] GAT 注意力权重 (可微)
         edge_feats: [B, M, T, 5] 边特征
-        gate_edge:  [B, M, T] 边门控
         edge_src:   [M]
         edge_dst:   [M]
         r_nom:      [M] 标称比值
@@ -151,46 +210,37 @@ def physics_consistency_loss(w_i: torch.Tensor,
     Returns:
         scalar loss
     """
-    B, N_phys, T = w_i.shape
-    M = edge_feats.shape[1]
-    device = w_i.device
+    device = A_ij.device
+    A = A_ij.mean(dim=2) if A_ij.dim() == 4 else A_ij   # [B, M, T]
+    B, M, T = A.shape
 
-    # ── 提取边特征 ──
-    r_obs = edge_feats[:, :, :, 0]     # [B, M, T]
-    w_type = edge_feats[:, :, :, 3]    # [B, M, T]
+    feat0 = edge_feats[:, :, :, 0]      # [B, M, T] dim0 (语义按边类型)
+    w_type = edge_feats[:, :, :, 3]     # [B, M, T]
 
     if r_nom is None:
         r_nom = torch.tensor([e.r_nom for e in PHYSICS_EDGES],
                             device=device, dtype=torch.float32)
+    r_nom_list = r_nom.tolist()
 
-    r_nom_exp = r_nom.view(1, M, 1)    # [1, M, 1]
+    # 按边类型算 l_ij
+    ell = torch.zeros(B, M, T, device=device)
+    for m, e in enumerate(PHYSICS_EDGES):
+        if e.edge_type == EdgeType.INTEGER_HARMONIC:
+            ell[:, m, :] = (feat0[:, m, :] - r_nom_list[m]).abs() / max(r_nom_list[m], eps)
+        elif e.edge_type == EdgeType.CONDITION:
+            ell[:, m, :] = 1.0 - feat0[:, m, :].clamp(-1.0, 1.0)        # cond_sim
+        elif e.edge_type == EdgeType.DRIFT:
+            ell[:, m, :] = 1.0 - feat0[:, m, :].clamp(-1.0, 1.0)        # Corr_E (正应高)
+        elif e.edge_type == EdgeType.ENERGY_COMPETITION:
+            ell[:, m, :] = 1.0 - feat0[:, m, :].clamp(-1.0, 1.0)        # -Corr_E (大=负相关=自洽)
 
-    # ── 比值偏差 ──
-    ratio_dev = (r_obs - r_nom_exp).abs() / r_nom_exp.clamp(min=eps)
-
-    # ── 两端 w_i (edge_src/dst 是图的 0-indexed, 物理节点从 1 开始) ──
-    # 映射: graph idx -> phys idx (减去 1, OP=0 不参与 w_i)
-    src_phys = edge_src - 1  # [M], -1 for OP edges
-    dst_phys = edge_dst - 1  # [M]
-
-    # 仅对物理节点索引有效的边 (>=0) 取 w_i
-    src_valid = src_phys.clamp(0, N_phys - 1)
-    dst_valid = dst_phys.clamp(0, N_phys - 1)
-    w_src = w_i[:, src_valid, :]  # [B, M, T]
-    w_dst = w_i[:, dst_valid, :]  # [B, M, T]
-    w_edge = w_src * w_dst         # [B, M, T]
-
-    # ── 逐边损失 ──
-    per_edge = w_type * ratio_dev * w_edge * gate_edge
-
-    total_weight = gate_edge.sum() + eps
-    loss = per_edge.sum() / total_weight
-
+    per_edge = w_type * A * ell
+    loss = per_edge.sum() / (A.sum() + eps)
     return loss
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. L_smooth — 时序平滑
+# 5. L_smooth - 时序平滑
 # ═══════════════════════════════════════════════════════════════
 
 def temporal_smoothness_loss(w_i: torch.Tensor,
@@ -219,7 +269,7 @@ def temporal_smoothness_loss(w_i: torch.Tensor,
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. L_balance — 防退化正则化
+# 6. L_balance - 防退化正则化
 # ═══════════════════════════════════════════════════════════════
 
 def balance_loss(w_i: torch.Tensor,
@@ -234,14 +284,14 @@ def balance_loss(w_i: torch.Tensor,
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. Total Loss
+# 7. Total Loss
 # ═══════════════════════════════════════════════════════════════
 
 def total_sast_loss(tfr_raw: torch.Tensor,
                      tfr_enhanced: torch.Tensor,
                      w_i: torch.Tensor,
                      y_true: torch.Tensor,
-                     classifier: nn.Module,
+                     freq_encoder: nn.Module,
                      edge_feats: torch.Tensor,
                      gate_edge: torch.Tensor,
                      edge_src: torch.Tensor,
@@ -249,25 +299,26 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      node_if: torch.Tensor,
                      freqs: torch.Tensor,
                      A_ij: Optional[torch.Tensor] = None,
-                     lambda_task: float = 1.0,
+                     lambda_supcon: float = 1.0,
                      lambda_entropy: float = 0.1,
                      lambda_physics: float = 0.5,
                      lambda_smooth: float = 0.05,
                      lambda_balance: float = 0.01,
                      lambda_A: float = 0.1,
+                     supcon_temperature: float = 0.1,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    SAST v3 总损失.
+    SAST v4 总损失 (SupCon 自监督).
 
-    L_total = lambda_task*L_task + lambda_e*RE_2D + lambda_p*L_physics
-            + lambda_s*L_smooth + lambda_b*L_balance
+    L_total = λ_sc*L_supcon + λ_e*RE_2D + λ_p*L_physics
+            + λ_s*L_smooth + λ_b*L_balance
 
     Args:
         tfr_raw:      [B, F, T] 原始 STFT 幅值
         tfr_enhanced: [B, F, T] SAST 增强 TFR
         w_i:          [B, N_phys, T] IF 可信度
-        y_true:       [B] 类别标签
-        classifier:   TFRClassifier 模块
+        y_true:       [B] 工况标签 (SupCon 正负对定义)
+        freq_encoder: FreqEncoder 模块
         edge_feats:   [B, M, T, 5] 边特征
         gate_edge:    [B, M, T] 边门控
         edge_src:     [M]
@@ -276,24 +327,27 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         freqs:        [F] 频率轴
         A_ij:         [B, M, H, T] (可选)
         lambda_*:     各项权重系数
+        supcon_temperature: SupCon 温度
 
     Returns:
         total_loss:  scalar
         losses_dict: dict of individual loss values + diagnostics
     """
-    device = w_i.device
-
     # ── 各分量 ──
-    l_task = task_loss(tfr_enhanced, y_true, classifier)
-    l_entropy = renyi_2d_loss(tfr_enhanced, alpha=2)
-    l_physics = physics_consistency_loss(
-        w_i, edge_feats, gate_edge, edge_src, edge_dst
-    )
+    z_freq = freq_encoder(tfr_enhanced)
+    l_supcon = supcon_loss(z_freq, y_true, temperature=supcon_temperature)
+    l_entropy = renyi_2d_loss(tfr_enhanced, freqs)
+    if A_ij is not None:
+        l_physics = physics_consistency_loss(
+            A_ij, edge_feats, edge_src, edge_dst
+        )
+    else:
+        l_physics = torch.tensor(0.0, device=w_i.device)
     l_smooth = temporal_smoothness_loss(w_i, A_ij, lambda_A=lambda_A)
     l_balance = balance_loss(w_i)
 
     # ── 加权求和 ──
-    total = (lambda_task * l_task +
+    total = (lambda_supcon * l_supcon +
              lambda_entropy * l_entropy +
              lambda_physics * l_physics +
              lambda_smooth * l_smooth +
@@ -302,7 +356,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     # ── 诊断 ──
     losses_dict = {
         'total': total.item(),
-        'task': l_task.item(),
+        'supcon': l_supcon.item(),
         'entropy_2d': l_entropy.item(),
         'physics': l_physics.item(),
         'smooth': l_smooth.item(),
@@ -311,28 +365,28 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'w_min': w_i.min().item(),
         'w_max': w_i.max().item(),
         'w_spread': (w_i.mean(dim=-1).max(dim=-1).values.mean() -
-                      w_i.mean(dim=-1).min(dim=-1).values.mean()).item(),
+                     w_i.mean(dim=-1).min(dim=-1).values.mean()).item(),
     }
 
     return total, losses_dict
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. Quick test
+# 8. Quick test
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("SAST Losses v3 — Smoke Test (10-edge heterogeneous graph)")
+    print("SAST Losses v4 - Smoke Test (SupCon)")
     print("=" * 60)
 
-    nB, nF, nT, nN, nM = 2, 256, 100, 3, 10
+    nB, nF, nT, nN, nM = 8, 256, 100, 3, 10
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     tfr_raw = torch.rand(nB, nF, nT, device=device)
     tfr_enhanced = torch.rand(nB, nF, nT, device=device)
     w_i = torch.sigmoid(torch.randn(nB, nN, nT, device=device))
-    y_true = torch.randint(0, 5, (nB,), device=device)
+    y_true = torch.tensor([0, 0, 1, 1, 2, 2, 3, 4], device=device)  # 含同工况对
     node_if = torch.rand(nB, nN, nT, device=device) * 500
     freqs = torch.linspace(0, 500, nF, device=device)
     edge_feats = torch.rand(nB, nM, nT, 5, device=device)
@@ -341,10 +395,10 @@ if __name__ == '__main__':
     edge_dst = torch.tensor([1, 2, 3, 2, 1, 3, 3, 1, 3, 2], device=device)
     A_ij = torch.rand(nB, nM, 4, nT, device=device)
 
-    classifier = TFRClassifier(n_freq_bins=nF).to(device)
+    encoder = FreqEncoder(n_freq_bins=nF).to(device)
 
     total, d = total_sast_loss(
-        tfr_raw, tfr_enhanced, w_i, y_true, classifier,
+        tfr_raw, tfr_enhanced, w_i, y_true, encoder,
         edge_feats, gate_edge, edge_src, edge_dst,
         node_if, freqs, A_ij,
     )

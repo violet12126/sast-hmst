@@ -3,6 +3,7 @@
 ## 讲解文档
 
 > 2026-07-27 | 面向水泵水轮机振动信号的时频分析与故障诊断
+> **v4 更新 (2026-07-31)**: 损失函数与可微性重大重构，详见 [v4 更新说明](#v4-更新2026-07) 及 `SAST_v4_design.md`
 
 ---
 
@@ -226,6 +227,15 @@ ridge_factor = (|STFT[η,t]| / max_energy) × exp(-|η - ridge_pos|² / (2 × bw
 | L_balance | w_mean 区间约束 [0.3, 0.8] | 正则化 | 0.01 |
 
 不需要分类交叉熵。RE_2D 提供"TFR 应集中"的全局信号，L_physics 按边类型修正——"倍频关系成立时集中是对的，不成立时集中是错的"。两者博弈使 GAT 对 2xBPF（倍频成立）给高 w_i，对 LOW_FREQ（无倍频约束）给低 w_i。
+
+> **v4 更新 (2026-07)**: 以上为 v3 原始设计。v4 做了以下重大重构，详见 `SAST_v4_design.md`：
+> - **可微性修复**：`SparseGaussianReassigner` 的 `argmin` 量化改为连续高斯核（`w=exp(-0.5*(k/sigma)^2)/Z`），修复 `tfr_enhanced` 对 `sigma_sq` 不可微的梯度断裂问题。修复后 TFR loss 能回流到 w_i（grad ~9.7e-4，修复前为 0）。
+> - **L_task → SupCon**：分类 CE 替换为监督对比损失（Khosla 2020），同工况 TFR 表示 z_freq 拉近、不同工况推远。用工况标签定义正负对但**不分类**。评估改为 KNN（z_freq 到类中心最近邻）。`TFRClassifier` → `FreqEncoder`（LayerNorm 替代 BatchNorm）。
+> - **RE_2D per-region 选择性**：全局 Rényi 熵改为 per-region 选择性——HARMONIC/BLADE_PASS 频段最小化熵，HYDRAULIC（LOW_FREQ）不惩罚，修复全局熵"鼓励所有能量集中"与选择性挤压的冲突。
+> - **L_physics 约束 A_ij**：约束对象从 w_i 改为 A_ij（GAT 注意力），按边类型差异化 ℓ（HARMONIC=`|r_obs-r_nom|/r_nom`、CONDITION=`1-cond_sim`、DRIFT=`1-Corr_E`、COMPETITION=`1-(-Corr_E)`）。修复 v3 的 gate_edge×ratio_dev 互消致 ~0 问题。
+> - **总损失**：`L = λ_sc·L_supcon + λ_e·RE_2D + λ_p·L_physics + λ_s·L_smooth + λ_b·L_balance`。SupCon 主监督，其余辅。
+> - **工况匹配固定不学习**：`StaticPrototypeMatcher` 的 alpha 从 cosine 直接计算，无可学习参数。职责分离——原型负责工况识别（固定），GAT 负责挤压策略（学习）。
+> - **去掉合成预训练**：方案A（信号重建）和方案B（理想 w_i 直接监督）均已删除，被 SupCon 自监督替代。
 
 ---
 

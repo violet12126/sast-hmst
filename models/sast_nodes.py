@@ -37,6 +37,7 @@ SAST Node Feature Extraction — 从 MSST omega_final 直接提取物理节点�
 """
 
 import numpy as np
+import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from models.tfr import msst
@@ -212,6 +213,117 @@ class MSSTNodeExtractor:
             node_names=[r.name for r in self.regions],
             omegas=omegas,
         )
+
+    def extract_gpu(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """批量 GPU 节点特征提取 — 全部在 GPU 上完成, 无 numpy 转换.
+
+        Args:
+            x: [B, T] torch tensor on CUDA
+
+        Returns:
+            dict of torch tensors on CUDA:
+              node_if:      [B, N_phys, T]  IF (Hz)
+              node_energy:  [B, N_phys, T]  log energy
+              node_bw:      [B, N_phys, T]  bandwidth (Hz)
+              node_persist: [B, N_phys]     persistence
+              tfr_stft:     [B, F, T]       complex STFT
+              freqs:        [F]             freq axis (Hz)
+              omegas:       [B, N_max, F, T]  IF trajectory (int32)
+        """
+        from models.msst_gpu import msst_gpu
+
+        B, T_sig = x.shape
+        device = x.device
+
+        node_if_list = []
+        node_energy_list = []
+        node_bw_list = []
+        node_persist_list = []
+        tfr_stft_list = []
+        omegas_list = []
+        freqs_out = None
+
+        for b in range(B):
+            # ── GPU MSST (single sample) ──
+            x_b = x[b]  # [T]
+            result = msst_gpu(x_b, self.fs, hlength=self.msst_hlength,
+                              num=self.msst_num, save_trajectory=True)
+
+            tfr_stft = result['STFT']          # [F, T] complex64
+            omega_final = result['omega_final'] # [F, T] int32
+            freqs = result['freqs']             # [F]
+            omegas_traj = result.get('omegas', [omega_final])
+
+            F, T = omega_final.shape
+
+            # ── IF map (Hz), 0 for invalid bins ──
+            valid_mask = omega_final >= 1  # [F, T]
+            if_map = torch.zeros(F, T, device=device, dtype=torch.float32)
+            if_map[valid_mask] = (omega_final[valid_mask] - 1).float() * self.fs / T_sig
+
+            # ── STFT energy ──
+            stft_energy = tfr_stft.abs() ** 2  # [F, T]
+
+            # ── Per-region aggregation (vectorized over T) ──
+            if_hz_b = torch.zeros(self.N_nodes, T, device=device, dtype=torch.float32)
+            energy_b = torch.zeros(self.N_nodes, T, device=device, dtype=torch.float32)
+            bw_b = torch.zeros(self.N_nodes, T, device=device, dtype=torch.float32)
+
+            for n_idx, region in enumerate(self.regions):
+                freq_mask = (freqs >= region.f_min) & (freqs <= region.f_max)  # [F]
+                # ── Narrow to region bins only (F_region ≪ F, ~30 bins) ──
+                region_if = if_map[freq_mask, :]         # [F_r, T]
+                region_valid = valid_mask[freq_mask, :]   # [F_r, T]
+                region_energy_map = stft_energy[freq_mask, :]  # [F_r, T]
+                F_r, T = region_if.shape
+                counts = region_valid.sum(dim=0)           # [T]
+
+                # ── Median IF (sort over small F_r, vectorized over T) ──
+                region_if_sort = region_if.clone()
+                region_if_sort[~region_valid] = float('inf')
+                region_if_sorted, _ = torch.sort(region_if_sort, dim=0)  # [F_r, T]
+                med_idx = ((counts - 1) // 2).clamp(min=0).long()        # [T]
+                t_arange = torch.arange(T, device=device)
+                if_hz_n = region_if_sorted[med_idx, t_arange]             # [T]
+                if_hz_n[counts == 0] = (region.f_min + region.f_max) / 2.0
+                if_hz_b[n_idx] = if_hz_n
+
+                # ── Energy (vectorized) ──
+                region_energy = (region_energy_map * region_valid.float()).sum(dim=0)
+                energy_b[n_idx] = torch.log1p(region_energy)
+
+                # ── Bandwidth / std (vectorized) ──
+                if_sum = (region_if * region_valid.float()).sum(dim=0)  # [T]
+                mu = if_sum / counts.clamp(min=1)                       # [T]
+                sq_dev = (region_if - mu.unsqueeze(0)) ** 2             # [F_r, T]
+                sq_sum = (sq_dev * region_valid.float()).sum(dim=0)     # [T]
+                bw_n = torch.sqrt(sq_sum / counts.clamp(min=1)).clamp(max=20.0)
+                bw_n[counts < 2] = 1.0
+                bw_b[n_idx] = bw_n
+
+            # ── Persistence ──
+            persist_b = torch.zeros(self.N_nodes, device=device, dtype=torch.float32)
+            for n_idx in range(self.N_nodes):
+                persist_b[n_idx] = (energy_b[n_idx] > 0.01).float().mean()
+
+            node_if_list.append(if_hz_b)
+            node_energy_list.append(energy_b)
+            node_bw_list.append(bw_b)
+            node_persist_list.append(persist_b)
+            tfr_stft_list.append(tfr_stft)
+            omegas_list.append(torch.stack(omegas_traj))
+            if freqs_out is None:
+                freqs_out = freqs
+
+        return {
+            'node_if': torch.stack(node_if_list),
+            'node_energy': torch.stack(node_energy_list),
+            'node_bw': torch.stack(node_bw_list),
+            'node_persist': torch.stack(node_persist_list),
+            'tfr_stft': torch.stack(tfr_stft_list),
+            'freqs': freqs_out,
+            'omegas': torch.stack(omegas_list),
+        }
 
     def get_region_bounds(self) -> Dict[str, Tuple[float, float]]:
         """返回各节点的频率区域边界 (用于诊断)."""

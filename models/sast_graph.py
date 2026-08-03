@@ -408,3 +408,108 @@ if __name__ == '__main__':
     print(f"  DRIFT:     {type_counts[EdgeType.DRIFT]} (expected 2)")
     print(f"  HARMONIC:  {type_counts[EdgeType.INTEGER_HARMONIC]} (expected 1)")
     print(f"  COMPETITION: {type_counts[EdgeType.ENERGY_COMPETITION]} (expected 4)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# torch 向量化版 (GPU, 替代 numpy compute_edge_features 的 per-batch 循环)
+# ═══════════════════════════════════════════════════════════════
+import torch
+import torch.nn.functional as F
+
+
+def _running_std_torch(x, window):
+    """x [..., T] -> [..., T] 滑动窗口 std (匹配 numpy _running_std, ddof=0)."""
+    *shape, T = x.shape
+    W = 2 * window + 1
+    if T < W:
+        s = x.std(dim=-1, keepdim=True, unbiased=False)
+        return s.expand(*shape, T)
+    x_pad = F.pad(x, (window, window), mode='replicate')
+    x_unf = x_pad.unfold(-1, W, 1)              # [..., T, W]
+    return x_unf.std(dim=-1, unbiased=False)    # [..., T]
+
+
+def _running_pearson_torch(x, y, window):
+    """x, y [..., T] -> [..., T] 滑动窗口 Pearson (匹配 numpy _running_pearson)."""
+    *shape, T = x.shape
+    W = 2 * window + 1
+    if T < W:
+        return torch.zeros(*shape, T, device=x.device, dtype=x.dtype)
+    x_pad = F.pad(x, (window, window), mode='replicate')
+    y_pad = F.pad(y, (window, window), mode='replicate')
+    x_unf = x_pad.unfold(-1, W, 1)              # [..., T, W]
+    y_unf = y_pad.unfold(-1, W, 1)
+    xm = x_unf - x_unf.mean(dim=-1, keepdim=True)
+    ym = y_unf - y_unf.mean(dim=-1, keepdim=True)
+    cov = (xm * ym).sum(dim=-1)
+    denom = torch.sqrt((xm ** 2).sum(dim=-1) * (ym ** 2).sum(dim=-1))
+    corr = cov / denom.clamp(min=1e-8)
+    return corr.clamp(-1.0, 1.0)                # [..., T] (匹配 numpy clip)
+
+
+def compute_edge_features_torch(node_if, node_energy, node_persist, node_bw,
+                                 edges=None, window_size=5, fs=1000.0):
+    """
+    torch 向量化 compute_edge_features (GPU, 一次算所有 B).
+
+    Args:
+        node_if:        [B, N, T] GPU
+        node_energy:    [B, N, T]
+        node_persist:   [B, N]
+        node_bw:        [B, N, T]
+        edges:          物理边列表
+        window_size:    滑动窗口半径
+        fs:             采样率
+
+    Returns:
+        edge_feats: [B, M, T, 5] GPU (dim0 语义按边类型, 同 numpy 版)
+    """
+    if edges is None:
+        edges = PHYSICS_EDGES
+    B, N, T = node_if.shape
+    M = len(edges)
+    device = node_if.device
+    dtype = node_if.dtype
+    eps = 1e-8
+
+    edge_feats = torch.zeros(B, M, T, 5, device=device, dtype=dtype)
+
+    for m, e in enumerate(edges):
+        src = e.src - 1   # 0-indexed (OP=0, phys 1..3 -> 0..2)
+        dst = e.dst - 1
+        f_src = node_if[:, src, :]
+        f_dst = node_if[:, dst, :]
+        e_src = node_energy[:, src, :]
+        e_dst = node_energy[:, dst, :]
+        p_min = torch.min(node_persist[:, src], node_persist[:, dst])
+        w_t = torch.tensor(float(e.w_type), device=device, dtype=dtype)
+
+        if e.edge_type == EdgeType.INTEGER_HARMONIC:
+            r_obs = f_dst / f_src.clamp(min=eps)
+            edge_feats[:, m, :, 0] = r_obs
+            edge_feats[:, m, :, 1] = _running_std_torch(r_obs, window_size)
+            edge_feats[:, m, :, 2] = _running_pearson_torch(e_src, e_dst, window_size)
+            edge_feats[:, m, :, 3] = w_t
+            edge_feats[:, m, :, 4] = p_min.unsqueeze(-1)
+        elif e.edge_type == EdgeType.DRIFT:
+            edge_feats[:, m, :, 0] = _running_pearson_torch(e_src, e_dst, window_size)
+            edge_feats[:, m, :, 1] = torch.log(e_src.clamp(min=eps) / e_dst.clamp(min=eps))
+            edge_feats[:, m, :, 2] = _running_pearson_torch(
+                node_bw[:, src, :], node_bw[:, dst, :], window_size)
+            edge_feats[:, m, :, 3] = w_t
+            edge_feats[:, m, :, 4] = p_min.unsqueeze(-1)
+        elif e.edge_type == EdgeType.ENERGY_COMPETITION:
+            corr_e = _running_pearson_torch(e_src, e_dst, window_size)
+            e_ratio = torch.log(e_src.clamp(min=eps) / e_dst.clamp(min=eps))
+            e_ratio_std = _running_std_torch(e_ratio, window_size)
+            edge_feats[:, m, :, 0] = -corr_e
+            edge_feats[:, m, :, 1] = e_ratio
+            edge_feats[:, m, :, 2] = torch.exp(-e_ratio_std / 0.5)
+            edge_feats[:, m, :, 3] = w_t
+            edge_feats[:, m, :, 4] = p_min.unsqueeze(-1)
+        elif e.edge_type == EdgeType.CONDITION:
+            edge_feats[:, m, :, 3] = w_t
+            # dim 0 (cond_sim) 由 SAST.forward Step5 填充
+
+    return edge_feats
+

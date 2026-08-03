@@ -629,77 +629,87 @@ class SqueezeIterationController(nn.Module):
 # 5. SparseGaussianReassigner (replaces AdaptiveSqueeze)
 # ═══════════════════════════════════════════════════════════════
 
+# C++ CUDA kernel (可选, 加速 91 循环; 编译: python deploy/setup_msst_kernels.py build_ext --inplace)
+try:
+    import deploy.reassigner as _reassigner_cpp
+    _HAS_REASSIGNER_CPP = True
+except Exception:
+    _HAS_REASSIGNER_CPP = False
+
+
 class ReassignerFunction(torch.autograd.Function):
-    """可微软高斯重排 (自定义 autograd, 省 91 循环中间张量).
+    """可微软高斯重排 (C++ CUDA kernel 加速, Python fallback).
 
-    前向/反向都循环重算, 不保存 91 个 [B,F,T] 中间 (只存 sigma/tfr_weighted/omega_hat/Z).
-    显存从 ~70GB (batch=16, 原两遍循环 autograd 保存全部中间) 降到 ~1GB.
-
-    数学:
-      Z = sum_k exp(-0.5*(k/sigma)^2)
-      tfr_enhanced[target] += (exp(-0.5*(k/sigma)^2)/Z) * tfr_weighted
-      target = omega_hat + k  (不依赖 sigma, 常量)
-
-    反向 (d tfr_enhanced / d sigma):
-      d exp_k/dsigma = exp_k * k^2/sigma^3
-      dZ/dsigma = (1/sigma^3) sum_k exp_k * k^2
-      dw_k/dsigma = w_k * (k^2/sigma^3 - dZ/dsigma/Z)
-      grad_sigma = sum_k grad_out[target] * tfr_weighted * dw_k/dsigma
+    C++ kernel (deploy/reassigner.cu): 一次 launch, 每 thread 一个 (b,f,t),
+    省 Python 91 循环. float32 + CUDA 时用 C++, 否则 Python 循环 fallback.
     """
 
     @staticmethod
     def forward(ctx, tfr_weighted, sigma, omega_hat_int, K, F_dim):
         B, F, T = tfr_weighted.shape
-        device = tfr_weighted.device
-        dtype = sigma.dtype
-        eps = 1e-8
-        offsets = list(range(-K, K + 1))
-        # Z = sum_k exp(-0.5*(k/sigma)^2)
-        Z = torch.zeros(B, F, T, device=device, dtype=dtype)
-        for k in offsets:
-            r = k / sigma
-            Z = Z + torch.exp(-0.5 * r * r)
-        Z = Z + eps
-        # tfr_enhanced = scatter(w_k * tfr_weighted)
-        tfr_enhanced = torch.zeros(B, F, T, device=device, dtype=tfr_weighted.dtype)
-        for k in offsets:
-            r = k / sigma
-            w_k = torch.exp(-0.5 * r * r) / Z
-            target = (omega_hat_int + k).clamp(0, F - 1)
-            tfr_enhanced.scatter_add_(1, target, w_k * tfr_weighted)
-        ctx.save_for_backward(sigma, tfr_weighted, omega_hat_int, Z)
+        tfr_enhanced = torch.zeros(B, F, T, device=tfr_weighted.device, dtype=tfr_weighted.dtype)
+        use_cpp = (_HAS_REASSIGNER_CPP and tfr_weighted.is_cuda
+                   and tfr_weighted.dtype == torch.float32 and sigma.dtype == torch.float32)
+        if use_cpp:
+            _reassigner_cpp.forward(tfr_weighted, sigma, omega_hat_int, tfr_enhanced, K)
+        else:
+            dtype = sigma.dtype
+            eps = 1e-8
+            offsets = list(range(-K, K + 1))
+            Z = torch.zeros(B, F, T, device=tfr_weighted.device, dtype=dtype)
+            for k in offsets:
+                r = k / sigma
+                Z = Z + torch.exp(-0.5 * r * r)
+            Z = Z + eps
+            for k in offsets:
+                r = k / sigma
+                w_k = torch.exp(-0.5 * r * r) / Z
+                target = (omega_hat_int + k).clamp(0, F - 1)
+                tfr_enhanced.scatter_add_(1, target, w_k * tfr_weighted)
+        ctx.save_for_backward(sigma, tfr_weighted, omega_hat_int)
         ctx.K = K
         ctx.F = F
+        ctx.use_cpp = use_cpp
         return tfr_enhanced
 
     @staticmethod
     def backward(ctx, grad_out):
-        sigma, tfr_weighted, omega_hat_int, Z = ctx.saved_tensors
+        sigma, tfr_weighted, omega_hat_int = ctx.saved_tensors
         K = ctx.K
         F = ctx.F
         B, _, T = sigma.shape
-        device = sigma.device
+        if ctx.use_cpp:
+            grad_out = grad_out.contiguous()
+            sigma = sigma.contiguous()
+            tfr_weighted = tfr_weighted.contiguous()
+            omega_hat_int = omega_hat_int.contiguous()
+            grad_sigma = torch.zeros_like(sigma)
+            _reassigner_cpp.backward(grad_out, sigma, tfr_weighted, omega_hat_int, grad_sigma, K)
+            return None, grad_sigma, None, None, None
+        # Python fallback
         dtype = sigma.dtype
+        eps = 1e-8
         offsets = list(range(-K, K + 1))
         sigma3 = sigma * sigma * sigma
-        # dZ/dsigma = (1/sigma^3) sum_k exp_k * k^2
+        Z = torch.zeros_like(sigma)
         dZ = torch.zeros_like(sigma)
         for k in offsets:
             r = k / sigma
-            dZ = dZ + torch.exp(-0.5 * r * r) * float(k * k)
+            e = torch.exp(-0.5 * r * r)
+            Z = Z + e
+            dZ = dZ + e * float(k * k)
+        Z = Z + eps
         dZ = dZ / sigma3
-        # grad_sigma = sum_k grad_out[target] * tfr_weighted * dw_k/dsigma
-        grad_sigma = torch.zeros_like(sigma)
         inv_Z = 1.0 / Z
+        grad_sigma = torch.zeros_like(sigma)
         for k in offsets:
             r = k / sigma
-            exp_k = torch.exp(-0.5 * r * r)
-            w_k = exp_k * inv_Z
+            e = torch.exp(-0.5 * r * r)
+            w_k = e * inv_Z
             dw_k = w_k * (float(k * k) / sigma3 - dZ * inv_Z)
             target = (omega_hat_int + k).clamp(0, F - 1)
-            grad_at = grad_out.gather(1, target)        # [B,F,T]
+            grad_at = grad_out.gather(1, target)
             grad_sigma = grad_sigma + grad_at * tfr_weighted * dw_k
-        # 输入顺序: tfr_weighted(0), sigma(1), omega_hat_int(2), K(3), F_dim(4)
         return None, grad_sigma, None, None, None
 
 
@@ -891,11 +901,7 @@ class SAST(nn.Module):
             F_bins = len(freqs)
             T_msst = tfr_mag.shape[-1]
 
-            # Edge features (CPU compute_graph still needs numpy — transfer once)
-            node_if_np = node_if.cpu().numpy()
-            node_energy_np = node_energy.cpu().numpy()
-            node_persist_np = node_persist.cpu().numpy()
-            node_bw_np = node_bw.cpu().numpy()
+            # (edge features 现在用 torch 向量化, 不转 numpy)
         else:
             # ── CPU fallback: per-sample numpy MSST ──
             all_nodes: List[NodeFeatures] = []
@@ -940,21 +946,27 @@ class SAST(nn.Module):
         # ═══════════════════════════════════════════════════════
         # Step 4: Edge features (numpy -> torch, with cond_ctx)
         # ═══════════════════════════════════════════════════════
-        edge_feats_list = []
-        r_obs_list = []
-        for b in range(B):
-            ef = compute_edge_features(
-                node_if_np[b], node_energy_np[b], node_persist_np[b],
-                node_bw=node_bw_np[b], edges=self.edges,
-                window_size=5, fs=self.fs,
-            )
-            edge_feats_list.append(ef['edge_feats'])  # [M, T, 5]
-            r_obs_list.append(ef['edge_feats'][:, :, 0])  # [M, T] — HARMONIC uses dim 0
-
-        edge_feats_np = np.stack(edge_feats_list)  # [B, M, T, 5]
-        r_obs_np = np.stack(r_obs_list)            # [B, M, T]
-        edge_feats_t = torch.from_numpy(edge_feats_np).float().to(device)
-        r_obs_t = torch.from_numpy(r_obs_np).float().to(device)
+        if node_if.is_cuda:
+            from models.sast_graph import compute_edge_features_torch
+            edge_feats_t = compute_edge_features_torch(
+                node_if, node_energy, node_persist, node_bw,
+                edges=self.edges, window_size=5, fs=self.fs)  # [B, M, T, 5]
+            r_obs_t = edge_feats_t[..., 0]  # [B, M, T]
+        else:
+            edge_feats_list = []
+            r_obs_list = []
+            for b in range(B):
+                ef = compute_edge_features(
+                    node_if_np[b], node_energy_np[b], node_persist_np[b],
+                    node_bw=node_bw_np[b], edges=self.edges,
+                    window_size=5, fs=self.fs,
+                )
+                edge_feats_list.append(ef['edge_feats'])
+                r_obs_list.append(ef['edge_feats'][:, :, 0])
+            edge_feats_np = np.stack(edge_feats_list)
+            r_obs_np = np.stack(r_obs_list)
+            edge_feats_t = torch.from_numpy(edge_feats_np).float().to(device)
+            r_obs_t = torch.from_numpy(r_obs_np).float().to(device)
 
         # ═══════════════════════════════════════════════════════
         # Step 5: Per-frame PPM -> GAT -> w_i

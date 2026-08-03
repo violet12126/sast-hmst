@@ -156,6 +156,14 @@ if __name__ == '__main__':
                     'nvcc': _NVCC_COMMON,  # cuFFT 不需要 --use_fast_math
                 },
             ),
+            CUDAExtension(
+                name='reassigner',
+                sources=[os.path.join(build_dir, 'reassigner.cu')],
+                extra_compile_args={
+                    'cxx': _CXX_COMMON,
+                    'nvcc': _NVCC_COMMON,  # 不用 fast_math (保 exp 精度, backward 敏感)
+                },
+            ),
         ],
         cmdclass={
             'build_ext': BuildExtension,

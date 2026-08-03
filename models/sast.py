@@ -629,6 +629,80 @@ class SqueezeIterationController(nn.Module):
 # 5. SparseGaussianReassigner (replaces AdaptiveSqueeze)
 # ═══════════════════════════════════════════════════════════════
 
+class ReassignerFunction(torch.autograd.Function):
+    """可微软高斯重排 (自定义 autograd, 省 91 循环中间张量).
+
+    前向/反向都循环重算, 不保存 91 个 [B,F,T] 中间 (只存 sigma/tfr_weighted/omega_hat/Z).
+    显存从 ~70GB (batch=16, 原两遍循环 autograd 保存全部中间) 降到 ~1GB.
+
+    数学:
+      Z = sum_k exp(-0.5*(k/sigma)^2)
+      tfr_enhanced[target] += (exp(-0.5*(k/sigma)^2)/Z) * tfr_weighted
+      target = omega_hat + k  (不依赖 sigma, 常量)
+
+    反向 (d tfr_enhanced / d sigma):
+      d exp_k/dsigma = exp_k * k^2/sigma^3
+      dZ/dsigma = (1/sigma^3) sum_k exp_k * k^2
+      dw_k/dsigma = w_k * (k^2/sigma^3 - dZ/dsigma/Z)
+      grad_sigma = sum_k grad_out[target] * tfr_weighted * dw_k/dsigma
+    """
+
+    @staticmethod
+    def forward(ctx, tfr_weighted, sigma, omega_hat_int, K, F_dim):
+        B, F, T = tfr_weighted.shape
+        device = tfr_weighted.device
+        dtype = sigma.dtype
+        eps = 1e-8
+        offsets = list(range(-K, K + 1))
+        # Z = sum_k exp(-0.5*(k/sigma)^2)
+        Z = torch.zeros(B, F, T, device=device, dtype=dtype)
+        for k in offsets:
+            r = k / sigma
+            Z = Z + torch.exp(-0.5 * r * r)
+        Z = Z + eps
+        # tfr_enhanced = scatter(w_k * tfr_weighted)
+        tfr_enhanced = torch.zeros(B, F, T, device=device, dtype=tfr_weighted.dtype)
+        for k in offsets:
+            r = k / sigma
+            w_k = torch.exp(-0.5 * r * r) / Z
+            target = (omega_hat_int + k).clamp(0, F - 1)
+            tfr_enhanced.scatter_add_(1, target, w_k * tfr_weighted)
+        ctx.save_for_backward(sigma, tfr_weighted, omega_hat_int, Z)
+        ctx.K = K
+        ctx.F = F
+        return tfr_enhanced
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        sigma, tfr_weighted, omega_hat_int, Z = ctx.saved_tensors
+        K = ctx.K
+        F = ctx.F
+        B, _, T = sigma.shape
+        device = sigma.device
+        dtype = sigma.dtype
+        offsets = list(range(-K, K + 1))
+        sigma3 = sigma * sigma * sigma
+        # dZ/dsigma = (1/sigma^3) sum_k exp_k * k^2
+        dZ = torch.zeros_like(sigma)
+        for k in offsets:
+            r = k / sigma
+            dZ = dZ + torch.exp(-0.5 * r * r) * float(k * k)
+        dZ = dZ / sigma3
+        # grad_sigma = sum_k grad_out[target] * tfr_weighted * dw_k/dsigma
+        grad_sigma = torch.zeros_like(sigma)
+        inv_Z = 1.0 / Z
+        for k in offsets:
+            r = k / sigma
+            exp_k = torch.exp(-0.5 * r * r)
+            w_k = exp_k * inv_Z
+            dw_k = w_k * (float(k * k) / sigma3 - dZ * inv_Z)
+            target = (omega_hat_int + k).clamp(0, F - 1)
+            grad_at = grad_out.gather(1, target)        # [B,F,T]
+            grad_sigma = grad_sigma + grad_at * tfr_weighted * dw_k
+        # 输入顺序: tfr_weighted(0), sigma(1), omega_hat_int(2), K(3), F_dim(4)
+        return None, grad_sigma, None, None, None
+
+
 class SparseGaussianReassigner(nn.Module):
     """
     论文式稀疏矩阵软重排: s_n = A_n(sigma, N*) · f_n
@@ -657,69 +731,21 @@ class SparseGaussianReassigner(nn.Module):
                 sigma_sq: torch.Tensor, freqs: torch.Tensor,
                 ridge_factor: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        连续可微稀疏高斯重排.
+        连续可微软高斯重排 (通过自定义 autograd Function 省显存).
 
-        s_n(target) = sum_eta w_k(eta; sigma) * f_n(eta)
-        其中 w_k = exp(-0.5*(k/sigma)^2) / Z, sigma = sigma_sq[eta] (连续, 可微).
-
-        可微性 (修复 v3 旧实现的梯度断裂):
-          - 权重 w_k 连续依赖 sigma_sq -> 梯度可经高斯核流向 sigma_sq -> w_i
-          - 目标位置 omega_hat 来自 MSST (离散, 常量), 不携带梯度 (符合设计:
-            "scatter index detach", IF 本身不参与梯度, 见 SAST_v2_design §可微性)
-          - 归一化核 (sum_k w_k = 1): 频率求和守恒, 不改变每帧总能量
-
-        替代旧的 argmin level 量化 (level_idx=argmin -> 离散, tfr_enhanced 对
-        sigma_sq 的梯度恒为 0, tfr_enhanced.requires_grad==False).
-
-        Args:
-            tfr_mag:      [B, F, T] STFT 幅值
-            omegas:       [B, N_max, F, T] IF 轨迹 (int, 1-indexed, 0=invalid)
-            sigma_sq:     [B, F, T] 逐 bin 核宽 (bin) - 可微
-            freqs:        [F] 频率轴 (保留接口, 未使用)
-            ridge_factor: [B, F, T] 逐 bin 挤压参与因子 (0..1, 可选)
-
-        Returns:
-            tfr_enhanced: [B, F, T] 重排后的 TFR (对 sigma_sq 可微)
+        可微性: ReassignerFunction 前向/反向都循环重算, 不保存 91 个 [B,F,T]
+        中间. sigma_sq 直接进高斯核权重 -> 梯度回流到 w_i.
         """
         B, F, T = tfr_mag.shape
-        device = tfr_mag.device
-        eps = 1e-8
-
-        # ── IF 目标位置 (来自 MSST, 常量, 不参与梯度) ──
-        # 所有 bin 统一使用 omega_final (最高阶 MSST lookup 的 IF)
-        omega_final = omegas[:, -1, :, :].float()                # [B, F, T]
-        omega_hat = (omega_final - 1.0).clamp(0, F - 1)          # 0-indexed
-        omega_hat_int = omega_hat.round().long()                 # 离散目标 bin
-
-        # ── 加权输入 ──
-        if ridge_factor is not None:
-            tfr_weighted = tfr_mag * ridge_factor                # 远离脊线的 bin 被衰减
-        else:
-            tfr_weighted = tfr_mag
-
-        # ── 连续高斯核: sigma_sq 直接进权重 (可微) ──
-        sigma = sigma_sq.clamp(self.sigma_min, self.sigma_max)   # [B, F, T]
-        K = int(np.ceil(self.kernel_radius * self.sigma_max))    # 固定最大半径
-        offsets_int = torch.arange(-K, K + 1, device=device).to(torch.long).tolist()
-
-        # 两遍循环 (避免 [2K+1, B, F, T] 大张量, 省 ~91x 内存):
-        #   Pass 1: Z = sum_k exp(-0.5*(k/sigma)^2)   [B, F, T]
-        #   Pass 2: scatter w_k = exp(...)/Z * tfr_weighted
-        # w_k 连续依赖 sigma -> 梯度回流到 sigma_sq -> w_i
-        Z = torch.zeros(B, F, T, device=device, dtype=sigma.dtype)
-        for k in offsets_int:
-            ratio = (k / sigma).clamp(-30.0, 30.0)
-            Z = Z + torch.exp(-0.5 * ratio ** 2)
-        Z = Z + eps
-
-        tfr_enhanced = torch.zeros(B, F, T, device=device, dtype=tfr_mag.dtype)
-        for k in offsets_int:
-            ratio = (k / sigma).clamp(-30.0, 30.0)
-            w_k = torch.exp(-0.5 * ratio ** 2) / Z              # [B, F, T] 可微
-            target = (omega_hat_int + k).clamp(0, F - 1)        # [B, F, T] long
-            tfr_enhanced.scatter_add_(1, target, w_k * tfr_weighted)
-
-        return tfr_enhanced
+        # IF 目标位置 (常量, 不参与梯度)
+        omega_final = omegas[:, -1, :, :].float()
+        omega_hat_int = (omega_final - 1.0).clamp(0, F - 1).round().long()
+        # 加权输入
+        tfr_weighted = tfr_mag * ridge_factor if ridge_factor is not None else tfr_mag
+        # sigma (clamp, 反向自动)
+        sigma = sigma_sq.clamp(self.sigma_min, self.sigma_max)
+        K = int(np.ceil(self.kernel_radius * self.sigma_max))
+        return ReassignerFunction.apply(tfr_weighted, sigma, omega_hat_int, K, F)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -759,7 +785,7 @@ class SAST(nn.Module):
                  freq_regions: Optional[List[FreqRegion]] = None,
                  d_h: int = 128, n_heads: int = 4, n_layers: int = 2,
                  sigma_min: float = 0.5, sigma_max: float = 15.0,
-                 N_max: int = 5, msst_num: int = 5,
+                 N_max: int = 4, msst_num: int = 4,
                  msst_hlength: Optional[int] = None,
                  d_cond: int = 32,
                  f_type_embed_dim: int = 16,
@@ -933,63 +959,33 @@ class SAST(nn.Module):
         # ═══════════════════════════════════════════════════════
         # Step 5: Per-frame PPM -> GAT -> w_i
         # ═══════════════════════════════════════════════════════
-        w_i_frames = []
-        A_ij_frames = []
-        gate_edge_frames = []
-        gate_node_frames = []
-
-        for t in range(T_msst):
-            # 原始节点特征: [f_norm, log_E, bw_norm, persistence]
-            f_norm = node_if[:, :, t] / fs_half          # [B, N_phys]
-            log_E = node_energy[:, :, t]                  # [B, N_phys]
-            bw_norm = node_bw[:, :, t] / fs_half          # [B, N_phys]
-            persist = node_persist                        # [B, N_phys]
-
-            raw_feats = torch.stack([f_norm, log_E, bw_norm, persist], dim=-1)
-            # [B, N_phys, 4]
-
-            # PPM: 原型增强 + 边门控
-            # drft_feats: edge_feats dim 0 (Corr_E for DRIFT edges)
-            # comp_feats: edge_feats dim 0 (-Corr_E for COMPETITION edges)
-            h_enhanced, C_prior_t, gate_edge_t, gate_node_t, cond_sim_t = self.ppm(
-                raw_feats,
-                node_if[:, :, t],           # [B, N_phys]
-                r_obs_t[:, :, t],           # [B, M]
-                cond_ctx[:, t, :],          # [B, d_cond]
-                edge_feats_t[:, :, t, 0],   # [B, M] — DRIFT dim 0
-                edge_feats_t[:, :, t, 0],   # [B, M] — COMPETITION dim 0 (-Corr_E)
-            )
-            # h_enhanced: [B, N_total, d_h]
-
-            # 注入 C_prior -> h_enhanced (OP padded, 物理节点 concatenated)
-            h_op_padded = F.pad(h_enhanced[:, :1, :], (0, 1))     # [B, 1, d_h+1]
-            h_phys_cat = torch.cat([
-                h_enhanced[:, 1:, :], C_prior_t.unsqueeze(-1)
-            ], dim=-1)                                             # [B, N_phys, d_h+1]
-            h_cat = torch.cat([h_op_padded, h_phys_cat], dim=1)   # [B, N_total, d_h+1]
-
-            h_gat_in = self.ppm.gat_input_proj(h_cat)  # [B, N_total, d_h]
-
-            # ── Inject cond_sim into CONDITION edge features ──
-            edge_feats_frame = edge_feats_t[:, :, t, :].clone()  # [B, M, 5]
-            for i, m in enumerate(CONDITION_EDGE_INDICES):
-                edge_feats_frame[:, m, 0] = cond_sim_t[:, i]   # raw cos sim
-
-            # GAT
-            w_i_t, A_ij_t = self.gat(
-                h_gat_in, edge_feats_frame,
-                self.edge_src, self.edge_dst,
-            )
-
-            w_i_frames.append(w_i_t)
-            A_ij_frames.append(A_ij_t)
-            gate_edge_frames.append(gate_edge_t)
-            gate_node_frames.append(gate_node_t)
-
-        w_i = torch.stack(w_i_frames, dim=-1)              # [B, N_phys, T]
-        A_ij = torch.stack(A_ij_frames, dim=-1)            # [B, M, H, T]
-        gate_edge = torch.stack(gate_edge_frames, dim=-1)  # [B, M, T]
-        gate_node = torch.stack(gate_node_frames, dim=-1)  # [B, N_total, T]
+        # Step 5: 向量化 PPM -> GAT -> w_i (T 维合并到 batch, 消除 per-frame Python 循环)
+        N_phys = node_if.shape[1]
+        M_edges = edge_feats_t.shape[1]
+        d_cond = cond_ctx.shape[-1]
+        BT = B * T_msst
+        f_norm = node_if / fs_half
+        persist_exp = node_persist.unsqueeze(-1).expand(-1, -1, T_msst)
+        raw_feats = torch.stack([f_norm, node_energy, node_bw / fs_half, persist_exp], dim=-1)
+        raw_feats_bt = raw_feats.permute(0, 2, 1, 3).reshape(BT, N_phys, 4)
+        node_if_bt = node_if.permute(0, 2, 1).reshape(BT, N_phys)
+        r_obs_bt = r_obs_t.permute(0, 2, 1).reshape(BT, M_edges)
+        cond_ctx_bt = cond_ctx.reshape(BT, d_cond)
+        drft_bt = edge_feats_t[:, :, :, 0].permute(0, 2, 1).reshape(BT, M_edges)
+        h_enhanced, C_prior_t, gate_edge_bt, gate_node_bt, cond_sim_bt = self.ppm(
+            raw_feats_bt, node_if_bt, r_obs_bt, cond_ctx_bt, drft_bt, drft_bt)
+        h_op_padded = F.pad(h_enhanced[:, :1, :], (0, 1))
+        h_phys_cat = torch.cat([h_enhanced[:, 1:, :], C_prior_t.unsqueeze(-1)], dim=-1)
+        h_cat = torch.cat([h_op_padded, h_phys_cat], dim=1)
+        h_gat_in = self.ppm.gat_input_proj(h_cat)
+        edge_feats_bt = edge_feats_t.permute(0, 2, 1, 3).reshape(BT, M_edges, 5)
+        for i, m in enumerate(CONDITION_EDGE_INDICES):
+            edge_feats_bt[:, m, 0] = cond_sim_bt[:, i]
+        w_i_bt, A_ij_bt = self.gat(h_gat_in, edge_feats_bt, self.edge_src, self.edge_dst)
+        w_i = w_i_bt.reshape(B, T_msst, N_phys).permute(0, 2, 1)
+        A_ij = A_ij_bt.reshape(B, T_msst, M_edges, -1).permute(0, 2, 3, 1)
+        gate_edge = gate_edge_bt.reshape(B, T_msst, M_edges).permute(0, 2, 1)
+        gate_node = gate_node_bt.reshape(B, T_msst, -1).permute(0, 2, 1)  # [B, N_total, T]
 
         # ═══════════════════════════════════════════════════════
         # Step 6: w_i -> sigma_i, N_star, order_idx

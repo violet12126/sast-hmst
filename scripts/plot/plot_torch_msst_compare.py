@@ -1,250 +1,139 @@
 """
-CUDA MSST vs Numpy MSST: 时频图对比
-=====================================
-CUDA 全流程 MSST (cuFFT STFT + scatter_add squeeze) vs 原始 numpy MSST。
-STFT 精确匹配 numpy (diff < 3e-14)。
+对比 numpy MSST (CPU, models/tfr.py) vs torch MSST (GPU, models/msst_torch.py)
+=============================================================================
+验证 torch 重写是否匹配 numpy (算法正确性) + 速度对比 (GPU 提速).
 
-用法: python plot_torch_msst_compare.py
+两个版本算法一致 (modulated STFT + 相位差分 IF + 迭代精化 + 硬挤压):
+  - numpy: 纯 numpy, CPU, per-frame 循环
+  - torch: 纯 torch, GPU, 向量化 (torch.fft + scatter)
+
+输出:
+  - numpy_vs_torch_msst.png: 6 面板时频图 (STFT/MSST/差异)
+  - 控制台: STFT 数值差异 + 速度对比
+
+用法:
+  python scripts/plot/plot_torch_msst_compare.py
 """
-
-import numpy as np
-import torch
-import time
 import sys
+import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+import torch
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from models.tfr import msst, compute_renyi
-
-# Import CUDA kernels
-import msst_stft
-
-FS = 1000
-SAVE_DIR = Path('hmst_figures/cuda_msst_compare')
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-plt.rcParams['font.family'] = 'sans-serif'
+from models.tfr import msst as msst_numpy
+from models.msst_torch import msst_torch
 
 
-# ═══════════════════════════════════════════════════════════════
-# CUDA MSST (STFT + IF estimation + squeeze, all GPU)
-# ═══════════════════════════════════════════════════════════════
+def make_signal(fs: int = 1000, N: int = 2000, seed: int = 0) -> np.ndarray:
+    """合成测试信号: BPF(48Hz, FM) + 2xBPF(96Hz) + LOW_FREQ(12Hz, AM)."""
+    rng = np.random.RandomState(seed)
+    t = np.arange(N) / fs
+    sig = (np.sin(2 * np.pi * 48 * t + 0.15 * np.sin(2 * np.pi * 3 * t)) +
+           0.6 * np.sin(2 * np.pi * 96 * t) +
+           0.25 * np.sin(2 * np.pi * 12 * t) * (1 + 0.3 * np.sin(2 * np.pi * 0.5 * t)) +
+           0.05 * rng.randn(N))
+    return sig.astype(np.float64)
 
-def msst_cuda(x_np, fs=FS, hlength=None, device='cuda'):
-    """
-    CUDA 全流程 MSST.
-    STFT 精确匹配 numpy modulated-form STFT (cuFFT).
-    挤压使用 torch scatter_add (与 numpy 硬挤压一致).
-
-    Returns:
-        tfr_sqz:  [F, T] float64 — 挤压 TFR 幅度
-        tfr_stft: [F, T] complex128 — 归一化 STFT
-        freqs:    [F] float64 — 频率轴
-        timings:  dict — 各步骤耗时
-    """
-    x_np = np.asarray(x_np, dtype=np.float64).ravel()
-    N = len(x_np)
-
-    # Window parameters
-    if hlength is None:
-        hlength = min(N, 512)
-    hlength = hlength + 1 - (hlength % 2)
-    Lh = (hlength - 1) // 2
-    neta = int(round(N / 2))
-    tcol = N
-
-    # Gaussian window
-    ht = np.linspace(-0.5, 0.5, hlength)
-    h_np = np.exp(-np.pi / 0.32**2 * ht**2)
-
-    # ── STFT (CUDA cuFFT) ──
-    x_t = torch.from_numpy(x_np).cuda()
-    h_t = torch.from_numpy(h_np).cuda()
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    tfr = msst_stft.msst_stft_cuda(x_t, h_t, N, hlength, Lh, neta, tcol)
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t_stft = time.perf_counter() - t0
-
-    # ── IF estimation (torch GPU, matching numpy Step 2) ──
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    # Phase diff: omega = round(diff(unwrap(angle(tfr))) * N/(2pi))
-    phase = torch.angle(tfr)
-    # Unwrap along time
-    d = torch.diff(phase, dim=-1)
-    dd = torch.where(d > np.pi, d - 2*np.pi, d)
-    dd = torch.where(dd < -np.pi, dd + 2*np.pi, dd)
-    phase_uw = torch.cat([phase[:, :1],
-                          phase[:, :1] + torch.cumsum(dd, dim=-1)], dim=-1)
-    d_phase = torch.diff(phase_uw, dim=-1)
-    omega = d_phase * N / (2.0 * np.pi)
-    omega = torch.round(omega).to(torch.int32)
-    omega = torch.cat([omega, omega[:, -1:]], dim=-1)
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t_if = time.perf_counter() - t0
-
-    # ── Squeeze (torch scatter_add, matching numpy Step 4) ──
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    mag = tfr.abs()
-    valid = (omega >= 1) & (omega <= neta) & (mag > 1e-4)
-    f_idx, t_idx = torch.where(valid)
-    k_idx = omega[f_idx, t_idx] - 1
-
-    Tx = torch.zeros(neta, tcol, dtype=torch.float64, device=device)
-    Tx.index_put_((k_idx, t_idx), mag[f_idx, t_idx].double(), accumulate=True)
-
-    # Normalize: /(N/2)
-    Tx = Tx / (N / 2.0)
-    tfr_norm = tfr / (N / 2.0)
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t_sqz = time.perf_counter() - t0
-
-    freqs = np.arange(neta, dtype=np.float64) / N * fs
-
-    return (Tx.cpu().numpy(),
-            tfr_norm.cpu().numpy(),
-            freqs,
-            dict(stft=t_stft, if_est=t_if, squeeze=t_sqz))
-
-
-# ═══════════════════════════════════════════════════════════════
-# Main comparison
-# ═══════════════════════════════════════════════════════════════
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device != 'cuda':
-        print("[ERROR] CUDA required")
-        return
-
-    T_SIG = 2000
-    print(f"CUDA MSST vs Numpy MSST — TFR Comparison")
-    print(f"T={T_SIG}, fs={FS} Hz")
+    fs, N, num = 1000, 2000, 4
+    sig = make_signal(fs, N)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Signal: N={N}, fs={fs}, num={num}")
+    print(f"Device (torch): {device}")
     print("=" * 60)
 
-    # Test signal
-    t_axis = np.arange(T_SIG) / FS
-    x = (np.sin(2*np.pi*48*t_axis + 0.15*np.sin(2*np.pi*3*t_axis)) +
-         0.6*np.sin(2*np.pi*96*t_axis) +
-         0.25*np.sin(2*np.pi*12*t_axis)).astype(np.float64)
-    print(f"Signal: {T_SIG} samples, {T_SIG/FS:.1f}s")
-
-    # ── Numpy MSST ──
-    print("\n[1] Numpy MSST (original)...")
+    # ── numpy MSST (CPU) ──
+    print("\n[1] numpy MSST (CPU, per-frame loop)...")
     t0 = time.perf_counter()
-    r_np = msst(x, FS, num=1, save_trajectory=True)
+    r_np = msst_numpy(sig, fs, num=num, save_trajectory=True)
     t_np = time.perf_counter() - t0
-    tfr_np = r_np['MSST']
-    re_np = compute_renyi(tfr_np)
-    print(f"  Time:  {t_np*1000:.0f} ms, shape: {tfr_np.shape}, Renyi={re_np:.2f}")
+    print(f"    time: {t_np:.3f}s")
 
-    # ── CUDA MSST (warmup first) ──
-    print("\n[2] CUDA MSST (GPU)...")
-    _ = msst_cuda(x, FS)  # warmup (CUDA init)
-    tfr_cuda, stft_cuda, freqs_cuda, timings = msst_cuda(x, FS)
-    t_total = sum(timings.values())
-    re_cuda = compute_renyi(tfr_cuda)
-    print(f"  STFT:    {timings['stft']*1000:.1f} ms")
-    print(f"  IF est:  {timings['if_est']*1000:.1f} ms")
-    print(f"  Squeeze: {timings['squeeze']*1000:.1f} ms")
-    print(f"  Total:   {t_total*1000:.1f} ms, shape: {tfr_cuda.shape}, Renyi={re_cuda:.2f}")
+    # ── torch MSST (GPU) ──
+    print("\n[2] torch MSST (GPU, vectorized)...")
+    x = torch.from_numpy(sig).to(device)
+    # warmup (首次 FFT/cuFFT 初始化开销)
+    _ = msst_torch(x, fs, num=num)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    r_torch = msst_torch(x, fs, num=num, save_trajectory=True)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_torch = time.perf_counter() - t0
+    print(f"    time: {t_torch:.3f}s")
+    print(f"\n    Speedup: {t_np / t_torch:.1f}x  (numpy {t_np:.3f}s -> torch {t_torch:.3f}s)")
 
-    # ── Compare ──
-    F_min = min(tfr_np.shape[0], tfr_cuda.shape[0])
-    T_min = min(tfr_np.shape[1], tfr_cuda.shape[1])
-    tfr_np_crop = tfr_np[:F_min, :T_min]
-    tfr_cuda_crop = tfr_cuda[:F_min, :T_min]
+    # ── 提取 ──
+    stft_np = np.abs(r_np['STFT'])                  # [F, T]
+    stft_torch = r_torch['STFT'].abs().cpu().numpy()
+    msst_np = r_np['MSST']                          # [F, T]
+    msst_torch_v = r_torch['MSST'].cpu().numpy()
+    freqs = r_np['freqs']
+    t_axis = r_np['t']
 
-    diff = np.abs(tfr_np_crop - tfr_cuda_crop)
-    tfr_corr = np.corrcoef(tfr_np_crop.ravel(), tfr_cuda_crop.ravel())[0, 1]
+    # ── 数值差异 (算法正确性) ──
+    stft_diff = np.abs(stft_np - stft_torch)
+    stft_rel = stft_diff.max() / (stft_np.max() + 1e-12)
+    print("\n" + "=" * 60)
+    print("STFT magnitude diff (numpy vs torch):")
+    print(f"  max abs diff:  {stft_diff.max():.2e}")
+    print(f"  mean abs diff: {stft_diff.mean():.2e}")
+    print(f"  relative:      {stft_rel:.2e}  "
+          f"{'-> 匹配 ✓ (数值精度, float64 vs complex64)' if stft_rel < 1e-4 else '-> 差异偏大, 需检查'}")
 
-    # Ridge check
-    f48 = np.argmin(np.abs(r_np['freqs'][:F_min] - 48))
-    ridge_np = np.argmax(tfr_np_crop[f48-3:f48+4, :], axis=0)
-    ridge_cuda = np.argmax(tfr_cuda_crop[f48-3:f48+4, :], axis=0)
-    np_jumps = np.sum(np.abs(np.diff(ridge_np.astype(float))) != 0)
-    cuda_jumps = np.sum(np.abs(np.diff(ridge_cuda.astype(float))) != 0)
+    msst_diff = np.abs(msst_np - msst_torch_v)
+    msst_rel = msst_diff.max() / (msst_np.max() + 1e-12)
+    print(f"\nMSST magnitude diff (numpy vs torch):")
+    print(f"  max abs diff: {msst_diff.max():.2e}, relative: {msst_rel:.2e}")
 
-    print(f"\n  TFR max diff:      {diff.max():.6f}")
-    print(f"  TFR mean diff:     {diff.mean():.8f}")
-    print(f"  TFR correlation:   {tfr_corr:.8f}")
-    print(f"  Speedup:           {t_np/t_total:.0f}x")
-    print(f"  48Hz ridge jumps:  numpy={np_jumps}, cuda={cuda_jumps}")
-    print(f"  Renyi:             numpy={re_np:.2f}, cuda={re_cuda:.2f}")
+    # omega 一致性
+    omega_np = r_np['omega_final']
+    omega_torch = r_torch['omega_final'].cpu().numpy()
+    omega_mismatch = (omega_np != omega_torch).sum()
+    print(f"\nomega_final mismatch: {omega_mismatch}/{omega_np.size} "
+          f"({100*omega_mismatch/omega_np.size:.2f}%)")
 
-    if diff.max() < 1e-10:
-        print("\n  >>> EXACT MATCH! <<<")
-    elif tfr_corr > 0.9999:
-        print("\n  >>> Near-perfect match <<<")
-    else:
-        print(f"\n  >>> TFR differs (corr={tfr_corr:.6f}) <<<")
+    # ── 画图 (6 面板) ──
+    fig, axes = plt.subplots(2, 3, figsize=(20, 11))
+    freq_max = 200
+    f_mask = freqs <= freq_max
 
-    # ── Plot ──
-    print("\n[3] Plotting...")
-    plot_comparison(tfr_np, tfr_cuda, r_np['freqs'], freqs_cuda,
-                    re_np, re_cuda, T_SIG, FS, F_min, T_min)
-    print(f"  Saved to {SAVE_DIR}/")
+    def _plot(ax, data, title, vmax=None):
+        db = 10 * np.log10(data + 1e-12)
+        im = ax.pcolormesh(t_axis, freqs[f_mask], db[f_mask], shading='gouraud',
+                           cmap='jet', vmin=-40, vmax=10 if vmax is None else vmax)
+        ax.set_ylim(0, freq_max)
+        ax.set_xlabel('Time [s]')
+        ax.set_ylabel('Frequency [Hz]')
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, label='dB')
 
+    _plot(axes[0, 0], stft_np, f'(a) numpy STFT (CPU, {t_np:.2f}s)')
+    _plot(axes[0, 1], stft_torch, f'(b) torch STFT (GPU, {t_torch:.2f}s)')
+    _plot(axes[0, 2], stft_diff, '(c) |numpy - torch| STFT', vmax=stft_diff.max())
 
-def plot_comparison(tfr_np, tfr_cuda, freqs_np, freqs_cuda,
-                    re_np, re_cuda, T_sig, FS, F_min, T_min):
-    """Side-by-side TFR comparison."""
-    FMAX = 200
-    t_axis = np.arange(T_min) / FS
-    mask_np = freqs_np[:F_min] <= FMAX
-    mask_t = freqs_cuda[:F_min] <= FMAX
+    _plot(axes[1, 0], msst_np, '(d) numpy MSST')
+    _plot(axes[1, 1], msst_torch_v, '(e) torch MSST')
+    _plot(axes[1, 2], msst_diff, '(f) |numpy - torch| MSST', vmax=msst_diff.max())
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    vmax = max(tfr_np[:F_min, :T_min].max(),
-               tfr_cuda[:F_min, :T_min].max()) * 0.5
-
-    for ax, data, freqs, mask, title, renyi in [
-        (axes[0], tfr_np[:F_min, :T_min], freqs_np[:F_min], mask_np,
-         'Numpy MSST\n(original)', re_np),
-        (axes[1], tfr_cuda[:F_min, :T_min], freqs_cuda[:F_min], mask_t,
-         'CUDA MSST\n(GPU)', re_cuda),
-    ]:
-        im = ax.pcolormesh(t_axis, freqs[mask], data[mask, :],
-                          shading='gouraud', cmap='jet', vmax=vmax)
-        ax.set_ylim(0, FMAX)
-        ax.set_title(f'{title}\nRenyi={renyi:.2f}', fontsize=12, fontweight='bold')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Frequency (Hz)')
-
-    # Panel 3: |diff|
-    ax = axes[2]
-    diff = np.abs(tfr_np[:F_min, :T_min] - tfr_cuda[:F_min, :T_min])
-    im = ax.pcolormesh(t_axis, freqs_np[:F_min][mask_np], diff[mask_np, :],
-                      shading='gouraud', cmap='hot', vmax=vmax * 0.01)
-    ax.set_ylim(0, FMAX)
-    corr = np.corrcoef(tfr_np[:F_min, :T_min].ravel(),
-                       tfr_cuda[:F_min, :T_min].ravel())[0, 1]
-    ax.set_title(f'|Numpy - CUDA|\nCorr={corr:.6f}', fontsize=12, fontweight='bold')
-    ax.set_xlabel('Time (s)')
-    plt.colorbar(im, ax=ax, fraction=0.046)
-
-    plt.suptitle(f'CUDA MSST — T={T_sig} ({T_sig/FS:.1f}s)',
-                 fontsize=14, fontweight='bold', y=1.02)
+    plt.suptitle(
+        f'numpy MSST (CPU) vs torch MSST (GPU)   N={N}, fs={fs}, num={num}\n'
+        f'STFT max diff: {stft_diff.max():.2e} (rel {stft_rel:.2e})  |  '
+        f'Speed: {t_np:.2f}s -> {t_torch:.2f}s ({t_np / t_torch:.1f}x)',
+        fontsize=13, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(SAVE_DIR / 'cuda_vs_numpy_msst.png', dpi=200, bbox_inches='tight')
+    out = Path(__file__).parent.parent.parent / 'numpy_vs_torch_msst.png'
+    plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
+    print(f"\nSaved: {out}")
 
 
 if __name__ == '__main__':

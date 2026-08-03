@@ -66,7 +66,8 @@ Examples:
     p.add_argument('--n_layers', type=int, default=2)
     p.add_argument('--sigma_min', type=float, default=0.5)
     p.add_argument('--sigma_max', type=float, default=15.0)
-    p.add_argument('--msst_num', type=int, default=3)
+    p.add_argument('--msst_num', type=int, default=4,
+                   help='MSST 迭代次数 (=N_max=4)')
     p.add_argument('--d_cond', type=int, default=32)
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--ppn_temperature', type=float, default=0.08)

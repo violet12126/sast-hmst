@@ -163,7 +163,8 @@ def msst_gpu(x: torch.Tensor, fs: float,
              hlength: Optional[int] = None,
              num: int = 3,
              save_trajectory: bool = False,
-             gamma: float = 1e-6) -> Dict:
+             gamma: float = 1e-6,
+             skip_squeeze: bool = False) -> Dict:
     """GPU-accelerated Multi-Synchrosqueezing Transform.
 
     API 兼容 models/tfr.py:msst(), 但全部在 GPU 上运行。
@@ -233,23 +234,9 @@ def msst_gpu(x: torch.Tensor, fs: float,
     # ═══════════════════════════════════════════════════════════
     freqs_hz = torch.arange(neta, device=device, dtype=torch.float32) / N * fs  # [F]
     t_axis = torch.arange(tcol, device=device, dtype=torch.float32) / fs         # [T]
-
-    # STFT magnitude (normalized)
     tfr_float = tfr.to(torch.complex64) / (N / 2.0)
-    mag_stft = tfr_float.abs().unsqueeze(0)  # [1, F, T]
-
-    # IF in Hz (continuous, for linear squeeze)
-    if_map = torch.zeros(neta, tcol, device=device, dtype=torch.float32)
-    valid_mask = omega_final >= 1
-    if_map[valid_mask] = ((omega_final[valid_mask] - 1).float() * fs / N)
-
-    # CUDA linear squeeze
-    mag_msst = msst_squeeze_linear_cuda(mag_stft, if_map.unsqueeze(0),
-                                         freqs_hz, gamma)  # [1, F, T]
-    mag_msst = mag_msst.squeeze(0)  # [F, T]
 
     result = {
-        'MSST':        mag_msst,
         'STFT':        tfr_float,
         'freqs':       freqs_hz,
         't':           t_axis,
@@ -257,5 +244,14 @@ def msst_gpu(x: torch.Tensor, fs: float,
     }
     if save_trajectory:
         result['omegas'] = omegas
+
+    if not skip_squeeze:
+        mag_stft = tfr_float.abs().unsqueeze(0)
+        if_map = torch.zeros(neta, tcol, device=device, dtype=torch.float32)
+        valid_mask = omega_final >= 1
+        if_map[valid_mask] = ((omega_final[valid_mask] - 1).float() * fs / N)
+        mag_msst = msst_squeeze_linear_cuda(mag_stft, if_map.unsqueeze(0),
+                                             freqs_hz, gamma)
+        result['MSST'] = mag_msst.squeeze(0)
 
     return result

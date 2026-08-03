@@ -6,7 +6,7 @@
 
 ## 1. 概述
 
-SAST v4 初始训练耗时极长(batch=16, max_len=2000: 75s/batch, 515min/epoch, 60ep 515h),完全不可用。经三个阶段优化,降至 0.75s/batch, 5.1min/epoch, 60ep 5.1h,接近对比框架 ts2vec(DCMR)的 4h25m。
+SAST v4 初始训练耗时极长(batch=16, max_len=2000: 75s/batch, 515min/epoch, 60ep 515h),完全不可用。经三个阶段优化,降至 0.75s/batch, 5.1min/epoch, 60ep 5.1h。
 
 | 阶段 | ms/batch | epoch | 60ep | 提速 |
 |---|---|---|---|---|

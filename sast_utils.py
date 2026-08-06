@@ -76,6 +76,11 @@ class SastConfig:
     val_split: float = 0.15
     max_samples: Optional[int] = None
 
+    # ── New modules ──
+    smoother_kernel: int = 15
+    n_sqz_max: int = 4
+    resume: Optional[str] = None  # checkpoint path for fine-tuning
+
     # ── Output ──
     save_dir: str = 'sast_checkpoints'
     viz_every: int = 5
@@ -186,6 +191,8 @@ def create_model(config: SastConfig, device: torch.device) -> SAST:
         ppn_temperature=config.ppn_temperature,
         prototype_temperature=config.prototype_temperature,
         dropout=config.dropout,
+        smoother_kernel=config.smoother_kernel,
+        n_sqz_max=config.n_sqz_max,
     ).to(device)
     return model
 

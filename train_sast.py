@@ -92,10 +92,18 @@ Examples:
     p.add_argument('--lambda_lowfreq', type=float, default=0.05,
                    help='低频锐化 loss 权重 (方法5, 0=禁用)')
 
+    # ── New module settings ──
+    p.add_argument('--smoother_kernel', type=int, default=15,
+                   help='TemporalSmoother conv kernel size (odd, >=3)')
+    p.add_argument('--n_sqz_max', type=int, default=4,
+                   help='推理多轮挤压最大轮数')
+
     # ── Output ──
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--save_dir', type=str, default='sast_checkpoints')
     p.add_argument('--viz_every', type=int, default=5)
+    p.add_argument('--resume', type=str, default=None,
+                   help='从 checkpoint 恢复训练 (路径, 如 sast_checkpoints/sast_v3_model.pt)')
 
     args = p.parse_args()
 
@@ -118,6 +126,9 @@ Examples:
         data_path=args.data, val_split=args.val_split,
         max_samples=args.max_samples,
         save_dir=args.save_dir, viz_every=args.viz_every,
+        smoother_kernel=args.smoother_kernel,
+        n_sqz_max=args.n_sqz_max,
+        resume=args.resume,
     )
     return config, args.device
 
@@ -175,6 +186,22 @@ def main():
     print(f"  SAST params: {total_params:,} (trainable: {trainable_params:,})")
     print(f"  Encoder params: {enc_params:,}")
 
+    # ── Resume from checkpoint (fine-tune) ──
+    start_epoch = 0
+    if config.resume:
+        print(f"\nResuming from checkpoint: {config.resume}")
+        ckpt = torch.load(config.resume, map_location=device, weights_only=False)
+        model_missing, model_unexpected = model.load_state_dict(
+            ckpt['model_state_dict'], strict=False)
+        enc_missing, enc_unexpected = freq_encoder.load_state_dict(
+            ckpt['encoder_state_dict'], strict=False)
+        if model_missing:
+            print(f"  Model new params (random init): {model_missing}")
+        if enc_missing:
+            print(f"  Encoder new params: {enc_missing}")
+        start_epoch = ckpt.get('epoch', 0)
+        print(f"  Resuming from epoch {start_epoch}")
+
     # ═══════════════════════════════════════════════════════════
     # 3. Optimizer + scheduler
     # ═══════════════════════════════════════════════════════════
@@ -209,7 +236,7 @@ def main():
     N_train = len(X_train)
     best_val_acc = 0.0
 
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, start_epoch + config.epochs):
         model.train()
         freq_encoder.train()
 
@@ -332,8 +359,9 @@ def main():
     # ═══════════════════════════════════════════════════════════
     # 6. Save checkpoint
     # ═══════════════════════════════════════════════════════════
-    ckpt_path = save_dir / 'sast_v3_model.pt'
+    ckpt_path = save_dir / f'sast_v3_e{epoch+1:03d}.pt'
     torch.save({
+        'epoch': epoch + 1,
         'model_state_dict': model.state_dict(),
         'encoder_state_dict': freq_encoder.state_dict(),
         'C_prior': model.get_C_prior().cpu(),

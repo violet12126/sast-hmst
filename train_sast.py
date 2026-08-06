@@ -87,7 +87,8 @@ Examples:
     p.add_argument('--lambda_entropy', type=float, default=0.1)
     p.add_argument('--lambda_physics', type=float, default=0.5)
     p.add_argument('--lambda_smooth', type=float, default=0.05)
-    p.add_argument('--lambda_balance', type=float, default=0.01)
+    p.add_argument('--lambda_balance', type=float, default=0.5)
+    p.add_argument('--lambda_var', type=float, default=0.5)
 
     # ── Output ──
     p.add_argument('--device', type=str, default='cuda')
@@ -110,6 +111,7 @@ Examples:
         lambda_supcon=args.lambda_supcon, lambda_entropy=args.lambda_entropy,
         lambda_physics=args.lambda_physics, lambda_smooth=args.lambda_smooth,
         lambda_balance=args.lambda_balance,
+        lambda_var=args.lambda_var,
         data_path=args.data, val_split=args.val_split,
         max_samples=args.max_samples,
         save_dir=args.save_dir, viz_every=args.viz_every,
@@ -240,6 +242,7 @@ def main():
                 lambda_physics=config.lambda_physics,
                 lambda_smooth=config.lambda_smooth,
                 lambda_balance=config.lambda_balance,
+                lambda_var=config.lambda_var,
             )
 
             # Additional diagnostics

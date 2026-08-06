@@ -1,9 +1,5 @@
 """
-<<<<<<< HEAD
 纯 PyTorch MSST 
-=======
-纯 PyTorch MSST (无 C++ kernel 依赖)
->>>>>>> fe3ccca131c826e2e613540da485feedad7f7c58
 =====================================
 用 torch.fft 向量化重写 modulated-form STFT, 匹配 models/tfr.py:msst() Step1
 和 C++ msst_stft_cuda. IF 估计/精化复用纯 torch 实现. squeeze 用硬挤压

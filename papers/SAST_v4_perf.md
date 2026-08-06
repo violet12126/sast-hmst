@@ -227,21 +227,8 @@ SAST batch 5.2s -> 0.75s(**6.9x**)。forward CPU 瓶颈消除(numpy 转换 + CPU
 
 ---
 
-## 4. 对比 ts2vec(DCMR)
 
-| | SAST v4(优化后) | ts2vec(DCMR) |
-|---|---|---|
-| batch | 16 | 32 |
-| per-batch | 751 ms | ~1300 ms |
-| epoch | 5.1 min | ~4.4 min |
-| 60ep | 5.1 h | 4.4 h |
-| acc | (待训练) | 0.9995 |
-
-ts2vec 快的原因:直接 `torch.fft.rfft` 一次 + 编码器(全 batched GPU),**没有** SAST 的 MSST(per-sample)+ reassigner(91 循环)+ edge_feats(物理图)。SAST 的物理结构开销(reassigner + edge_feats + MSST)是 ts2vec 没有的,但优化后已接近。
-
----
-
-## 5. 关键技术点总结(Lessons Learned)
+## 4. 关键技术点总结(Lessons Learned)
 
 1. **Python 循环 -> 向量化**:per-frame GAT(2000 循环)和 edge_feats(per-batch)用 T/B 合并 batch 向量化,消除 Python launch 开销。判断标准:循环内 op 是 batched 的(GAT/PPM/pearson),且合并后 tensor 不 OOM(GAT 的 N=4 小,可以;reassigner 的 [91,B,F,T] 大,不行)
 2. **自定义 CUDA kernel**:reassigner 的 91 循环无法向量化([91,B,F,T] OOM),用 C++ kernel 一次 launch。可微(forward+backward 手写,autograd Function 调用)
@@ -253,7 +240,7 @@ ts2vec 快的原因:直接 `torch.fft.rfft` 一次 + 编码器(全 batched GPU),
 
 ---
 
-## 6. 最终配置与训练命令
+## 5. 最终配置与训练命令
 
 ```bash
 # 编译 C++ reassigner(首次)
@@ -274,7 +261,7 @@ python train_sast.py --epochs 60 --batch_size 16 --max_len 1500 --device cuda
 
 ---
 
-## 7. 仍可优化(后续)
+## 6. 仍可优化(后续)
 
 - **extract_gpu per-sample 循环**(~1.8s,28%):`for b in range(B)` 逐样本 msst_torch + node 提取。MSST 本质 per-sample,但可减少 Python/numpy 转换开销
 - **max_len=2000 全信号**:当前 8GB GPU 限 max_len=1000/1500。更大 GPU 或 gradient checkpointing 可全信号

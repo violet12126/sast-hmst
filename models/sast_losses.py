@@ -273,14 +273,30 @@ def temporal_smoothness_loss(w_i: torch.Tensor,
 # ═══════════════════════════════════════════════════════════════
 
 def balance_loss(w_i: torch.Tensor,
-                  w_min: float = 0.3, w_max: float = 0.8) -> torch.Tensor:
+                  w_min: float = 0.3, w_max: float = 0.9) -> torch.Tensor:
     """
-    防止所有 w_i -> 0 或所有 w_i -> 1.
+    per-node 防退化: 每节点时间均值 w_node in [w_min, w_max].
 
-    L_balance = max(0, w_min - w_mean) + max(0, w_mean - w_max)
+    L_balance = mean_nodes [ max(0, w_min - w_node) + max(0, w_node - w_max) ]
+    per-node (非全局均值), 防单节点饱和到 1.0.
     """
-    w_mean = w_i.mean()
-    return torch.clamp(w_min - w_mean, min=0.0) + torch.clamp(w_mean - w_max, min=0.0)
+    w_node = w_i.mean(dim=-1)  # [B, N_phys] per-node 时间均值
+    l = torch.clamp(w_min - w_node, min=0.0) + torch.clamp(w_node - w_max, min=0.0)
+    return l.mean()
+
+
+def w_variance_loss(w_i: torch.Tensor, target_var: float = 0.05) -> torch.Tensor:
+    """
+    鼓励节点间 w_i 分化 (惩罚低方差).
+
+    w_i 全同 (无分化) -> var=0 -> loss=target_var (惩罚)
+    w_i 分化 -> var>target -> loss=0 (不惩罚)
+
+    与 balance_loss 配合: balance 防单节点饱和, variance 防节点间全同.
+    """
+    w_node = w_i.mean(dim=-1)  # [B, N_phys]
+    var = w_node.var(dim=-1)   # [B] 节点间方差
+    return torch.relu(target_var - var).mean()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -305,6 +321,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      lambda_smooth: float = 0.05,
                      lambda_balance: float = 0.01,
                      lambda_A: float = 0.1,
+                     lambda_var: float = 0.5,
                      supcon_temperature: float = 0.1,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
@@ -345,13 +362,15 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         l_physics = torch.tensor(0.0, device=w_i.device)
     l_smooth = temporal_smoothness_loss(w_i, A_ij, lambda_A=lambda_A)
     l_balance = balance_loss(w_i)
+    l_var = w_variance_loss(w_i)
 
     # ── 加权求和 ──
     total = (lambda_supcon * l_supcon +
              lambda_entropy * l_entropy +
              lambda_physics * l_physics +
              lambda_smooth * l_smooth +
-             lambda_balance * l_balance)
+             lambda_balance * l_balance +
+             lambda_var * l_var)
 
     # ── 诊断 ──
     losses_dict = {
@@ -361,6 +380,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'physics': l_physics.item(),
         'smooth': l_smooth.item(),
         'balance': l_balance.item(),
+        'w_var': l_var.item(),
         'w_mean': w_i.mean().item(),
         'w_min': w_i.min().item(),
         'w_max': w_i.max().item(),

@@ -36,6 +36,10 @@ Synchrosqueezed-chirplet-transforms-main/
 # Jupyter
 .ipynb_checkpoints/
 
+# Training outputs (checkpoints, plots, profiler traces)
+sast_checkpoints/
+sast_trace.json
+
 # Temp
 *.swp
 *.swo

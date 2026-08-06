@@ -629,7 +629,7 @@ class SqueezeIterationController(nn.Module):
 # 5. SparseGaussianReassigner (replaces AdaptiveSqueeze)
 # ═══════════════════════════════════════════════════════════════
 
-# C++ CUDA kernel (可选, 加速 91 循环; 编译: python deploy/setup_msst_kernels.py build_ext --inplace)
+# C++ CUDA kernel (可选, 加速 循环; 编译: python deploy/setup_msst_kernels.py build_ext --inplace)
 try:
     import deploy.reassigner as _reassigner_cpp
     _HAS_REASSIGNER_CPP = True

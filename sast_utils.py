@@ -67,7 +67,8 @@ class SastConfig:
     lambda_entropy: float = 0.1
     lambda_physics: float = 0.5
     lambda_smooth: float = 0.05
-    lambda_balance: float = 0.01
+    lambda_balance: float = 0.5
+    lambda_var: float = 0.5
 
     # ── Data ──
     data_path: str = '5_dataset.npz'

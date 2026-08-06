@@ -61,41 +61,33 @@ __global__ void reassigner_backward_kernel(
     int t = idx % T;
     int b = idx / (F * T);
 
-    float sig_f = sigma[idx];
-    float tfr_w_f = tfr_weighted[idx];
+    float sig = sigma[idx];
+    float tfr_w = tfr_weighted[idx];
     int omega = (int)omega_hat[idx];
-    // double 内部累加: backward 的 dw_k = w_k*(k^2/sig^3 - dZ/Z) 是两个接近大数相减,
-    // float32 灾难抵消丢精度 (grad 差 6 数量级). 用 double 累加, 写回 float.
-    double sig = (double)sig_f;
-    double sig3 = sig * sig * sig;
-
-    // Z + dZ/dsigma = (1/sig^3) sum_k exp_k * k^2
-    double Z = 0.0, dZ = 0.0;
+    float sig3 = sig * sig * sig;
+    float Z = 0.0f, dZ = 0.0f;
     for (int k = -K; k <= K; k++) {
-        double r = (double)k / sig;
-        double e = exp(-0.5 * r * r);
+        float r = (float)k / sig;
+        float e = expf(-0.5f * r * r);
         Z += e;
-        dZ += e * (double)(k * k);
+        dZ += e * (float)(k * k);
     }
-    Z += 1e-8;
+    Z += 1e-8f;
     dZ = dZ / sig3;
-    double inv_Z = 1.0 / Z;
-
-    // grad_sigma = sum_k grad_out[target] * tfr_w * dw_k
-    // dw_k = w_k * (k^2/sig^3 - dZ/Z)
-    double gs = 0.0;
+    float inv_Z = 1.0f / Z;
+    float gs = 0.0f;
     for (int k = -K; k <= K; k++) {
-        double r = (double)k / sig;
-        double e = exp(-0.5 * r * r);
-        double w_k = e * inv_Z;
-        double dw_k = w_k * ((double)(k * k) / sig3 - dZ * inv_Z);
+        float r = (float)k / sig;
+        float e = expf(-0.5f * r * r);
+        float w_k = e * inv_Z;
+        float dw_k = w_k * ((float)(k * k) / sig3 - dZ * inv_Z);
         int target = omega + k;
         if (target < 0) target = 0;
         else if (target >= F) target = F - 1;
-        double grad_at = (double)grad_out[b * F * T + target * T + t];
-        gs += grad_at * (double)tfr_w_f * dw_k;
+        float grad_at = grad_out[b * F * T + target * T + t];
+        gs += grad_at * tfr_w * dw_k;
     }
-    grad_sigma[idx] = (float)gs;
+    grad_sigma[idx] = gs;
 }
 
 // ── C++ wrappers ──

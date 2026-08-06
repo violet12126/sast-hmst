@@ -626,6 +626,36 @@ class SqueezeIterationController(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 4.5 TemporalSmoother - w_i 时序平滑 (方法1+2)
+# ═══════════════════════════════════════════════════════════════
+class TemporalSmoother(nn.Module):
+    """w_i 沿时间维 depthwise 1D 高斯平滑, 可学习 (方法2), 高斯初值即方法1.
+
+    根因: GAT 每帧独立算 w_i (T 折进 batch), 无时序耦合 -> w_i 跳变 ->
+    sigma_i 跳变 -> TFR 竖线. 本层在 GAT 输出后对 w_i 做时域平滑.
+    - 方法1(立刻): 旧 checkpoint 加载(strict=False)后 conv 为高斯初值, 等效固定平滑, 竖线立即消失, 无需重训.
+    - 方法2(根治): 可学习, 重训后学到最优时序耦合.
+    归一化核(每次 forward 归一为和=1) -> 仅重分布不缩放, w_i 仍在 (0,1).
+    """
+
+    def __init__(self, n_phys: int, kernel_size: int = 15, sigma: float = 3.0):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size 须奇数"
+        self.kernel_size = kernel_size
+        k = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        g = torch.exp(-0.5 * (k / sigma) ** 2)
+        g = g / g.sum()                                   # 归一化高斯
+        # [n_phys, 1, K] for depthwise conv1d (groups=n_phys)
+        self.weight = nn.Parameter(g.view(1, 1, kernel_size).repeat(n_phys, 1, 1))
+        self.pad = kernel_size // 2
+
+    def forward(self, w_i: torch.Tensor) -> torch.Tensor:
+        # w_i: [B, N_phys, T], depthwise conv 沿 T
+        w = self.weight / self.weight.sum(dim=2, keepdim=True).clamp(min=1e-8)
+        return F.conv1d(w_i, w, padding=self.pad, groups=w.shape[0])
+
+
+# ═══════════════════════════════════════════════════════════════
 # 5. SparseGaussianReassigner (replaces AdaptiveSqueeze)
 # ═══════════════════════════════════════════════════════════════
 
@@ -730,32 +760,54 @@ class SparseGaussianReassigner(nn.Module):
     """
 
     def __init__(self, sigma_min: float = 0.5, sigma_max: float = 15.0,
-                 n_sigma_levels: int = 20, kernel_radius: float = 3.0):
+                 n_sigma_levels: int = 20, kernel_radius: float = 3.0,
+                 N_max: int = 4):
         super().__init__()
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.n_sigma_levels = n_sigma_levels
         self.kernel_radius = kernel_radius
+        self.N_max = N_max  # 推理多轮挤压最大轮数
 
     def forward(self, tfr_mag: torch.Tensor, omegas: torch.Tensor,
                 sigma_sq: torch.Tensor, freqs: torch.Tensor,
-                ridge_factor: Optional[torch.Tensor] = None) -> torch.Tensor:
+                ridge_factor: Optional[torch.Tensor] = None,
+                n_sqz_per_bin: Optional[torch.Tensor] = None,
+                N_max: int = 4) -> torch.Tensor:
         """
         连续可微软高斯重排 (通过自定义 autograd Function 省显存).
 
         可微性: ReassignerFunction 前向/反向都循环重算, 不保存 91 个 [B,F,T]
         中间. sigma_sq 直接进高斯核权重 -> 梯度回流到 w_i.
+
+        推理时 (n_sqz_per_bin 非 None): 迭代挤压 λ 轮 (设计 §18).
+          LOW_FREQ(λ=0) 不挤=保留原貌; BPF/2xBPF 多轮锐化.
+          每轮仅挤压 src_mask 内的源 bin, 挤出后能量到 omega_final,
+          未挤的留原地. 用固定 omega_final=omegas[:,-1] (收敛的固定点).
         """
         B, F, T = tfr_mag.shape
         # IF 目标位置 (常量, 不参与梯度)
         omega_final = omegas[:, -1, :, :].float()
         omega_hat_int = (omega_final - 1.0).clamp(0, F - 1).round().long()
-        # 加权输入
-        tfr_weighted = tfr_mag * ridge_factor if ridge_factor is not None else tfr_mag
         # sigma (clamp, 反向自动)
         sigma = sigma_sq.clamp(self.sigma_min, self.sigma_max)
         K = int(np.ceil(self.kernel_radius * self.sigma_max))
-        return ReassignerFunction.apply(tfr_weighted, sigma, omega_hat_int, K, F)
+
+        if n_sqz_per_bin is not None:
+            # ── 推理: 按 bin 级挤压轮数迭代 ──
+            tfr_cur = tfr_mag * (ridge_factor if ridge_factor is not None else 1.0)
+            for r in range(1, N_max + 1):
+                src_mask = (n_sqz_per_bin >= r).to(tfr_cur.dtype)
+                if src_mask.max() == 0:
+                    break
+                moved = ReassignerFunction.apply(
+                    tfr_cur * src_mask, sigma, omega_hat_int, K, F)
+                tfr_cur = moved + tfr_cur * (1.0 - src_mask)
+            return tfr_cur
+        else:
+            # ── 训练: 单 pass (可微, λ=1) ──
+            tfr_weighted = tfr_mag * ridge_factor if ridge_factor is not None else tfr_mag
+            return ReassignerFunction.apply(tfr_weighted, sigma, omega_hat_int, K, F)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -801,7 +853,10 @@ class SAST(nn.Module):
                  f_type_embed_dim: int = 16,
                  ppn_temperature: float = 0.08,
                  prototype_temperature: float = 0.1,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 use_temporal_smoother: bool = True,
+                 smoother_kernel: int = 15,
+                 n_sqz_max: int = 4):
         super().__init__()
         self.fs = fs
         self.d_h = d_h
@@ -809,6 +864,7 @@ class SAST(nn.Module):
         self.sigma_max = sigma_max
         self.N_max = N_max
         self.msst_num = max(msst_num, N_max)
+        self.n_sqz_max = n_sqz_max  # 推理多轮挤压最大轮数
 
         # ── 频率区域 ──
         self.regions = freq_regions if freq_regions is not None else PUMP_TURBINE_REGIONS
@@ -853,7 +909,14 @@ class SAST(nn.Module):
         # ── Sparse Gaussian Reassigner ──
         self.reassigner = SparseGaussianReassigner(
             sigma_min=sigma_min, sigma_max=sigma_max,
+            N_max=n_sqz_max,
         )
+
+        # ── Temporal Smoother (w_i 时序平滑, 方法1+2) ──
+        self.use_temporal_smoother = use_temporal_smoother
+        self.wi_smoother = TemporalSmoother(
+            n_phys=self.N_phys, kernel_size=smoother_kernel) \
+            if use_temporal_smoother else None
 
     def _extract_nodes_single(self, x_np: np.ndarray) -> NodeFeatures:
         """对单条信号运行 MSST + 节点特征提取 (CPU, numpy)."""
@@ -999,6 +1062,10 @@ class SAST(nn.Module):
         gate_edge = gate_edge_bt.reshape(B, T_msst, M_edges).permute(0, 2, 1)
         gate_node = gate_node_bt.reshape(B, T_msst, -1).permute(0, 2, 1)  # [B, N_total, T]
 
+        # ── w_i 时序平滑 (方法1+2): 消除逐帧跳变 -> σ/λ 不再跳 -> 无竖线 ──
+        if self.wi_smoother is not None:
+            w_i = self.wi_smoother(w_i)
+
         # ═══════════════════════════════════════════════════════
         # Step 6: w_i -> sigma_i, N_star, order_idx
         # ═══════════════════════════════════════════════════════
@@ -1018,26 +1085,44 @@ class SAST(nn.Module):
 
         # ── Squeeze iteration control (推理时) ──
         lambda_sqz = None
+        n_sqz_per_bin = None
         if not training:
             bw_expected = torch.tensor([r.bw_expected for r in self.regions],
                                       device=device, dtype=torch.float32)
             lambda_sqz, ridge_factor = self.sqz_controller(
                 w_i, tfr_mag, freqs, node_if, bw_expected)
+            # 推理: per-bin 挤压轮数 = round(λ_per_node * ridge_factor)
+            # λ=0 (LOW_FREQ) -> 0 轮不挤; λ=1 (BPF) -> 最多 n_sqz_max 轮
+            lambda_per_bin = lambda_sqz[B_idx_f, i_star, T_idx_f]
+            n_sqz_per_bin = (lambda_per_bin * ridge_factor).round().clamp(0, self.n_sqz_max).long()
         else:
             ridge_factor = None  # 训练时所有 bin 全参与
 
         # ═══════════════════════════════════════════════════════
         # Step 7: Sparse Gaussian Reassignment
         # 所有 bin 统一使用 omega_5 (最优 IF), sigma + ridge_factor 控制挤压
+        # 推理: n_sqz_per_bin 控制每 bin 被挤轮数, λ=0 不挤保留原貌
         # ═══════════════════════════════════════════════════════
         tfr_enhanced = self.reassigner(
             tfr_mag, omegas, sigma_sq, freqs, ridge_factor,
+            n_sqz_per_bin=n_sqz_per_bin, N_max=self.n_sqz_max,
         )
+
+        # ── MSST 硬挤压 (可视化对比基准) ──
+        # 与 reassigner 共用 omega_final (omegas[:,-1]), 唯一区别:
+        # 硬挤压 (单点 scatter) vs 软高斯重排 (sigma 控宽). 不参与反传.
+        with torch.no_grad():
+            omega_final_msst = omegas[:, -1, :, :].float()
+            valid_msst = omega_final_msst >= 1
+            idx_msst = (omega_final_msst - 1.0).clamp(0, F_bins - 1).round().long()
+            tfr_msst = torch.zeros_like(tfr_mag)
+            tfr_msst.scatter_add_(1, idx_msst, tfr_mag * valid_msst.to(tfr_mag.dtype))
 
         # ── 输出 ──
         result = {
             'tfr_enhanced': tfr_enhanced,
             'tfr_raw': tfr_mag,
+            'tfr_msst': tfr_msst,       # [B, F, T] MSST 硬挤压 (对比基准)
             'w_i': w_i,
             'sigma_sq': sigma_sq,
             'alpha': alpha,            # [B, T, 5] 原型注意力
@@ -1055,8 +1140,9 @@ class SAST(nn.Module):
             'edge_feats': edge_feats_t,
         }
         if not training:
-            result['lambda_sqz'] = lambda_sqz       # [B, N_phys, T] — 挤压轮数
-            result['ridge_factor'] = ridge_factor   # [B, F, T] — bin 参与因子
+            result['lambda_sqz'] = lambda_sqz         # [B, N_phys, T] — 挤压轮数
+            result['ridge_factor'] = ridge_factor     # [B, F, T] — bin 参与因子
+            result['n_sqz_per_bin'] = n_sqz_per_bin   # [B, F, T] — per-bin 挤压轮数
         return result
 
     def get_freq_features(self, x: torch.Tensor) -> torch.Tensor:

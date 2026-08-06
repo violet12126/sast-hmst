@@ -89,6 +89,8 @@ Examples:
     p.add_argument('--lambda_smooth', type=float, default=0.05)
     p.add_argument('--lambda_balance', type=float, default=0.5)
     p.add_argument('--lambda_var', type=float, default=0.5)
+    p.add_argument('--lambda_lowfreq', type=float, default=0.05,
+                   help='低频锐化 loss 权重 (方法5, 0=禁用)')
 
     # ── Output ──
     p.add_argument('--device', type=str, default='cuda')
@@ -112,6 +114,7 @@ Examples:
         lambda_physics=args.lambda_physics, lambda_smooth=args.lambda_smooth,
         lambda_balance=args.lambda_balance,
         lambda_var=args.lambda_var,
+        lambda_lowfreq=args.lambda_lowfreq,
         data_path=args.data, val_split=args.val_split,
         max_samples=args.max_samples,
         save_dir=args.save_dir, viz_every=args.viz_every,
@@ -243,6 +246,7 @@ def main():
                 lambda_smooth=config.lambda_smooth,
                 lambda_balance=config.lambda_balance,
                 lambda_var=config.lambda_var,
+                lambda_lowfreq=config.lambda_lowfreq,
             )
 
             # Additional diagnostics
@@ -314,6 +318,7 @@ def main():
                     viz_full['edge_feats'], viz_full['gate_edge'],
                     viz_full['edge_src'], viz_full['edge_dst'],
                     viz_full['node_if'], viz_full['freqs'], viz_full['A_ij'],
+                    lambda_lowfreq=config.lambda_lowfreq,
                 )
                 # Attach losses to results for title context
                 viz_results['_losses'] = viz_losses

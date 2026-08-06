@@ -69,6 +69,7 @@ class SastConfig:
     lambda_smooth: float = 0.05
     lambda_balance: float = 0.5
     lambda_var: float = 0.5
+    lambda_lowfreq: float = 0.05
 
     # ── Data ──
     data_path: str = '5_dataset.npz'
@@ -223,14 +224,24 @@ def load_checkpoint(checkpoint_path: str,
     config = SastConfig.from_dict(ckpt_args)
 
     model = create_model(config, device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    model_missing, model_unexpected = model.load_state_dict(
+        ckpt['model_state_dict'], strict=False)
+    if model_missing:
+        print(f"  [load_checkpoint] model missing keys (用随机初值): {model_missing}")
+    if model_unexpected:
+        print(f"  [load_checkpoint] model unexpected keys: {model_unexpected}")
 
     # Infer F_bins from encoder state dict
     enc_weight = ckpt['encoder_state_dict']['encoder.0.weight']
     F_bins = enc_weight.shape[1]
 
     freq_encoder = create_freq_encoder(F_bins, device=device)
-    freq_encoder.load_state_dict(ckpt['encoder_state_dict'])
+    enc_missing, enc_unexpected = freq_encoder.load_state_dict(
+        ckpt['encoder_state_dict'], strict=False)
+    if enc_missing:
+        print(f"  [load_checkpoint] encoder missing keys: {enc_missing}")
+    if enc_unexpected:
+        print(f"  [load_checkpoint] encoder unexpected keys: {enc_unexpected}")
 
     model.eval()
     freq_encoder.eval()
@@ -275,7 +286,7 @@ def infer_sast(model: SAST, x, return_all: bool = False) -> Dict[str, np.ndarray
         x = x.unsqueeze(0)
     x = x.to(next(model.parameters()).device)
 
-    results = model(x, return_all=True)
+    results = model(x, return_all=True, training=False)
 
     # Convert to numpy, squeezing batch dim
     out = {}
@@ -495,7 +506,7 @@ def plot_tfr(results: Dict[str, np.ndarray],
              freq_max: float = 200,
              title: Optional[str] = None):
     """
-    3-panel plot: Raw STFT | SAST TFR + Node IF | w_i(t)
+    3-panel plot: Raw MSST | SAST TFR + Node IF | w_i(t)
 
     Args:
         results:  from infer_sast(..., return_all=True)
@@ -503,7 +514,7 @@ def plot_tfr(results: Dict[str, np.ndarray],
         freq_max:  y-axis frequency limit
         title:     optional suptitle override
     """
-    tfr_raw = results['tfr_raw']
+    tfr_raw = results.get('tfr_msst', results['tfr_raw'])
     tfr_enhanced = results['tfr_enhanced']
     w_i = results['w_i']
     node_if = results['node_if']
@@ -520,9 +531,9 @@ def plot_tfr(results: Dict[str, np.ndarray],
 
     fig, axes = plt.subplots(1, 3, figsize=(21, 6))
 
-    # (a) Raw STFT
+    # (a) Raw MSST (Hard Squeeze)
     _plot_stft_panel(axes[0], tfr_raw, t_axis, freqs, freq_max,
-                     '(a) Raw STFT\nAll components blurred by finite window')
+                     '(a) Raw MSST (Hard Squeeze)\nStandard synchrosqueeze, no w_i gating')
 
     # (b) SAST TFR + node IF
     _plot_enhanced_tfr_panel(axes[1], tfr_enhanced, t_axis, freqs, freq_max,
@@ -553,7 +564,7 @@ def plot_full_diagnostics(results: Dict[str, np.ndarray],
         epoch:     optional epoch number for title
         freq_max:  y-axis frequency limit
     """
-    tfr_raw = results['tfr_raw']
+    tfr_raw = results.get('tfr_msst', results['tfr_raw'])
     tfr_enhanced = results['tfr_enhanced']
     sigma_sq = results['sigma_sq']
     w_i = results['w_i']
@@ -573,9 +584,9 @@ def plot_full_diagnostics(results: Dict[str, np.ndarray],
 
     fig, axes = plt.subplots(2, 3, figsize=(22, 14))
 
-    # (a) Raw STFT
+    # (a) Raw MSST (Hard Squeeze)
     _plot_stft_panel(axes[0, 0], tfr_raw, t_axis, freqs, freq_max,
-                     '(a) Raw STFT (No Squeeze)', add_colorbar=True)
+                     '(a) Raw MSST (Hard Squeeze)', add_colorbar=True)
 
     # (b) SAST TFR + Node IF
     _plot_enhanced_tfr_panel(axes[0, 1], tfr_enhanced, t_axis, freqs, freq_max,

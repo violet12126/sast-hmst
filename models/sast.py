@@ -573,7 +573,7 @@ class SqueezeIterationController(nn.Module):
 
         Returns:
             lambda_i:     [B, N_phys, T]  节点级挤压轮数 (0..N_max)
-            ridge_factor: [B, F, T]  逐 bin 挤压参与因子 (0..1)
+            ridge_factor: [B, F, T]  逐 bin 挤压参与因子 (ridge_floor..1)
         """
         B, N_phys, T = w_i.shape
         F = freqs.shape[0]
@@ -585,42 +585,34 @@ class SqueezeIterationController(nn.Module):
         lambda_i = lambda_i.clamp(0, self.N_max)
 
         # ── ridge_factor: bin 级参与因子 ──
-        # 逐 bin 分配到最近物理节点
+        # 基于 bin 频率到节点 IF 的归一化距离 (替代 energy-weighted ridge).
+        # 加宽衰减 (sigma=2x bw) + ridge_floor → 弱谐波也能轻度参与挤压.
         freqs_exp = freqs.view(1, 1, F, 1)           # [1, 1, F, 1]
         node_if_exp = node_if.unsqueeze(2)             # [B, N_phys, 1, T]
         dist = (freqs_exp - node_if_exp).abs()         # [B, N_phys, F, T]
         i_star = dist.argmin(dim=1)                     # [B, F, T]
 
-        # 每帧, 每个节点频段内的脊线位置 (能量最大 bin)
-        # 需要在节点频段内找 argmax — 简化为全局频段内能量最大
         ridge_factor = torch.zeros(B, F, T, device=device)
         bw_exp = bw_expected.view(1, N_phys, 1).to(device)  # [1, N_phys, 1]
 
         for n in range(N_phys):
             node_mask = (i_star == n)  # [B, F, T]
 
-            # 该节点的脊线 (逐帧, 在 assigned bin 内找 max energy)
-            tfr_masked = tfr_mag.clone()
-            tfr_masked[~node_mask] = 0.0
+            # 脊线 = 节点 IF (GAT 已跟踪, 无需 energy-weighted)
+            ridge_pos_f = node_if[:, n, :]  # [B, T]
 
-            # 脊线位置 (energy-weighted mean 而非 argmax, 更鲁棒)
-            ridge_energy = tfr_masked.max(dim=1).values  # [B, T] — 脊线能量
-            ridge_pos_f = (tfr_masked * freqs_exp.squeeze(1).squeeze(1).view(1, F, 1)).sum(dim=1) / \
-                          tfr_masked.sum(dim=1).clamp(min=eps)  # [B, T] — energy-weighted freq
-
-            # 对所有 bin 计算到脊线的距离
+            # 归一化距离: |freq - IF| / (2 * bw) — 加宽到 2x 预期带宽
             f_all = freqs.view(1, F, 1)  # [1, F, 1]
             ridge_f_exp = ridge_pos_f.unsqueeze(1)  # [B, 1, T]
-            ridge_dist = (f_all - ridge_f_exp).abs() / bw_exp[:, n:n+1, :].clamp(min=eps)  # [B, F, T]
-            ridge_decay = torch.exp(-ridge_dist ** 2 / 2.0)
+            ridge_dist = (f_all - ridge_f_exp).abs() / \
+                         (2.0 * bw_exp[:, n:n+1, :]).clamp(min=eps)  # [B, F, T]
+            # 放宽衰减: sigma=2 → fainter harmonics still get partial participation
+            ridge_decay = torch.exp(-ridge_dist ** 2 / 8.0)
 
-            # 能量比
-            max_e = ridge_energy.unsqueeze(1).clamp(min=eps)  # [B, 1, T]
-            energy_ratio = tfr_mag / max_e
+            ridge_factor = ridge_factor + node_mask.float() * ridge_decay
 
-            ridge_factor = ridge_factor + node_mask.float() * energy_ratio * ridge_decay
-
-        ridge_factor = ridge_factor.clamp(0.0, 1.0)
+        # ridge_floor=0.15: 远端谐波也能参与, 至少 ~15% 每轮
+        ridge_factor = ridge_factor.clamp(0.15, 1.0)
 
         return lambda_i, ridge_factor
 

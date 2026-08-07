@@ -240,32 +240,34 @@ def physics_consistency_loss(A_ij: torch.Tensor,
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. L_smooth - 时序平滑
+# 5. L_consistency - 频段内时序一致性
 # ═══════════════════════════════════════════════════════════════
 
-def temporal_smoothness_loss(w_i: torch.Tensor,
-                              A_ij: Optional[torch.Tensor] = None,
-                              lambda_A: float = 0.1) -> torch.Tensor:
+def w_consistency_loss(w_i: torch.Tensor) -> torch.Tensor:
     """
-    w_i(t) 和 A_ij(t) 的时序一致性.
+    惩罚各物理节点内 w_i 沿时间的方差.
+
+    核心思路: 一旦模型确定了频率脊线 (如 BPF ≈ 50Hz), 该频段内的挤压宽度
+    w_i 在所有时间帧上应该差不多——不同频段可以有不同的 w_i, 但同一频段内部
+    不能跳变.
+
+    L_consistency = mean_{nodes} Var_{t} [w_i(n, t)]
+
+    与 w_variance_loss 互补:
+      - w_consistency_loss: 缩小节点内时间方差 (管内聚, 防跳变)
+      - w_variance_loss:    扩大节点间均值差异 (管分化, 防全同退化)
+
+    Args:
+        w_i: [B, N_phys, T] IF 可信度
+
+    Returns:
+        scalar loss (越低 → 各频段内 w_i 越一致)
     """
-    device = w_i.device
     B, N, T = w_i.shape
-
-    if T >= 2:
-        w_diff = (w_i[:, :, 1:] - w_i[:, :, :-1])
-        loss_w = (w_diff ** 2).mean()
-    else:
-        loss_w = torch.tensor(0.0, device=device)
-
-    loss_attn = torch.tensor(0.0, device=device)
-    if A_ij is not None and lambda_A > 0:
-        _, _, _, T_a = A_ij.shape
-        if T_a >= 2:
-            attn_diff = (A_ij[:, :, :, 1:] - A_ij[:, :, :, :-1])
-            loss_attn = (attn_diff ** 2).mean()
-
-    return loss_w + lambda_A * loss_attn
+    if T < 2:
+        return torch.tensor(0.0, device=w_i.device)
+    per_node_var = w_i.var(dim=2)    # [B, N_phys] 每节点沿时间的方差
+    return per_node_var.mean()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -400,10 +402,9 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      lambda_supcon: float = 1.0,
                      lambda_entropy: float = 0.1,
                      lambda_physics: float = 0.5,
-                     lambda_smooth: float = 0.05,
                      lambda_balance: float = 0.01,
-                     lambda_A: float = 0.1,
                      lambda_var: float = 0.5,
+                     lambda_consistency: float = 0.3,
                      lambda_lowfreq: float = 0.05,
                      supcon_temperature: float = 0.1,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -411,7 +412,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     SAST v4 总损失 (SupCon 自监督).
 
     L_total = λ_sc*L_supcon + λ_e*RE_2D + λ_p*L_physics
-            + λ_s*L_smooth + λ_b*L_balance + λ_var*L_var
+            + λ_b*L_balance + λ_var*L_var + λ_c*L_consistency
             + λ_lf*L_lowfreq
 
     Args:
@@ -428,6 +429,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         freqs:        [F] 频率轴
         A_ij:         [B, M, H, T] (可选)
         lambda_*:     各项权重系数
+        lambda_consistency: w_i 频段内时序一致性权重 (默认 0.3)
         lambda_lowfreq: 低频锐化 loss 权重 (默认 0.05)
         supcon_temperature: SupCon 温度
 
@@ -445,9 +447,9 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         )
     else:
         l_physics = torch.tensor(0.0, device=w_i.device)
-    l_smooth = temporal_smoothness_loss(w_i, A_ij, lambda_A=lambda_A)
     l_balance = balance_loss(w_i)
     l_var = w_variance_loss(w_i)
+    l_consistency = w_consistency_loss(w_i)
     l_lowfreq = lowfreq_sharpness_loss(
         tfr_enhanced, freqs, node_if, PUMP_TURBINE_REGIONS)
 
@@ -455,9 +457,9 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     total = (lambda_supcon * l_supcon +
              lambda_entropy * l_entropy +
              lambda_physics * l_physics +
-             lambda_smooth * l_smooth +
              lambda_balance * l_balance +
              lambda_var * l_var +
+             lambda_consistency * l_consistency +
              lambda_lowfreq * l_lowfreq)
 
     # ── 诊断 ──
@@ -466,9 +468,9 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'supcon': l_supcon.item(),
         'entropy_2d': l_entropy.item(),
         'physics': l_physics.item(),
-        'smooth': l_smooth.item(),
         'balance': l_balance.item(),
         'w_var': l_var.item(),
+        'w_consistency': l_consistency.item(),
         'lowfreq_sharp': l_lowfreq.item(),
         'w_mean': w_i.mean().item(),
         'w_min': w_i.min().item(),

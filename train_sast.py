@@ -86,15 +86,14 @@ Examples:
     p.add_argument('--lambda_supcon', type=float, default=1.0)
     p.add_argument('--lambda_entropy', type=float, default=0.1)
     p.add_argument('--lambda_physics', type=float, default=0.5)
-    p.add_argument('--lambda_smooth', type=float, default=0.05)
     p.add_argument('--lambda_balance', type=float, default=0.5)
     p.add_argument('--lambda_var', type=float, default=0.5)
+    p.add_argument('--lambda_consistency', type=float, default=0.3,
+                   help='w_i 频段内时序一致性 loss 权重 (越高各帧越一致, 防跳变)')
     p.add_argument('--lambda_lowfreq', type=float, default=0.05,
-                   help='低频锐化 loss 权重 (方法5, 0=禁用)')
+                   help='低频锐化 loss 权重 (0=禁用)')
 
     # ── New module settings ──
-    p.add_argument('--smoother_kernel', type=int, default=15,
-                   help='TemporalSmoother conv kernel size (odd, >=3)')
     p.add_argument('--n_sqz_max', type=int, default=4,
                    help='推理多轮挤压最大轮数')
 
@@ -119,14 +118,14 @@ Examples:
         lr=args.lr, weight_decay=args.weight_decay,
         grad_clip=args.grad_clip, seed=args.seed,
         lambda_supcon=args.lambda_supcon, lambda_entropy=args.lambda_entropy,
-        lambda_physics=args.lambda_physics, lambda_smooth=args.lambda_smooth,
+        lambda_physics=args.lambda_physics,
         lambda_balance=args.lambda_balance,
         lambda_var=args.lambda_var,
+        lambda_consistency=args.lambda_consistency,
         lambda_lowfreq=args.lambda_lowfreq,
         data_path=args.data, val_split=args.val_split,
         max_samples=args.max_samples,
         save_dir=args.save_dir, viz_every=args.viz_every,
-        smoother_kernel=args.smoother_kernel,
         n_sqz_max=args.n_sqz_max,
         resume=args.resume,
     )
@@ -224,8 +223,8 @@ def main():
     print(f"Training SAST v3 (SupCon) for {config.epochs} epochs")
     print(f"  Batch size: {config.batch_size}, LR: {config.lr}")
     print(f"  λ_sc={config.lambda_supcon}  λ_e={config.lambda_entropy}")
-    print(f"  λ_p={config.lambda_physics}  λ_s={config.lambda_smooth}")
-    print(f"  λ_b={config.lambda_balance}")
+    print(f"  λ_p={config.lambda_physics}  λ_b={config.lambda_balance}")
+    print(f"  λ_var={config.lambda_var}  λ_c={config.lambda_consistency}  λ_lf={config.lambda_lowfreq}")
     if has_val:
         print(f"  Val split: {config.val_split:.0%} (KNN accuracy via z_freq centroids)")
     print(f"{'='*60}")
@@ -270,22 +269,15 @@ def main():
                 lambda_supcon=config.lambda_supcon,
                 lambda_entropy=config.lambda_entropy,
                 lambda_physics=config.lambda_physics,
-                lambda_smooth=config.lambda_smooth,
                 lambda_balance=config.lambda_balance,
                 lambda_var=config.lambda_var,
+                lambda_consistency=config.lambda_consistency,
                 lambda_lowfreq=config.lambda_lowfreq,
             )
-
-            # ── TemporalSmoother 正则: 防残差学成 delta ──
-            smoother_reg = torch.tensor(0.0, device=device)
-            if model.wi_smoother is not None:
-                smoother_reg = model.wi_smoother.reg_loss()
-                loss = loss + smoother_reg
 
             # Additional diagnostics
             losses_dict['gate_mean'] = results['gate_edge'].mean().item()
             losses_dict['C_prior_mean'] = model.get_C_prior().mean().item()
-            losses_dict['smoother_reg'] = smoother_reg.item()
 
             # ── Backward ──
             optimizer.zero_grad(set_to_none=True)
@@ -312,10 +304,9 @@ def main():
               f"sc={epoch_losses.get('supcon', 0):.3f} "
               f"ent={epoch_losses.get('entropy_2d', 0):.3f} "
               f"phy={epoch_losses.get('physics', 0):.4f} "
-              f"smo={epoch_losses.get('smooth', 0):.4f} "
               f"bal={epoch_losses.get('balance', 0):.4f} "
+              f"wc={epoch_losses.get('w_consistency', 0):.4f} "
               f"lf={epoch_losses.get('lowfreq_sharp', 0):.4f} "
-              f"sr={epoch_losses.get('smoother_reg', 0):.4f} "
               f"w_m={epoch_losses.get('w_mean', 0):.3f} "
               f"w_s={epoch_losses.get('w_spread', 0):.3f} "
               f"g={epoch_losses.get('gate_mean', 0):.3f}")

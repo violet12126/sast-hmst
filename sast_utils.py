@@ -66,9 +66,9 @@ class SastConfig:
     lambda_supcon: float = 1.0
     lambda_entropy: float = 0.1
     lambda_physics: float = 0.5
-    lambda_smooth: float = 0.05
     lambda_balance: float = 0.5
     lambda_var: float = 0.5
+    lambda_consistency: float = 0.3
     lambda_lowfreq: float = 0.05
 
     # ── Data ──
@@ -77,7 +77,6 @@ class SastConfig:
     max_samples: Optional[int] = None
 
     # ── New modules ──
-    smoother_kernel: int = 15
     n_sqz_max: int = 4
     resume: Optional[str] = None  # checkpoint path for fine-tuning
 
@@ -191,7 +190,6 @@ def create_model(config: SastConfig, device: torch.device) -> SAST:
         ppn_temperature=config.ppn_temperature,
         prototype_temperature=config.prototype_temperature,
         dropout=config.dropout,
-        smoother_kernel=config.smoother_kernel,
         n_sqz_max=config.n_sqz_max,
     ).to(device)
     return model

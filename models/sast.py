@@ -815,14 +815,18 @@ class SparseGaussianReassigner(nn.Module):
 
         if n_sqz_per_bin is not None:
             # ── 推理: 按 bin 级挤压轮数迭代 ──
-            tfr_cur = tfr_mag * (ridge_factor if ridge_factor is not None else 1.0)
+            # 所有 bin 从原始 STFT 能量开始. n_sqz_per_bin 控制挤几轮,
+            # ridge_factor 控制每轮参与程度. 不挤的 bin 留原位.
+            tfr_cur = tfr_mag
             for r in range(1, N_max + 1):
                 src_mask = (n_sqz_per_bin >= r).to(tfr_cur.dtype)
                 if src_mask.max() == 0:
                     break
+                # bin 参与度 = mask * ridge_factor (ridge 低 → 部分参与)
+                part = src_mask * (ridge_factor if ridge_factor is not None else 1.0)
                 moved = ReassignerFunction.apply(
-                    tfr_cur * src_mask, sigma, omega_hat_int, K, F)
-                tfr_cur = moved + tfr_cur * (1.0 - src_mask)
+                    tfr_cur * part, sigma, omega_hat_int, K, F)
+                tfr_cur = moved + tfr_cur * (1.0 - part)
             return tfr_cur
         else:
             # ── 训练: 单 pass (可微, λ=1) ──

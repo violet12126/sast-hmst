@@ -307,8 +307,9 @@ def main():
               f"phy={epoch_losses.get('physics', 0):.4f} "
               f"smo={epoch_losses.get('smooth', 0):.4f} "
               f"bal={epoch_losses.get('balance', 0):.4f} "
-              f"w_mean={epoch_losses.get('w_mean', 0):.3f} "
-              f"w_spread={epoch_losses.get('w_spread', 0):.3f} "
+              f"lf={epoch_losses.get('lowfreq_sharp', 0):.4f} "
+              f"w_m={epoch_losses.get('w_mean', 0):.3f} "
+              f"w_s={epoch_losses.get('w_spread', 0):.3f} "
               f"g={epoch_losses.get('gate_mean', 0):.3f}")
 
         # ── Validation (KNN via z_freq centroids) ──

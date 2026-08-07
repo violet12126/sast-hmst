@@ -635,7 +635,7 @@ class TemporalSmoother(nn.Module):
     sigma_i 跳变 -> TFR 竖线. 本层在 GAT 输出后对 w_i 做时域平滑.
     - 方法1(立刻): 旧 checkpoint 加载(strict=False)后 conv 为高斯初值, 等效固定平滑, 竖线立即消失, 无需重训.
     - 方法2(根治): 可学习, 重训后学到最优时序耦合.
-    归一化核(每次 forward 归一为和=1) -> 仅重分布不缩放, w_i 仍在 (0,1).
+    - softmax 归一化 → 权重恒正, 和=1, w_i 始终在 (0,1), 训练不爆炸.
     """
 
     def __init__(self, n_phys: int, kernel_size: int = 15, sigma: float = 3.0):
@@ -643,15 +643,17 @@ class TemporalSmoother(nn.Module):
         assert kernel_size % 2 == 1, "kernel_size 须奇数"
         self.kernel_size = kernel_size
         k = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
-        g = torch.exp(-0.5 * (k / sigma) ** 2)
-        g = g / g.sum()                                   # 归一化高斯
+        # log-高斯初始化: softmax(log_g) = 归一化高斯 (因为 exp(log_g) = g)
+        log_g = -0.5 * (k / sigma) ** 2
         # [n_phys, 1, K] for depthwise conv1d (groups=n_phys)
-        self.weight = nn.Parameter(g.view(1, 1, kernel_size).repeat(n_phys, 1, 1))
+        self.weight = nn.Parameter(
+            log_g.view(1, 1, kernel_size).repeat(n_phys, 1, 1))
         self.pad = kernel_size // 2
 
     def forward(self, w_i: torch.Tensor) -> torch.Tensor:
         # w_i: [B, N_phys, T], depthwise conv 沿 T
-        w = self.weight / self.weight.sum(dim=2, keepdim=True).clamp(min=1e-8)
+        # softmax 保证: 所有权重 > 0, sum = 1, 输出严格是输入的凸组合
+        w = F.softmax(self.weight, dim=2)
         return F.conv1d(w_i, w, padding=self.pad, groups=w.shape[0])
 
 

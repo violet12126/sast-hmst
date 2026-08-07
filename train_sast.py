@@ -276,9 +276,16 @@ def main():
                 lambda_lowfreq=config.lambda_lowfreq,
             )
 
+            # ── TemporalSmoother 正则: 防残差学成 delta ──
+            smoother_reg = torch.tensor(0.0, device=device)
+            if model.wi_smoother is not None:
+                smoother_reg = model.wi_smoother.reg_loss()
+                loss = loss + smoother_reg
+
             # Additional diagnostics
             losses_dict['gate_mean'] = results['gate_edge'].mean().item()
             losses_dict['C_prior_mean'] = model.get_C_prior().mean().item()
+            losses_dict['smoother_reg'] = smoother_reg.item()
 
             # ── Backward ──
             optimizer.zero_grad(set_to_none=True)
@@ -308,6 +315,7 @@ def main():
               f"smo={epoch_losses.get('smooth', 0):.4f} "
               f"bal={epoch_losses.get('balance', 0):.4f} "
               f"lf={epoch_losses.get('lowfreq_sharp', 0):.4f} "
+              f"sr={epoch_losses.get('smoother_reg', 0):.4f} "
               f"w_m={epoch_losses.get('w_mean', 0):.3f} "
               f"w_s={epoch_losses.get('w_spread', 0):.3f} "
               f"g={epoch_losses.get('gate_mean', 0):.3f}")

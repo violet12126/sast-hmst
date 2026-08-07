@@ -629,32 +629,50 @@ class SqueezeIterationController(nn.Module):
 # 4.5 TemporalSmoother - w_i 时序平滑 (方法1+2)
 # ═══════════════════════════════════════════════════════════════
 class TemporalSmoother(nn.Module):
-    """w_i 沿时间维 depthwise 1D 高斯平滑, 可学习 (方法2), 高斯初值即方法1.
+    """w_i 沿时间维 depthwise 1D 高斯平滑.
 
     根因: GAT 每帧独立算 w_i (T 折进 batch), 无时序耦合 -> w_i 跳变 ->
     sigma_i 跳变 -> TFR 竖线. 本层在 GAT 输出后对 w_i 做时域平滑.
-    - 方法1(立刻): 旧 checkpoint 加载(strict=False)后 conv 为高斯初值, 等效固定平滑, 竖线立即消失, 无需重训.
-    - 方法2(根治): 可学习, 重训后学到最优时序耦合.
-    - softmax 归一化 → 权重恒正, 和=1, w_i 始终在 (0,1), 训练不爆炸.
+
+    设计:
+    - 固定高斯核 (buffer, 不可学) 保证基础平滑, 竖线不会出现.
+    - 可选学习残差 (Parameter) 允许微调, 但用 L2 罚项约束其不偏离太远.
+    - 最终权重 = softmax(高斯_log + 残差), 和=1 恒正, w_i 始终在 (0,1).
+    - 旧 ckpt strict=False 加载时缺 residual → 零初值, 等效纯固定高斯.
     """
 
-    def __init__(self, n_phys: int, kernel_size: int = 15, sigma: float = 3.0):
+    def __init__(self, n_phys: int, kernel_size: int = 15, sigma: float = 3.0,
+                 learnable: bool = True, l2_weight: float = 1.0):
         super().__init__()
         assert kernel_size % 2 == 1, "kernel_size 须奇数"
         self.kernel_size = kernel_size
+        self.learnable = learnable
+        self.l2_weight = l2_weight
+
         k = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
-        # log-高斯初始化: softmax(log_g) = 归一化高斯 (因为 exp(log_g) = g)
+        # 基础高斯 (log 空间, 经 softmax 后 = 归一化高斯)
         log_g = -0.5 * (k / sigma) ** 2
-        # [n_phys, 1, K] for depthwise conv1d (groups=n_phys)
-        self.weight = nn.Parameter(
-            log_g.view(1, 1, kernel_size).repeat(n_phys, 1, 1))
+        base = log_g.view(1, 1, kernel_size).repeat(n_phys, 1, 1)
+        self.register_buffer('base_logit', base)  # 不可学, 保证基础平滑
+
+        # 可学残差 (初始化为 0 → 初始行为 = 纯固定高斯)
+        if learnable:
+            self.residual = nn.Parameter(torch.zeros(n_phys, 1, kernel_size))
+        else:
+            self.register_buffer('residual', torch.zeros(n_phys, 1, kernel_size))
+
         self.pad = kernel_size // 2
 
     def forward(self, w_i: torch.Tensor) -> torch.Tensor:
         # w_i: [B, N_phys, T], depthwise conv 沿 T
-        # softmax 保证: 所有权重 > 0, sum = 1, 输出严格是输入的凸组合
-        w = F.softmax(self.weight, dim=2)
+        w = F.softmax(self.base_logit + self.residual, dim=2)
         return F.conv1d(w_i, w, padding=self.pad, groups=w.shape[0])
+
+    def reg_loss(self) -> torch.Tensor:
+        """L2 正则: 惩罚残差偏离 0, 防止学成 delta 绕过平滑."""
+        if self.learnable:
+            return self.residual.pow(2).mean() * self.l2_weight
+        return torch.tensor(0.0, device=self.residual.device)
 
 
 # ═══════════════════════════════════════════════════════════════

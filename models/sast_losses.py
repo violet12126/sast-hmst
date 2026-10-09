@@ -275,15 +275,35 @@ def w_consistency_loss(w_i: torch.Tensor) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════
 
 def balance_loss(w_i: torch.Tensor,
-                  w_min: float = 0.3, w_max: float = 0.9) -> torch.Tensor:
+                  w_min: float = 0.3, w_max: float = 0.9,
+                  presence: Optional[torch.Tensor] = None,
+                  w_min_floor: float = 0.05) -> torch.Tensor:
     """
     per-node 防退化: 每节点时间均值 w_node in [w_min, w_max].
 
     L_balance = mean_nodes [ max(0, w_min - w_node) + max(0, w_node - w_max) ]
     per-node (非全局均值), 防单节点饱和到 1.0.
+
+    分量存在度门控 (presence):
+      原式假设"每个节点在每帧都应有分量", 对 2xBPF 在空转 (分量消失) 会强行
+      要求 w_node >= w_min, 与"分量不存在时不该挤压"矛盾。
+      给定 presence [B, N, T] 时下界按存在度插值:
+        w_min_eff = w_min_floor + (w_min - w_min_floor) * mean_t(e_n)
+      分量缺席 (e→0) → 下界松弛到 w_min_floor; 分量明显 (e→1) → 恢复 w_min。
+
+    Args:
+        w_i:         [B, N_phys, T]
+        w_min/w_max: 标量上下界
+        presence:    [B, N_phys, T] 可选, 分量存在度
+        w_min_floor: 存在度为 0 时的下界
     """
     w_node = w_i.mean(dim=-1)  # [B, N_phys] per-node 时间均值
-    l = torch.clamp(w_min - w_node, min=0.0) + torch.clamp(w_node - w_max, min=0.0)
+    if presence is not None:
+        e_mean = presence.mean(dim=-1)  # [B, N_phys]
+        w_min_eff = w_min_floor + (w_min - w_min_floor) * e_mean
+    else:
+        w_min_eff = torch.as_tensor(w_min, device=w_i.device, dtype=w_i.dtype)
+    l = torch.clamp(w_min_eff - w_node, min=0.0) + torch.clamp(w_node - w_max, min=0.0)
     return l.mean()
 
 
@@ -299,6 +319,52 @@ def w_variance_loss(w_i: torch.Tensor, target_var: float = 0.05) -> torch.Tensor
     w_node = w_i.mean(dim=-1)  # [B, N_phys]
     var = w_node.var(dim=-1)   # [B] 节点间方差
     return torch.relu(target_var - var).mean()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6b2. L_range - per-node 逐帧范围约束
+# ═══════════════════════════════════════════════════════════════
+
+def w_range_loss(w_i: torch.Tensor,
+                 w_low: torch.Tensor,
+                 w_high: torch.Tensor,
+                 presence: Optional[torch.Tensor] = None,
+                 w_low_min: float = 0.05) -> torch.Tensor:
+    """
+    惩罚 w_i 超出 per-node 目标范围的每一个元素 (逐帧, 非仅时间均值).
+
+    与 w_consistency_loss 互补:
+      - consistency: 缩小节点内时间方差 (平滑, 但快速跳变也能低方差)
+      - range:       硬约束每个时间帧在物理合理范围内 (防跳变)
+
+    L_range = mean[ clamp(w_low_eff - w_i, 0) + clamp(w_i - w_high, 0) ]
+
+    分量存在度门控 (presence):
+      w_range_low 隐含假设"该分量恒存在"。2xBPF 在空转工况分量消失
+      (存在度 e≈0.10 vs 带负荷 0.32-0.34), 但现行下界 0.65 仍强制
+      w≥0.65 → λ=round(w·4)≥3 轮硬挤压 → 凭空造出尖锐谱线。
+      给定 presence [B, N, T] 时下界逐帧插值:
+        w_low_eff = w_low_min + e_n(t) · (w_low - w_low_min)
+      分量缺席 → 允许 w 降到 w_low_min (几乎不挤压)。
+
+    Args:
+        w_i:      [B, N_phys, T] IF 可信度
+        w_low:    [N_phys] per-node 下界 (如 LOW_FREQ=0.10, BPF=0.55)
+        w_high:   [N_phys] per-node 上界 (如 LOW_FREQ=0.45, BPF=1.00)
+        presence: [B, N_phys, T] 可选, 分量存在度 (0=缺席, 1=显著)
+        w_low_min: 存在度为 0 时的下界
+
+    Returns:
+        scalar loss (→0 表示所有帧都在有效范围内)
+    """
+    w_high_exp = w_high.view(1, -1, 1).to(w_i.device)   # [1, N_phys, 1]
+    if presence is not None:
+        w_low_base = w_low.view(1, -1, 1).to(w_i.device)     # [1, N_phys, 1]
+        w_low_exp = w_low_min + presence.to(w_i.dtype) * (w_low_base - w_low_min)
+    else:
+        w_low_exp = w_low.view(1, -1, 1).to(w_i.device)
+    l = torch.clamp(w_low_exp - w_i, min=0.0) + torch.clamp(w_i - w_high_exp, min=0.0)
+    return l.mean()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -384,6 +450,130 @@ def lowfreq_sharpness_loss(
 
 
 # ═══════════════════════════════════════════════════════════════
+# 6c. 节点分量存在度 (presence) — 供 w_range / balance / anchor 门控
+# ═══════════════════════════════════════════════════════════════
+
+def node_presence(tfr_mag: torch.Tensor,
+                  freqs: torch.Tensor,
+                  regions: Optional[List[FreqRegion]] = None,
+                  frac: float = 0.1,
+                  eps: float = 1e-12) -> torch.Tensor:
+    """
+    逐节点逐帧的"分量存在度" e ∈ [0, 1].
+
+    动机: w_range_low / balance 的下界都隐含"该分量恒存在"的假设。
+    实测 2xBPF 节点在空转工况分量消失 (带内能量峰平坦, 存在度 0.10),
+    但下界仍强制 w≥0.65 → λ≥3 轮硬挤压 → 凭空造出尖锐谱线。
+    用一个纯粹由输入谱决定的标量把"分量是否存在"显式表达出来。
+
+    定义 (能量集中度, 与频率轴分辨率无关):
+      c_n(t) = 带内能量最高的 k 个 bin 的能量 / 带内总能量,  k = ceil(frac·F_n)
+      p      = k / F_n        (平坦谱时的期望占比)
+      e_n(t) = clamp((c - p)/(1 - p), 0, 1)
+      平坦宽带谱 → c≈p → e≈0 ; 独立谱线 → c→1 → e→1
+
+    注意: 必须传**原始** (未增强) 谱, 否则模型可通过制造尖锐谱线提高 e。
+
+    Args:
+        tfr_mag: [B, F, T] 幅值谱 (或复数 STFT, 内部取模)
+        freqs:   [F] 频率轴 (Hz)
+        regions: FreqRegion 列表
+        frac:    计入"峰"的 bin 比例
+
+    Returns:
+        [B, N_phys, T] 存在度
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    if torch.is_complex(tfr_mag):
+        tfr_mag = tfr_mag.abs()
+    B, F, T = tfr_mag.shape
+    dtype = tfr_mag.dtype
+    e = torch.zeros(B, len(regions), T, device=tfr_mag.device, dtype=dtype)
+
+    for n, r in enumerate(regions):
+        m = (freqs >= r.f_min) & (freqs <= r.f_max)
+        Fn = int(m.sum().item())
+        if Fn == 0:
+            continue
+        band = tfr_mag[:, m, :].clamp(min=0.0)          # [B, Fn, T]
+        k = max(1, int(math.ceil(frac * Fn)))
+        tot = band.sum(dim=1)                            # [B, T]
+        top = band.topk(min(k, Fn), dim=1).values.sum(dim=1)   # [B, T]
+        c = top / tot.clamp(min=eps)
+        p = k / Fn
+        e[:, n, :] = ((c - p) / max(eps, 1.0 - p)).clamp(0.0, 1.0)
+    return e
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6d. 绝对频率锚 (L_anchor)
+# ═══════════════════════════════════════════════════════════════
+
+def freq_anchor_loss(tfr_enhanced: torch.Tensor,
+                     freqs: torch.Tensor,
+                     regions: Optional[List[FreqRegion]] = None,
+                     presence: Optional[torch.Tensor] = None,
+                     eps: float = 1e-12) -> torch.Tensor:
+    """
+    绝对频率锚 — 打破比值约束的尺度不变性 (设计讨论 §"谐波边").
+
+    为什么需要:
+      边约束用的是比值 r_obs = f_dst / f_src (INTEGER_HARMONIC 要求 = 2.0)。
+      比值是尺度不变量: 若 BPF 与 2xBPF 的频率同时被高估 (或低估) 同样的比例,
+      r_obs 不变 → 该约束对"共模频率偏差"完全无感, 无法把节点 IF 拉回真值。
+      实测 r_obs = 100.1/47 ≈ 2.13 而非 2.00, 谐波边门控因此被压到 0.25-0.44。
+      绝对锚提供唯一的外部参考系。
+
+    作用对象 (关键):
+      锚**不能**作用在 node_if 上 —— node_if 由 MSST 的 omega_final 解析得到,
+      对网络参数不可微, 锚在它上面只会得到一个常数 (零梯度、无任何训练作用)。
+      故本函数锚在**增强 TFR 的可微带内能量质心**上:
+        E(f,t) = |TFR_enhanced(f,t)|²,  w = E/Σ_f E
+        f_cent(t) = Σ_f w·f          (带内能量质心, 对参数可微)
+      惩罚 f_cent 超出 [f_anchor ± anchor_tol] 的漂移 (flat-bottom hinge):
+
+        L_anchor = Σ_n gate_n(t) · clamp(|f_cent_n(t) - f_anchor_n| - tol_n, 0)
+
+      flat-bottom 的意义: 真实的工况漂移 (水头/负荷引起的峰位移动) 不应被惩罚,
+      只有越界漂移才罚 → 锚是"护栏"而非"硬目标"。
+
+    Args:
+        tfr_enhanced: [B, F, T] 增强 TFR (可微)
+        freqs:        [F] 频率轴 (Hz)
+        regions:      FreqRegion 列表 (读 f_anchor / anchor_tol / 频段)
+        presence:     [B, N_phys, T] 可选, 分量存在度门控 (缺席时不锚)
+
+    Returns:
+        scalar loss (Hz 量纲)
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    B, F, T = tfr_enhanced.shape
+    dtype = tfr_enhanced.dtype
+    total = torch.zeros((), device=tfr_enhanced.device, dtype=dtype)
+    p = tfr_enhanced.abs()
+
+    for n, r in enumerate(regions):
+        if r.f_anchor is None:
+            continue
+        m = (freqs >= r.f_min) & (freqs <= r.f_max)
+        if not bool(m.any().item()):
+            continue
+        E = p[:, m, :].pow(2)                                   # [B, Fn, T]
+        w = E / E.sum(dim=1, keepdim=True).clamp(min=eps)        # [B, Fn, T]
+        fb = freqs[m].to(dtype).view(1, -1, 1)                   # [1, Fn, 1]
+        f_cent = (w * fb).sum(dim=1)                            # [B, T]
+        dev = (f_cent - float(r.f_anchor)).abs() - float(r.anchor_tol)
+        l_bt = dev.clamp(min=0.0)                               # [B, T] Hz
+        if presence is not None:
+            total = total + (l_bt * presence[:, n, :].to(dtype)).mean()
+        else:
+            total = total + l_bt.mean()
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════
 # 7. Total Loss
 # ═══════════════════════════════════════════════════════════════
 
@@ -406,17 +596,22 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      lambda_var: float = 0.5,
                      lambda_consistency: float = 0.3,
                      lambda_lowfreq: float = 0.05,
+                     lambda_range: float = 0.3,
+                     lambda_anchor: float = 0.2,
                      supcon_temperature: float = 0.1,
+                     regions: Optional[List[FreqRegion]] = None,
+                     presence_frac: float = 0.1,
+                     w_low_min: float = 0.05,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     SAST v4 总损失 (SupCon 自监督).
 
     L_total = λ_sc*L_supcon + λ_e*RE_2D + λ_p*L_physics
             + λ_b*L_balance + λ_var*L_var + λ_c*L_consistency
-            + λ_lf*L_lowfreq
+            + λ_lf*L_lowfreq + λ_r*L_range + λ_a*L_anchor
 
     Args:
-        tfr_raw:      [B, F, T] 原始 STFT 幅值
+        tfr_raw:      [B, F, T] 原始 STFT 幅值 (用于估计分量存在度, 须未增强)
         tfr_enhanced: [B, F, T] SAST 增强 TFR
         w_i:          [B, N_phys, T] IF 可信度
         y_true:       [B] 工况标签 (SupCon 正负对定义)
@@ -431,12 +626,20 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         lambda_*:     各项权重系数
         lambda_consistency: w_i 频段内时序一致性权重 (默认 0.3)
         lambda_lowfreq: 低频锐化 loss 权重 (默认 0.05)
+        lambda_range:   w_i per-node 逐帧范围约束权重 (默认 0.3)
+        lambda_anchor:  绝对频率锚权重 (默认 0.2)
         supcon_temperature: SupCon 温度
+        regions:      物理节点频段定义 (默认 PUMP_TURBINE_REGIONS)
+        presence_frac: 存在度估计计入"峰"的 bin 比例 (默认 0.1)
+        w_low_min:     分量缺席时 w_range 下界松弛到的值 (默认 0.05)
 
     Returns:
         total_loss:  scalar
         losses_dict: dict of individual loss values + diagnostics
     """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+
     # ── 各分量 ──
     z_freq = freq_encoder(tfr_enhanced)
     l_supcon = supcon_loss(z_freq, y_true, temperature=supcon_temperature)
@@ -447,11 +650,26 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         )
     else:
         l_physics = torch.tensor(0.0, device=w_i.device)
-    l_balance = balance_loss(w_i)
+
+    # ── 分量存在度 (由原始谱决定, 门控下面三项) ──
+    presence = node_presence(tfr_raw, freqs, regions, frac=presence_frac)
+
+    l_balance = balance_loss(w_i, presence=presence, w_min_floor=w_low_min)
     l_var = w_variance_loss(w_i)
     l_consistency = w_consistency_loss(w_i)
+    r_low = regions[0]                      # LOW_FREQ 频段随定义走
     l_lowfreq = lowfreq_sharpness_loss(
-        tfr_enhanced, freqs, node_if, PUMP_TURBINE_REGIONS)
+        tfr_enhanced, freqs, node_if, regions,
+        f_low=r_low.f_min, f_high=r_low.f_max)
+    # ── per-node 逐帧范围约束 (下界按存在度松弛) ──
+    w_low = torch.tensor([r.w_range_low for r in regions],
+                          device=w_i.device, dtype=torch.float32)
+    w_high = torch.tensor([r.w_range_high for r in regions],
+                           device=w_i.device, dtype=torch.float32)
+    l_range = w_range_loss(w_i, w_low, w_high,
+                           presence=presence, w_low_min=w_low_min)
+    # ── 绝对频率锚 (作用在可微的带内能量质心上) ──
+    l_anchor = freq_anchor_loss(tfr_enhanced, freqs, regions, presence=presence)
 
     # ── 加权求和 ──
     total = (lambda_supcon * l_supcon +
@@ -460,7 +678,9 @@ def total_sast_loss(tfr_raw: torch.Tensor,
              lambda_balance * l_balance +
              lambda_var * l_var +
              lambda_consistency * l_consistency +
-             lambda_lowfreq * l_lowfreq)
+             lambda_lowfreq * l_lowfreq +
+             lambda_range * l_range +
+             lambda_anchor * l_anchor)
 
     # ── 诊断 ──
     losses_dict = {
@@ -472,12 +692,18 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'w_var': l_var.item(),
         'w_consistency': l_consistency.item(),
         'lowfreq_sharp': l_lowfreq.item(),
+        'w_range': l_range.item(),
+        'anchor': l_anchor.item(),
         'w_mean': w_i.mean().item(),
         'w_min': w_i.min().item(),
         'w_max': w_i.max().item(),
         'w_spread': (w_i.mean(dim=-1).max(dim=-1).values.mean() -
                      w_i.mean(dim=-1).min(dim=-1).values.mean()).item(),
     }
+    # 逐节点存在度 (batch 均值) — 用于确认"分量缺席"是否被识别
+    p_mean = presence.mean(dim=-1).mean(dim=0)   # [N_phys]
+    for n, r in enumerate(regions):
+        losses_dict[f'presence_{r.name}'] = p_mean[n].item()
 
     return total, losses_dict
 

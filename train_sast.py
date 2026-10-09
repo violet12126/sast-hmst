@@ -29,13 +29,14 @@ import time
 sys.path.insert(0, str(Path(__file__).parent))
 
 from models.sast_losses import total_sast_loss
+from models.sast_nodes import PUMP_TURBINE_REGIONS
 from models.sast_graph import get_graph_summary, NODE_NAMES
 
-from sast_utils import (
-    SastConfig, set_seed, load_dataset,
-    create_model, create_freq_encoder, get_freq_bins,
-    compute_class_centroids, plot_full_diagnostics, infer_sast, evaluate_accuracy,
-)
+from sast_config import SastConfig, set_seed
+from sast_data import load_dataset
+from sast_model import create_model, create_freq_encoder, get_freq_bins
+from sast_inference import compute_class_centroids, infer_sast, evaluate_accuracy
+from sast_viz import plot_full_diagnostics
 
 
 def parse_args():
@@ -92,6 +93,14 @@ Examples:
                    help='w_i 频段内时序一致性 loss 权重 (越高各帧越一致, 防跳变)')
     p.add_argument('--lambda_lowfreq', type=float, default=0.05,
                    help='低频锐化 loss 权重 (0=禁用)')
+    p.add_argument('--lambda_range', type=float, default=0.3,
+                   help='w_i per-node 逐帧范围约束 loss 权重')
+    p.add_argument('--lambda_anchor', type=float, default=0.2,
+                   help='绝对频率锚 loss 权重 (BPF 49.995±4Hz, 2xBPF 99.990±1.5Hz)')
+    p.add_argument('--presence_frac', type=float, default=0.1,
+                   help='分量存在度估计: 计入"峰"的带内 bin 比例')
+    p.add_argument('--w_low_min', type=float, default=0.05,
+                   help='分量缺席时 w_range/balance 下界松弛到该值')
 
     # ── New module settings ──
     p.add_argument('--n_sqz_max', type=int, default=4,
@@ -123,6 +132,10 @@ Examples:
         lambda_var=args.lambda_var,
         lambda_consistency=args.lambda_consistency,
         lambda_lowfreq=args.lambda_lowfreq,
+        lambda_range=args.lambda_range,
+        lambda_anchor=args.lambda_anchor,
+        presence_frac=args.presence_frac,
+        w_low_min=args.w_low_min,
         data_path=args.data, val_split=args.val_split,
         max_samples=args.max_samples,
         save_dir=args.save_dir, viz_every=args.viz_every,
@@ -224,7 +237,12 @@ def main():
     print(f"  Batch size: {config.batch_size}, LR: {config.lr}")
     print(f"  λ_sc={config.lambda_supcon}  λ_e={config.lambda_entropy}")
     print(f"  λ_p={config.lambda_physics}  λ_b={config.lambda_balance}")
-    print(f"  λ_var={config.lambda_var}  λ_c={config.lambda_consistency}  λ_lf={config.lambda_lowfreq}")
+    print(f"  λ_var={config.lambda_var}  λ_c={config.lambda_consistency}  λ_lf={config.lambda_lowfreq}  λ_r={config.lambda_range}")
+    print(f"  λ_anchor={config.lambda_anchor}  presence_frac={config.presence_frac}  w_low_min={config.w_low_min}")
+    for r in PUMP_TURBINE_REGIONS:
+        anch = '—' if r.f_anchor is None else f'{r.f_anchor:.3f}±{r.anchor_tol}Hz'
+        print(f"    {r.name:<9s} [{r.f_min:.0f},{r.f_max:.0f}] Hz  "
+              f"w∈[{r.w_range_low},{r.w_range_high}]  锚 {anch}")
     if has_val:
         print(f"  Val split: {config.val_split:.0%} (KNN accuracy via z_freq centroids)")
     print(f"{'='*60}")
@@ -273,6 +291,10 @@ def main():
                 lambda_var=config.lambda_var,
                 lambda_consistency=config.lambda_consistency,
                 lambda_lowfreq=config.lambda_lowfreq,
+                lambda_range=config.lambda_range,
+                lambda_anchor=config.lambda_anchor,
+                presence_frac=config.presence_frac,
+                w_low_min=config.w_low_min,
             )
 
             # Additional diagnostics
@@ -306,6 +328,7 @@ def main():
               f"phy={epoch_losses.get('physics', 0):.4f} "
               f"bal={epoch_losses.get('balance', 0):.4f} "
               f"wc={epoch_losses.get('w_consistency', 0):.4f} "
+              f"wr={epoch_losses.get('w_range', 0):.4f} "
               f"lf={epoch_losses.get('lowfreq_sharp', 0):.4f} "
               f"w_m={epoch_losses.get('w_mean', 0):.3f} "
               f"w_s={epoch_losses.get('w_spread', 0):.3f} "
@@ -338,7 +361,7 @@ def main():
             with torch.no_grad():
                 viz_signal_t = torch.from_numpy(viz_signal).float().unsqueeze(0).to(device)
                 viz_label_t = torch.tensor([viz_label], device=device)
-                viz_full = model(viz_signal_t, return_all=True)
+                viz_full = model(viz_signal_t, return_all=True, training=False)
                 _, viz_losses = total_sast_loss(
                     viz_full['tfr_raw'], viz_full['tfr_enhanced'],
                     viz_full['w_i'], viz_label_t, freq_encoder,
@@ -346,6 +369,10 @@ def main():
                     viz_full['edge_src'], viz_full['edge_dst'],
                     viz_full['node_if'], viz_full['freqs'], viz_full['A_ij'],
                     lambda_lowfreq=config.lambda_lowfreq,
+                    lambda_range=config.lambda_range,
+                    lambda_anchor=config.lambda_anchor,
+                    presence_frac=config.presence_frac,
+                    w_low_min=config.w_low_min,
                 )
                 # Attach losses to results for title context
                 viz_results['_losses'] = viz_losses
@@ -380,7 +407,7 @@ def main():
     model.eval()
     with torch.no_grad():
         viz_signal_t = torch.from_numpy(viz_signal).float().unsqueeze(0).to(device)
-        final_results = model(viz_signal_t, return_all=True)
+        final_results = model(viz_signal_t, return_all=True, training=False)
         w_i_final = final_results['w_i'][0].cpu().numpy()  # [N_phys, T]
         print(f"\nFinal w_i (time-mean per node):")
         phys_names = NODE_NAMES[1:]

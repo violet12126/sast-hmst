@@ -28,13 +28,14 @@ import argparse
 import os
 import sys
 from typing import Optional
-
+import tensorrt as trt
 import numpy as np
-
+import pycuda.driver as cuda
+import pycuda.autoinit  # noqa: F401
 # 复用重排 CUDA kernel (Jetson 上需先编译 reassigner.cu)
 try:
     import torch
-    import deploy.reassigner as _reassigner_cpp
+    import deploy.reassigner as _reassi gner_cpp
     _HAS_REASSIGNER = True
 except Exception:
     _HAS_REASSIGNER = False
@@ -73,7 +74,7 @@ class _TrtRunner:
     """加载 .engine, 分配 IO 内存, run 一次网络部分前向."""
 
     def __init__(self, engine_path: str):
-        import tensorrt as trt
+        
         self.logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.logger)
         with open(engine_path, 'rb') as f:
@@ -83,8 +84,7 @@ class _TrtRunner:
         self._alloc_buffers()
 
     def _alloc_buffers(self):
-        import pycuda.driver as cuda
-        import pycuda.autoinit  # noqa: F401
+
         self._cuda = cuda
         self._n_inputs = 0
         for i in range(self.engine.num_io_tensors):

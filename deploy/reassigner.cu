@@ -93,6 +93,13 @@ __global__ void reassigner_backward_kernel(
 // ── C++ wrappers ──
 void reassigner_forward_cuda(torch::Tensor tfr_weighted, torch::Tensor sigma,
                              torch::Tensor omega_hat, torch::Tensor tfr_enhanced, int K) {
+    TORCH_CHECK(tfr_weighted.is_cuda(), "tfr_weighted must be on CUDA");
+    TORCH_CHECK(sigma.is_cuda(),        "sigma must be on CUDA");
+    TORCH_CHECK(omega_hat.is_cuda(),    "omega_hat must be on CUDA");
+    TORCH_CHECK(tfr_weighted.dim() == 3, "tfr_weighted must be [B, F, T]");
+    TORCH_CHECK(tfr_weighted.dtype() == torch::kFloat32, "tfr_weighted must be float32");
+    TORCH_CHECK(sigma.dtype() == torch::kFloat32, "sigma must be float32");
+
     int B = tfr_weighted.size(0);
     int F = tfr_weighted.size(1);
     int T = tfr_weighted.size(2);
@@ -103,11 +110,17 @@ void reassigner_forward_cuda(torch::Tensor tfr_weighted, torch::Tensor sigma,
         tfr_weighted.data_ptr<float>(), sigma.data_ptr<float>(),
         omega_hat.data_ptr<int64_t>(), tfr_enhanced.data_ptr<float>(),
         B, F, T, K);
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "reassigner_forward_kernel failed: ",
+                cudaGetErrorString(err));
 }
 
 void reassigner_backward_cuda(torch::Tensor grad_out, torch::Tensor sigma,
                               torch::Tensor tfr_weighted, torch::Tensor omega_hat,
                               torch::Tensor grad_sigma, int K) {
+    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be on CUDA");
+    TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [B, F, T]");
+
     int B = grad_out.size(0);
     int F = grad_out.size(1);
     int T = grad_out.size(2);
@@ -118,6 +131,9 @@ void reassigner_backward_cuda(torch::Tensor grad_out, torch::Tensor sigma,
         grad_out.data_ptr<float>(), sigma.data_ptr<float>(),
         tfr_weighted.data_ptr<float>(), omega_hat.data_ptr<int64_t>(),
         grad_sigma.data_ptr<float>(), B, F, T, K);
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "reassigner_backward_kernel failed: ",
+                cudaGetErrorString(err));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

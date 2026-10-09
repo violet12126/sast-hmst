@@ -76,11 +76,8 @@ python deploy/compile_hmst_cuda.py
 `import hmst_cuda_ext`，**绕开 torch JIT 的源码哈希+重编译**，因此**无需 MSVC、无需 `PYTHONUTF8`**，普通终端即可加载：
 
 ```bash
-# 方式 A: 从 JIT 缓存拷贝 (compile_hmst_cuda.py 编译后)
-cp "$LOCALAPPDATA/torch_extensions/torch_extensions/Cache/py310_cu118/hmst_cuda_ext/hmst_cuda_ext.pyd" deploy/
-
-# 方式 B: 用 setuptools 就地编译到 deploy/ (需 MSVC + PYTHONUTF8, 仅一次)
-cd deploy && python setup_hmst.py build_ext --inplace && cd ..
+# 用 setuptools 就地编译到 deploy/ (需 MSVC + PYTHONUTF8, 仅一次)
+cd deploy && python setup_msst_kernels.py build_ext --inplace && cd ..
 ```
 
 之后任意 shell 直接：
@@ -109,9 +106,9 @@ Jetson 是 aarch64 Linux → 编译的是 **`.so`**（不是 Windows 的 `.pyd`�
 ```bash
 # 板端编译 (必须在 deploy/ 目录内跑, 因 sources 是相对路径)
 cd deploy
-TORCH_CUDA_ARCH_LIST="8.7" python setup_hmst.py     # Orin=8.7; Xavier=7.2; 老 Nano=5.3
+TORCH_CUDA_ARCH_LIST="8.7" python setup_msst_kernels.py     # Orin=8.7; Xavier=7.2; 老 Nano=5.3
 cd ..
-# → 产出 deploy/hmst_cuda_ext.cpython-3X-aarch64-linux-gnu.so
+# → 产出 deploy/*.cpython-3X-aarch64-linux-gnu.so
 ```
 
 之后任意 shell 直接 `python your_script.py`，路径 1 自动加载该 `.so`。

@@ -41,11 +41,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from sast_utils import (
-    SastConfig, set_seed, load_dataset,
-    load_checkpoint, infer_sast, predict_class, evaluate_accuracy, compute_class_centroids,
-    plot_tfr, plot_full_diagnostics, print_inference_summary,
+from sast_config import set_seed
+from sast_data import load_dataset
+from sast_model import load_checkpoint
+from sast_inference import (
+    infer_sast, predict_class, evaluate_accuracy, compute_class_centroids,
 )
+from sast_viz import plot_tfr, plot_full_diagnostics, print_inference_summary
 from models.sast_graph import get_graph_summary
 
 
@@ -242,12 +244,14 @@ def main():
 
     # Plot
     out_path = args.output
+    fs = meta['config'].fs
     if args.mode == 'full':
         out_path = out_path or f'sast_full_class{class_label}_s{sample_idx}.png'
-        plot_full_diagnostics(results, out_path)
+        plot_full_diagnostics(results, out_path, freq_max=args.freq_max)
     else:
         out_path = out_path or f'sast_tfr_class{class_label}_s{sample_idx}.png'
-        plot_tfr(results, out_path, freq_max=args.freq_max)
+        plot_tfr(results, out_path, freq_max=args.freq_max,
+                 signal=signal, fs=fs)
 
     # Summary table
     C_prior = meta['C_prior']

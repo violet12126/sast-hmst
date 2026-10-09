@@ -123,6 +123,7 @@ if __name__ == '__main__':
         '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH',
         '-D_DISABLE_STL_NOEXCEPT_FUNCTION_TYPE',
         '-Xcompiler', '/Zc:noexceptTypes-',
+        '-Xcompiler', '/utf-8',   # MSVC 按 UTF-8 解析源码 (避免中文/Unicode 注释被 GBK 误读吞行)
     ]
     _NVCC_FAST_MATH = _NVCC_COMMON + ['--use_fast_math']
 
@@ -148,9 +149,8 @@ if __name__ == '__main__':
                 },
             ),
             CUDAExtension(
-                name='msst_stft',
-                sources=[os.path.join(build_dir, 'msst_stft.cu')],
-                libraries=['cufft'],
+                name='reassigner_sorted',
+                sources=[os.path.join(build_dir, 'reassigner_sorted.cu')],
                 extra_compile_args={
                     'cxx': _CXX_COMMON,
                     'nvcc': _NVCC_COMMON,  # cuFFT 不需要 --use_fast_math
@@ -162,6 +162,14 @@ if __name__ == '__main__':
                 extra_compile_args={
                     'cxx': _CXX_COMMON,
                     'nvcc': _NVCC_COMMON,  # 不用 fast_math (保 exp 精度, backward 敏感)
+                },
+            ),
+            CUDAExtension(
+                name='reassigner_opt',
+                sources=[os.path.join(build_dir, 'reassigner_opt.cu')],
+                extra_compile_args={
+                    'cxx': _CXX_COMMON,
+                    'nvcc': _NVCC_COMMON,  # 转置布局 + 动态 K_eff; 不用 fast_math (保 exp 精度, backward 敏感)
                 },
             ),
         ],

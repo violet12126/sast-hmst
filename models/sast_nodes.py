@@ -19,9 +19,9 @@ SAST Node Feature Extraction — 从 MSST omega_final 直接提取物理节点�
     5. LOW_FREQ (11-15 Hz): 水力来源 (涡带/压力脉动), 与 BPF 不成整数倍
 
   保留节点:
-    LOW_FREQ: 2-25 Hz   — 水力分量, 独立于机械路径
-    BPF:      42-55 Hz  — 叶片通过频率, 宽峰 (工况调制)
-    2xBPF:    90-105 Hz — 二倍叶片通过频率, 尖峰, 极度稳定
+    LOW_FREQ: 2-18 Hz   — 水力分量, 独立于机械路径
+    BPF:      42-55 Hz  — 叶片通过频率, 宽峰 (工况调制); 绝对锚 49.995 Hz ±4
+    2xBPF:    90-105 Hz — 二倍叶片通过频率, 尖峰, 极度稳定; 绝对锚 99.990 Hz ±1.5
 
   边: BPF → 2xBPF (r_nom=2.0, INTEGER_HARMONIC) — 唯一的确定性倍频关系
 
@@ -47,6 +47,22 @@ from models.tfr import msst
 # 水泵水轮机频率区域定义 (基于实测数据频谱分析)
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# 机组物理参数 → 绝对频率锚
+# ═══════════════════════════════════════════════════════════════
+# 额定转速 333.3 rpm, 转轮叶片数 9 → f_rot = 5.5550 Hz
+#   1×BPF = Z_r·f_rot = 49.995 Hz (与 50 Hz 电网频率数值重合, 见 docs 讨论)
+#   2×BPF = 2·Z_r·f_rot = 99.990 Hz (实测 100.10 Hz, 逐样本标准差 0.000)
+# 锚的作用: 比值约束 (r_obs = f_dst/f_src) 是尺度不变的, 无法纠正共模频率偏差,
+#           绝对锚提供唯一的"绝对参考系"。
+# 锚的容差 anchor_tol: 只惩罚超出容差的漂移 (flat-bottom hinge), 不惩罚真实工况漂移。
+N_RATED_RPM = 333.3
+Z_RUNNER = 9
+F_ROT_HZ = N_RATED_RPM / 60.0        # 5.5550 Hz
+F_BPF_ANCHOR = Z_RUNNER * F_ROT_HZ   # 49.995 Hz
+F_2XBPF_ANCHOR = 2.0 * Z_RUNNER * F_ROT_HZ   # 99.990 Hz
+
+
 @dataclass
 class FreqRegion:
     """单个物理节点的频率搜索区域。"""
@@ -57,19 +73,40 @@ class FreqRegion:
     C_prior: float      # 先验可压缩性倾向 (0-1)
     bw_expected: float  # 预期带宽 (Hz) — 用于原型匹配和异常检测
     persist_expected: float  # 预期持续性 (0-1)
+    w_range_low: float  # w_i 逐帧下界 (0-1, 防跳变到过低)
+    w_range_high: float # w_i 逐帧上界 (0-1, 防跳变到过高)
+    f_anchor: Optional[float] = None    # 绝对频率锚 (Hz); None = 无绝对参考
+    anchor_tol: float = 4.0             # 锚容差 (Hz), flat-bottom 半宽
 
 
 PUMP_TURBINE_REGIONS: List[FreqRegion] = [
-    # LOW_FREQ: 水力来源 (涡带/压力脉动), 2-25 Hz
+    # LOW_FREQ: 水力来源 (涡带/压力脉动), 2-18 Hz
+    #   实测评测 (probe_node_if.py / check_spectral_bands.py):
+    #     - 2.0 Hz 附近在所有工况都是带内能量峰 (E峰 f = 2.0-3.0 Hz)
+    #     - 15.14 Hz 在低负荷是最强线 (凸出 11.2 dB), 属同一"水力"族的漂移分量
+    #     - >17 Hz 各工况均为平坦宽带 (PMR 0.8-1.5 dB), 无独立峰
+    #   → 上界由 25 Hz 收到 18 Hz: 去掉纯宽带尾部, 避免 IF 中位数被抬到带中
     #   预期宽频 (12 Hz), 中低持续性 (涡带仅部分工况显著)
-    FreqRegion('LOW_FREQ',  2.0, 25.0,  'HYDRAULIC',       0.30, 12.0, 0.50),
+    #   w_range: [0.10, 0.45] — 保守, 宽核, 不锐化
+    #   无绝对锚: 水力分量频率由流动不稳定性决定, 不锁定转速
+    FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.30, 12.0, 0.50, 0.10, 0.45),
     # BPF: 叶片通过频率, 42-55 Hz
     #   预期宽频 (~12 Hz), 高持续性 (有水就有)
     #   工况调制致宽: 水头/负荷/导叶开度变化 → IF 在 42-55 Hz 内漂移
-    FreqRegion('BPF',      42.0, 55.0,  'BLADE_PASS',      0.60, 12.0, 0.85),
+    #   ⚠ 实测: 带内能量峰在 46.4-48.8 Hz (非 50.00), 且 45.9 Hz 候选分量在
+    #     空转 (45.65% 转速) 仍位于 46.39±0.61 Hz → 该带混入了不锁转速的水力宽峰。
+    #     故锚容差取宽 (±4 Hz), 只惩罚越界漂移, 不与真实工况漂移对抗。
+    #   w_range: [0.55, 0.90] — 信任, 窄核, 锐化
+    FreqRegion('BPF',      42.0, 55.0,  'BLADE_PASS',      0.60, 12.0, 0.85, 0.55, 0.90,
+               f_anchor=F_BPF_ANCHOR, anchor_tol=4.0),
     # 2xBPF: 二倍叶片通过频率, 90-105 Hz
     #   预期窄带 (2 Hz), 极高持续性
-    FreqRegion('2xBPF',    90.0, 105.0, 'BLADE_HARMONIC',  0.90,  2.0, 0.95),
+    #   实测: 带内能量峰 = 100.00 Hz (全部带负荷工况), 逐样本 f=100.10 Hz 标准差 0.000,
+    #        空转时该分量消失 (存在度 0.10 vs 带负荷 0.32-0.34) → 确证为 2×BPF
+    #   锚容差 ±1.5 Hz (紧): 该线位置由转速唯一确定, 不应漂移
+    #   w_range: [0.65, 0.90] — 最信任, 极锐
+    FreqRegion('2xBPF',    90.0, 105.0, 'BLADE_HARMONIC',  0.90,  2.0, 0.95, 0.65, 0.90,
+               f_anchor=F_2XBPF_ANCHOR, anchor_tol=1.5),
 ]
 
 # 节点数量

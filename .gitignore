@@ -39,6 +39,25 @@ Synchrosqueezed-chirplet-transforms-main/
 # Training outputs (checkpoints, plots, profiler traces)
 sast_checkpoints/
 sast_trace.json
+*.nsys-rep
+*.ncu-rep
+
+# 可再生的探查输出 (由 scripts/ 重新生成)
+infer_out_v4/
+tfr_version_probe/
+
+# Word 临时/锁定文件
+~$*
+
+# 未发表的论文手稿 (本地留存, 不入公开仓库; 可由 scripts/doc 重建)
+docs/SAST_汇报与论文初稿.docx
+docs/_build_check.docx
+
+# 个人文件 (简历/面试准备), 非本项目内容
+简历*.txt
+面试准备_*.md
+docs/nsys_interview_qa.md
+待补充实验清单.md
 
 # Temp
 *.swp

@@ -547,17 +547,17 @@ class SqueezeIterationController(nn.Module):
 
     关键洞察: MSST 的 lookup 迭代对所有 bin 无害 (总是朝能量集中方向走),
     因此所有 bin 统一用 omega_5 (最优 IF)。GAT 控制的是挤压轮数:
-      - 2xBPF: lambda=1 (一轮到位, 已收敛)
-      - BPF:    lambda=3~5 (多轮, 每轮重估 IF 提升 SNR)
-      - LOW_FREQ: lambda=0 (不挤)
+      - 2xBPF: lambda≈4 (w_i≈1.0, 多轮锐化)
+      - BPF:    lambda≈4 (w_i≈1.0, 多轮锐化)
+      - LOW_FREQ: lambda≥min_sqz (宽核 soft nudge, 不锐化但防全保留)
 
-    节点级 lambda_i = round(w_i * N_max)
-    bin 级 ridge_factor = energy_ratio * ridge_decay (脊线 bin→全参与, 远离 bin→跳过)
+    min_sqz=1: 所有 bin 至少挤一轮, LOW_FREQ 用宽 sigma 温柔拨动, 不伤低频.
     """
 
-    def __init__(self, N_max: int = 5):
+    def __init__(self, N_max: int = 5, min_sqz: int = 1):
         super().__init__()
         self.N_max = N_max
+        self.min_sqz = min_sqz
 
     def forward(self, w_i: torch.Tensor,
                 tfr_mag: torch.Tensor, freqs: torch.Tensor,
@@ -582,7 +582,7 @@ class SqueezeIterationController(nn.Module):
 
         # ── lambda_i: 节点级挤压轮数 ──
         lambda_i = torch.round(w_i * self.N_max).long()  # [B, N_phys, T]
-        lambda_i = lambda_i.clamp(0, self.N_max)
+        lambda_i = lambda_i.clamp(self.min_sqz, self.N_max)
 
         # ── ridge_factor: bin 级参与因子 ──
         # 基于 bin 频率到节点 IF 的归一化距离 (替代 energy-weighted ridge).
@@ -628,6 +628,13 @@ try:
 except Exception:
     _HAS_REASSIGNER_CPP = False
 
+# 转置布局 [B,T,F] 优化版 (动态 K_eff=ceil(6σ), 比 base 快 2~7x)
+try:
+    import deploy.reassigner_opt as _reassigner_opt_cpp
+    _HAS_REASSIGNER_OPT = True
+except Exception:
+    _HAS_REASSIGNER_OPT = False
+
 
 class ReassignerFunction(torch.autograd.Function):
     """可微软高斯重排 (C++ CUDA kernel 加速, Python fallback).
@@ -640,9 +647,19 @@ class ReassignerFunction(torch.autograd.Function):
     def forward(ctx, tfr_weighted, sigma, omega_hat_int, K, F_dim):
         B, F, T = tfr_weighted.shape
         tfr_enhanced = torch.zeros(B, F, T, device=tfr_weighted.device, dtype=tfr_weighted.dtype)
-        use_cpp = (_HAS_REASSIGNER_CPP and tfr_weighted.is_cuda
-                   and tfr_weighted.dtype == torch.float32 and sigma.dtype == torch.float32)
-        if use_cpp:
+        use_cuda = (tfr_weighted.is_cuda and tfr_weighted.dtype == torch.float32
+                    and sigma.dtype == torch.float32)
+        use_opt = use_cuda and _HAS_REASSIGNER_OPT
+        use_base = use_cuda and _HAS_REASSIGNER_CPP and not use_opt
+        if use_opt:
+            # 转置布局优化核期望 [B,T,F]; 转置 -> 调用 -> 转回 (多 2 次 contiguous 拷贝)
+            tw = tfr_weighted.transpose(1, 2).contiguous()
+            sg = sigma.transpose(1, 2).contiguous()
+            oh = omega_hat_int.transpose(1, 2).contiguous()
+            out_bTf = torch.zeros(B, T, F, device=tfr_weighted.device, dtype=torch.float32)
+            _reassigner_opt_cpp.forward(tw, sg, oh, out_bTf, K)
+            tfr_enhanced = out_bTf.transpose(1, 2).contiguous()
+        elif use_base:
             _reassigner_cpp.forward(tfr_weighted, sigma, omega_hat_int, tfr_enhanced, K)
         else:
             dtype = sigma.dtype
@@ -661,7 +678,8 @@ class ReassignerFunction(torch.autograd.Function):
         ctx.save_for_backward(sigma, tfr_weighted, omega_hat_int)
         ctx.K = K
         ctx.F = F
-        ctx.use_cpp = use_cpp
+        ctx.use_opt = use_opt
+        ctx.use_base = use_base
         return tfr_enhanced
 
     @staticmethod
@@ -670,7 +688,16 @@ class ReassignerFunction(torch.autograd.Function):
         K = ctx.K
         F = ctx.F
         B, _, T = sigma.shape
-        if ctx.use_cpp:
+        if ctx.use_opt:
+            go = grad_out.transpose(1, 2).contiguous()
+            sg = sigma.transpose(1, 2).contiguous()
+            tw = tfr_weighted.transpose(1, 2).contiguous()
+            oh = omega_hat_int.transpose(1, 2).contiguous()
+            gs_bTf = torch.zeros(B, T, F, device=sigma.device, dtype=torch.float32)
+            _reassigner_opt_cpp.backward(go, sg, tw, oh, gs_bTf, K)
+            grad_sigma = gs_bTf.transpose(1, 2).contiguous()
+            return None, grad_sigma, None, None, None
+        if ctx.use_base:
             grad_out = grad_out.contiguous()
             sigma = sigma.contiguous()
             tfr_weighted = tfr_weighted.contiguous()
@@ -868,7 +895,7 @@ class SAST(nn.Module):
         )
 
         # ── Squeeze Iteration Controller (推理用) ──
-        self.sqz_controller = SqueezeIterationController(N_max=N_max)
+        self.sqz_controller = SqueezeIterationController(N_max=N_max, min_sqz=1)
 
         # ── Sparse Gaussian Reassigner ──
         self.reassigner = SparseGaussianReassigner(
@@ -1024,7 +1051,13 @@ class SAST(nn.Module):
         # Step 6: w_i -> sigma_i, N_star, order_idx
         # ═══════════════════════════════════════════════════════
         # sigma_i: per-node -> broadcast to per-bin
-        delta = self.sigma_max - self.sigma_min
+        # 原线性映射 sigma = sigma_min + (1-w_i)*(sigma_max-sigma_min) 会让保守节点
+        # (如 LOW_FREQ, w_i≈0.3) 得到 sigma≈10.7 bin (≈5.3 Hz), 高斯重排把低频
+        # 脊线摊到 ±3σ≈±16 Hz, 峰值稀释 ~27x, 低频基线被"摊没"。
+        # 治本收紧: 把"软挤压"的有效核宽上限压到 sigma_soft_cap, 使低频脊线
+        # 保持软挤压(不锐化)但不再过度展宽; BPF/2xBPF 的 w_i→1 仍逼近 sigma_min。
+        sigma_soft_cap = 3.0   # 保守端最大核宽 (bin) ≈ 1.5 Hz
+        delta = min(self.sigma_max, sigma_soft_cap) - self.sigma_min
         sigma_i = self.sigma_min + (1.0 - w_i) * delta  # [B, N_phys, T]
 
         # 逐 bin sigma: 分配到最近物理节点
@@ -1048,7 +1081,7 @@ class SAST(nn.Module):
             # 推理: per-bin 挤压轮数 = round(λ_per_node * ridge_factor)
             # λ=0 (LOW_FREQ) -> 0 轮不挤; λ=1 (BPF) -> 最多 n_sqz_max 轮
             lambda_per_bin = lambda_sqz[B_idx_f, i_star, T_idx_f]
-            n_sqz_per_bin = (lambda_per_bin * ridge_factor).round().clamp(0, self.n_sqz_max).long()
+            n_sqz_per_bin = (lambda_per_bin * ridge_factor).round().clamp(1, self.n_sqz_max).long()
         else:
             ridge_factor = None  # 训练时所有 bin 全参与
 

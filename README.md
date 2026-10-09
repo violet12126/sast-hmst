@@ -24,16 +24,10 @@ sast-hmst/
 │   └── # Adaptive order synchrosqueezing transform.md  # Colominas & Meignen 2025 论文笔记
 ├── scripts/
 │   ├── plot/                 # 可视化
-│   │   ├── plot_sst_order_compare.py      # N=1~5 阶 SST 全貌对比
-│   │   ├── plot_torch_msst_compare.py     # CUDA MSST vs Numpy MSST
-│   │   ├── plot_squeeze_compare.py        # 挤压方式对比 (hard/linear CUDA)
-│   │   └── plot_dataset_tfr_cuda.py       # 真实数据 CUDA MSST
-│   ├── test/                 # 测试
-│   │   ├── test_squeeze_compare.py        # 挤压精度对比
-│   │   └── test_torch_stft_v2.py          # Torch STFT + Squeeze 对比
-│   └── analysis/             # 数据分析
-│       ├── eda_prototypes.py             # 静态原型生成
-│       └── analyze_npz.py                # 数据集频谱分析
+│   │   └── plot_msst_tfr.py              # WSST2 / ssqueezepy / MSST / FFT 对比
+│   └── test/                 # 测试
+│       ├── test_squeeze_compare.py        # 挤压精度对比
+│       └── test_torch_stft_v2.py          # Torch STFT + Squeeze 对比
 └── docs/                      # 补充文档
 ```
 
@@ -45,12 +39,10 @@ sast-hmst/
 python deploy/setup_msst_kernels.py build_ext --inplace
 ```
 
-### 运行 CUDA MSST 时频图对比
+### 运行 MSST 时频图对比
 
 ```bash
-python scripts/plot/plot_torch_msst_compare.py      # CUDA vs Numpy (T=2000)
-python scripts/plot/plot_sst_order_compare.py        # N=1~5 阶对比
-python scripts/plot/plot_dataset_tfr_cuda.py         # 真实 5 类样本
+python scripts/plot/plot_msst_tfr.py                # WSST2 / ssq / MSST / FFT 对比
 ```
 
 

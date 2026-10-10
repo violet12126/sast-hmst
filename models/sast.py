@@ -44,6 +44,7 @@ from models.sast_nodes import (
 from models.sast_graph import (
     PHYSICS_EDGES, N_EDGES, N_NODES,
     PHYSICS_NODE_INDICES,
+    NODE_LOW_FREQ, NODE_BPF_DRIFT, NODE_BPF_LINE, NODE_2XBPF,
     compute_edge_features, get_graph_summary,
     HARMONIC_EDGE_INDICES, CONDITION_EDGE_INDICES, DRIFT_EDGE_INDICES,
     COMPETITION_EDGE_INDICES,
@@ -146,15 +147,23 @@ class StaticPrototypeMatcher(nn.Module):
 
         # node_energy 已经是对数能量, 转回线性用于比例计算
         E_lin = torch.exp(node_energy.clamp(max=20.0))  # [B, N, T]
-        E_total = E_lin.sum(dim=1, keepdim=True).clamp(min=1e-12)
 
-        R_LF = E_lin[:, 0, :] / E_total[:, 0, :]      # [B, T]
-        R_BPF = E_lin[:, 1, :] / E_total[:, 0, :]     # [B, T]
-        R_2xBPF = E_lin[:, 2, :] / E_total[:, 0, :]   # [B, T]
+        # B4 拆节点: 冻结原型 (STATIC_PROTOTYPES) 是按"3 节点能量划分"离线统计的
+        # (E_total = E_LF + E_BPF + E_2xBPF), 语义为 BPF 族整体。拆节点后必须把
+        # BPF_DRIFT + BPF_LINE 合并回"BPF 族", 否则 V_obs 的语义与原型不匹配。
+        # ⚠ 若日后重做 EDA 并按 4 节点重建原型, 这里应改为直接取 4 个节点能量。
+        E_bpf = E_lin[:, NODE_BPF_DRIFT - 1, :] + E_lin[:, NODE_BPF_LINE - 1, :]
+        E_2x = E_lin[:, NODE_2XBPF - 1, :]
+        E_lf = E_lin[:, NODE_LOW_FREQ - 1, :]
+        E_total = (E_lf + E_bpf + E_2x).clamp(min=1e-12)
+
+        R_LF = E_lf / E_total                        # [B, T]
+        R_BPF = E_bpf / E_total                      # [B, T]
+        R_2xBPF = E_2x / E_total                     # [B, T]
 
         eps = 1e-12
         log_ratio = torch.log10(
-            E_lin[:, 1, :].clamp(min=eps) / E_lin[:, 2, :].clamp(min=eps)
+            E_bpf.clamp(min=eps) / E_2x.clamp(min=eps)
         )  # [B, T]
 
         V_obs = torch.stack([R_LF, R_BPF, R_2xBPF, log_ratio], dim=-1)  # [B, T, 4]

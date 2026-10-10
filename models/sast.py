@@ -188,7 +188,7 @@ class PhysicsPrototypeMemory(nn.Module):
         super().__init__()
         self.regions = regions if regions is not None else PUMP_TURBINE_REGIONS
         self.N_phys = len(self.regions)
-        self.N_total = N_NODES  # 4 (OP + 3 physical)
+        self.N_total = N_NODES  # 5 (OP + 4 physical, B4 拆节点后)
         self.temperature = temperature
 
         # ── C_prior: 每物理节点的先验信任度 (可学习 logit) ──

@@ -8,6 +8,7 @@ import torch                                                   # noqa: E402
 from models.sast_losses import (                               # noqa: E402
     FreqEncoder, node_presence, total_sast_loss)
 from models.sast_nodes import PUMP_TURBINE_REGIONS as R        # noqa: E402
+from models.sast_graph import PHYSICS_EDGES, N_EDGES           # noqa: E402
 
 print('regions:')
 for r in R:
@@ -16,22 +17,25 @@ for r in R:
           f'anchor={r.f_anchor}±{r.anchor_tol}')
 
 dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-B, F, T, N, M = 4, 1000, 60, 3, 10
+B, F, T, N, M = 4, 1000, 60, len(R), N_EDGES
 freqs = torch.linspace(0, 500, F, device=dev)
 
 mag = torch.full((B, F, T), 1e-3, device=dev)
-mag[:, (freqs >= 99) & (freqs <= 101), :] += 1.0     # 100 Hz 线
-mag[:, (freqs >= 46) & (freqs <= 48), :] += 0.4      # 47 Hz 鼓包
+mag[:, (freqs >= 99) & (freqs <= 101), :] += 1.0     # 100 Hz 2xBPF 线
+mag[:, (freqs >= 49.5) & (freqs <= 50.5), :] += 1.0  # 50 Hz 1xBPF 线
+mag[:, (freqs >= 46) & (freqs <= 48), :] += 0.4      # 47 Hz 漂移鼓包
 
 w_i = torch.full((B, N, T), 0.5, device=dev, requires_grad=True)
 node_if = torch.stack([torch.full((B, T), 10.0, device=dev),
                        torch.full((B, T), 47.0, device=dev),
+                       torch.full((B, T), 50.0, device=dev),
                        torch.full((B, T), 100.1, device=dev)])
 enc = FreqEncoder(n_freq_bins=F).to(dev)
 ef = torch.rand(B, M, T, 5, device=dev)
 ge = torch.rand(B, M, T, device=dev)
-es = torch.tensor([0, 0, 0, 1, 2, 2, 1, 3, 2, 3], device=dev)
-ed = torch.tensor([1, 2, 3, 2, 1, 3, 3, 1, 3, 2], device=dev)
+# 边索引直接由图定义导出 (B4 拆节点后 11 条边), 不再硬编码
+es = torch.tensor([e.src for e in PHYSICS_EDGES], device=dev)
+ed = torch.tensor([e.dst for e in PHYSICS_EDGES], device=dev)
 A = torch.rand(B, M, 4, T, device=dev, requires_grad=True)
 y = torch.tensor([0, 1, 2, 3], device=dev)
 
@@ -51,7 +55,7 @@ p_flat = node_presence(flat, freqs, R)
 p_line = node_presence(mag, freqs, R)
 print('\npresence 仅2Hz有能量 :',
       [round(p_flat[:, n, :].mean().item(), 3) for n in range(N)])
-print('presence 含100/47Hz线:',
+print('presence 含100/50/47Hz:',
       [round(p_line[:, n, :].mean().item(), 3) for n in range(N)])
 
 # 平坦谱: 2xBPF 缺席 -> w_low 应松弛, L_range 应比不给 presence 小
@@ -66,16 +70,34 @@ print(f'  L_balance 无门控    = {balance_loss(w_low_set).item():.4f}')
 print(f'  L_balance 有门控    = {balance_loss(w_low_set, presence=p_flat).item():.4f}')
 
 # ── 锚越界时必须产生非零梯度 (否则锚形同虚设) ──
-from models.sast_losses import freq_anchor_loss                          # noqa: E402
-print('\n[锚越界检验] 把 BPF 带内能量搬到 43Hz (偏差 7Hz > 容差 4Hz):')
-for f0 in (47.0, 43.0, 40.0):
+from models.sast_losses import freq_anchor_loss, harmonic_ratio_loss   # noqa: E402
+from models.sast_nodes import band_centroid_if                         # noqa: E402
+print('\n[锚越界检验] 把 BPF_LINE 带内能量峰移到 f0 '
+      '(锚 49.995±1.5 → 容差带 [48.5, 51.5]); 2xBPF 另给锚内参考线:')
+for f0 in (50.0, 51.0, 52.0, 53.0):
     t = torch.full((2, F, T), 1e-3, device=dev, requires_grad=True)
     with torch.no_grad():
-        t[:, (freqs >= f0 - 1) & (freqs <= f0 + 1), :] += 1.0
-        t[:, (freqs >= 99) & (freqs <= 101), :] += 1.0
+        t[:, (freqs >= 99) & (freqs <= 101), :] += 1.0        # 2xBPF 锚内线
+        t[:, (freqs >= f0 - 0.5) & (freqs <= f0 + 0.5), :] += 1.0
     la = freq_anchor_loss(t, freqs, R, presence=None)
     g = torch.autograd.grad(la, t, retain_graph=False)[0]
-    print(f'  BPF 能量峰={f0:.0f}Hz  L_anchor={la.item():.4f}Hz  '
+    cents = band_centroid_if(t.detach(), freqs, R)[0, :, :].mean(dim=-1)
+    print(f'  BPF_LINE 峰={f0:.1f}Hz  BPF_LINE质心={cents[2]:.2f}Hz  '
+          f'2xBPF质心={cents[3]:.2f}Hz  L_anchor={la.item():.4f}Hz  '
           f'|dL/dt|={g.abs().sum().item():.3e}')
+
+# ── A2: L_ratio 必须对可微 if_hat 产生梯度 (对比 L_physics 的零梯度) ──
+print('\n[A2 比值约束可微性] (f_BPF_LINE, f_2xBPF) 相对偏差超过 6% 时应有非零梯度:')
+for f1, f2 in [(50.0, 100.0), (49.0, 104.0), (48.5, 104.0), (52.0, 95.0)]:
+    t = torch.full((2, F, T), 1e-3, device=dev, requires_grad=True)
+    with torch.no_grad():
+        t[:, (freqs >= f1 - 0.4) & (freqs <= f1 + 0.4), :] += 1.0
+        t[:, (freqs >= f2 - 0.4) & (freqs <= f2 + 0.4), :] += 1.0
+    ih = band_centroid_if(t, freqs, R)
+    fl, fh = ih[:, 2, :].mean().item(), ih[:, 3, :].mean().item()
+    lr = harmonic_ratio_loss(ih, R, presence=None, tol=0.06)
+    g = torch.autograd.grad(lr, t, retain_graph=False)[0]
+    print(f'  BPF_LINE={fl:6.2f}Hz  2xBPF={fh:6.2f}Hz  r_obs={fh / fl:.3f}  '
+          f'L_ratio={lr.item():.4f}  |dL/dt|={g.abs().sum().item():.3e}')
 
 print('\nSmoke test OK')

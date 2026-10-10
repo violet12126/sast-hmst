@@ -18,20 +18,28 @@ SAST Node Feature Extraction — 从 MSST omega_final 直接提取物理节点�
     4. HIGH_HARMONIC (468 Hz): 仅 31-45% 样本出现, 能量 <0.08%, 判定为噪声
     5. LOW_FREQ (11-15 Hz): 水力来源 (涡带/压力脉动), 与 BPF 不成整数倍
 
-  保留节点:
-    LOW_FREQ: 2-18 Hz   — 水力分量, 独立于机械路径
-    BPF:      42-55 Hz  — 叶片通过频率, 宽峰 (工况调制); 绝对锚 49.995 Hz ±4
-    2xBPF:    90-105 Hz — 二倍叶片通过频率, 尖峰, 极度稳定; 绝对锚 99.990 Hz ±1.5
+  保留节点 (B4 拆节点: 42-55 Hz 原为单一 BLADE_PASS 节点, 同时装着两种机制,
+            一个标量 σ_i 无法既挤窄线又留宽峰 → 拆成两个同质节点):
+    LOW_FREQ:  2-18 Hz   — 流动不稳定性 (涡带/压力脉动); 无绝对锚
+    BPF_DRIFT: 42-48 Hz  — 工况漂移宽峰; 无绝对锚 (频率由流动不稳定性决定)
+    BPF_LINE:  48-53 Hz  — 转速锁定线 1×Z_r·f_rot; 绝对锚 49.995 Hz ±1.5
+    2xBPF:     90-105 Hz — 二倍叶片通过频率, 尖峰, 极度稳定; 绝对锚 99.990 Hz ±1.5
 
-  边: BPF → 2xBPF (r_nom=2.0, INTEGER_HARMONIC) — 唯一的确定性倍频关系
+  边: BPF_LINE → 2xBPF (r_nom=2.0, INTEGER_HARMONIC) — 唯一的确定性倍频关系
+      (只有锁转速的 BPF_LINE 才是 2xBPF 的基频; BPF_DRIFT 不参与倍频约束)
+
+IF 聚合 (A2 可微 node_if):
+  if_hz 的观测值由"带内无权重中位数"改为"带内能量加权均值"——
+  中位数与能量无关, 在宽带 (如 LOW_FREQ 16 Hz) 上会被大量噪声 bin 拉向频带
+  几何中心 (实测偏高 6-12 Hz), 是 r_obs = 2.13 ≠ 2.00 的直接来源。
 
 用法:
   extractor = MSSTNodeExtractor(fs=1000, freq_regions=PUMP_TURBINE_REGIONS)
   nodes = extractor(signal)  # signal: [T] numpy array
-  # nodes.if_hz: [3, T] 每节点每帧 IF (Hz)
-  # nodes.energy: [3, T] 每节点每帧能量
-  # nodes.bandwidth: [3, T] 每节点每帧 IF 带宽 (Hz)
-  # nodes.persistence: [3] 每节点持久性
+  # nodes.if_hz: [N_phys, T] 每节点每帧 IF (Hz)
+  # nodes.energy: [N_phys, T] 每节点每帧能量
+  # nodes.bandwidth: [N_phys, T] 每节点每帧 IF 带宽 (Hz)
+  # nodes.persistence: [N_phys] 每节点持久性
   # nodes.tfr_stft: [F, T] 复数 STFT (用于后续挤压)
   # nodes.freqs: [F] 频率轴 (Hz)
 """
@@ -69,7 +77,7 @@ class FreqRegion:
     name: str           # 节点名称 (如 'BPF', '2xBPF')
     f_min: float        # 区域下界 (Hz)
     f_max: float        # 区域上界 (Hz)
-    f_type: str         # 分量类型 (HYDRAULIC, BLADE_PASS, BLADE_HARMONIC)
+    f_type: str         # 分量类型 (HYDRAULIC, BLADE_DRIFT, BLADE_PASS, BLADE_HARMONIC)
     C_prior: float      # 先验可压缩性倾向 (0-1)
     bw_expected: float  # 预期带宽 (Hz) — 用于原型匹配和异常检测
     persist_expected: float  # 预期持续性 (0-1)
@@ -90,15 +98,18 @@ PUMP_TURBINE_REGIONS: List[FreqRegion] = [
     #   w_range: [0.10, 0.45] — 保守, 宽核, 不锐化
     #   无绝对锚: 水力分量频率由流动不稳定性决定, 不锁定转速
     FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.30, 12.0, 0.50, 0.10, 0.45),
-    # BPF: 叶片通过频率, 42-55 Hz
-    #   预期宽频 (~12 Hz), 高持续性 (有水就有)
-    #   工况调制致宽: 水头/负荷/导叶开度变化 → IF 在 42-55 Hz 内漂移
-    #   ⚠ 实测: 带内能量峰在 46.4-48.8 Hz (非 50.00), 且 45.9 Hz 候选分量在
-    #     空转 (45.65% 转速) 仍位于 46.39±0.61 Hz → 该带混入了不锁转速的水力宽峰。
-    #     故锚容差取宽 (±4 Hz), 只惩罚越界漂移, 不与真实工况漂移对抗。
-    #   w_range: [0.55, 0.90] — 信任, 窄核, 锐化
-    FreqRegion('BPF',      42.0, 55.0,  'BLADE_PASS',      0.60, 12.0, 0.85, 0.55, 0.90,
-               f_anchor=F_BPF_ANCHOR, anchor_tol=4.0),
+    # BPF_DRIFT: 工况漂移宽峰, 42-48 Hz (B4 拆节点)
+    #   实测: 带内能量峰在 46.4-48.8 Hz; 45.9 Hz 候选分量在空转 (45.65% 转速)
+    #   仍位于 46.39±0.61 Hz → 频率不锁转速, 由流动不稳定性决定。
+    #   故: 无绝对锚, w_range 下界低 (允许不挤压), 不参与倍频约束。
+    #   w_range: [0.10, 0.50] — 不信任其"线"性, 保留展宽
+    FreqRegion('BPF_DRIFT', 42.0, 48.0,  'BLADE_DRIFT',    0.30,  6.0, 0.60, 0.10, 0.50),
+    # BPF_LINE: 转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48-53 Hz (B4 拆节点)
+    #   该线位置由转速唯一确定 (与 50 Hz 电网频率数值重合, 只能靠空转换速区分)。
+    #   拆开后不再与漂移宽峰共用一个 σ_i, 锚容差因此可以收紧到 ±1.5 Hz。
+    #   w_range: [0.65, 0.95] — 最信任, 极锐
+    FreqRegion('BPF_LINE',  48.0, 53.0,  'BLADE_PASS',     0.80,  1.5, 0.90, 0.65, 0.95,
+               f_anchor=F_BPF_ANCHOR, anchor_tol=1.5),
     # 2xBPF: 二倍叶片通过频率, 90-105 Hz
     #   预期窄带 (2 Hz), 极高持续性
     #   实测: 带内能量峰 = 100.00 Hz (全部带负荷工况), 逐样本 f=100.10 Hz 标准差 0.000,
@@ -112,6 +123,69 @@ PUMP_TURBINE_REGIONS: List[FreqRegion] = [
 # 节点数量
 N_PHYSICS_NODES = len(PUMP_TURBINE_REGIONS)
 
+# "软"分量类型: 频率由流动不稳定性决定, 不该被鼓励集中/锐化.
+# RE_2D 熵对这类频段不惩罚 (保留展宽); 硬挤压类 (BLADE_PASS/BLADE_HARMONIC) 才罚.
+SOFT_F_TYPES = ('HYDRAULIC', 'BLADE_DRIFT')
+
+
+# ═══════════════════════════════════════════════════════════════
+# 可微节点频率 (A2) — 作用在**增强 TFR** 上, 与观测 IF 分工不同
+# ═══════════════════════════════════════════════════════════════
+#
+# 两类节点频率必须分开:
+#   IF_obs  — 由 MSST omega_final 聚合得到, 只依赖输入信号, 对网络参数不可微。
+#             用于边特征 / 边门控 / bin→节点分配 (路由)。
+#   IF_hat  — 由**增强 TFR** 的带内能量质心得到, 经 w_i -> σ_i -> 重排, 对参数可微。
+#             用于谐波比值约束 / 绝对频率锚 (约束)。
+#
+# 为什么不能让约束用 IF_obs: 它的梯度恒为零 —— 模型可以在完全不满足
+# "f(2xBPF) = 2·f(BPF)" 的条件下把 L_physics 降到最低, 约束等于没接上。
+def band_centroid_if(tfr: torch.Tensor,
+                     freqs: torch.Tensor,
+                     regions: Optional[List[FreqRegion]] = None,
+                     eps: float = 1e-12) -> torch.Tensor:
+    """
+    逐节点逐帧的带内能量质心频率 [B, N_phys, T] (对 tfr 可微).
+
+      E(f, t) = |tfr(f, t)|²
+      f_cent  = Σ_{f∈band} E·f / Σ_{f∈band} E
+
+    与 IF_obs 的区别: 这是"能量所在处", 不是"频带几何中心"——
+    即使带宽 16 Hz, 只要能量集中在 2-3 Hz, 质心就落在 2-3 Hz。
+
+    Args:
+        tfr:     [B, F, T] 复值或幅值 TFR (可微)
+        freqs:   [F] 频率轴 (Hz)
+        regions: FreqRegion 列表 (默认 PUMP_TURBINE_REGIONS)
+
+    Returns:
+        [B, N_phys, T] Hz; 带内无能量时退化为频带中心
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    mag = tfr.abs() if torch.is_complex(tfr) else tfr
+    B, F, T = mag.shape
+    dtype = mag.dtype
+    dev = mag.device
+    out = torch.zeros(B, len(regions), T, device=dev, dtype=dtype)
+
+    for n, r in enumerate(regions):
+        m = (freqs >= r.f_min) & (freqs <= r.f_max)
+        Fn = int(m.sum().item())
+        if Fn == 0:
+            out[:, n, :] = (r.f_min + r.f_max) / 2.0
+            continue
+        e = mag[:, m, :].pow(2)                                  # [B, Fn, T]
+        tot = e.sum(dim=1)                                       # [B, T]
+        f_ax = freqs[m].to(dtype=dtype, device=dev).view(1, -1, 1)
+        cent = (e * f_ax).sum(dim=1) / tot.clamp(min=eps)        # [B, T]
+        # 带内完全无能量 -> 质心无意义, 退化为频带中心
+        cent = torch.where(tot > eps, cent,
+                           torch.full_like(cent, (r.f_min + r.f_max) / 2.0))
+        out[:, n, :] = cent
+
+    return out
+
 
 # ═══════════════════════════════════════════════════════════════
 # NodeFeatures dataclass
@@ -120,7 +194,7 @@ N_PHYSICS_NODES = len(PUMP_TURBINE_REGIONS)
 @dataclass
 class NodeFeatures:
     """从 MSST omega_final 提取的物理节点特征。"""
-    if_hz: np.ndarray       # [N, T] 每节点 IF (Hz), N=3
+    if_hz: np.ndarray       # [N, T] 每节点 IF (Hz), N = N_PHYSICS_NODES
     energy: np.ndarray      # [N, T] 每节点对数能量
     bandwidth: np.ndarray   # [N, T] 每节点 IF 标准差 (Hz)
     persistence: np.ndarray # [N] 每节点时间持续性 (0-1)
@@ -223,7 +297,13 @@ class MSSTNodeExtractor:
                     continue
 
                 if_vals = if_map[region_valid, t]
-                if_hz[n_idx, t] = np.median(if_vals)
+                w_vals = stft_energy[region_valid, t]
+                w_tot = float(w_vals.sum())
+                if w_tot > 0:
+                    # A2/B1: 能量加权均值 (取代无权重中位数)
+                    if_hz[n_idx, t] = float((w_vals * if_vals).sum() / w_tot)
+                else:
+                    if_hz[n_idx, t] = float(np.mean(if_vals))
                 energy[n_idx, t] = np.log1p(stft_energy[region_valid, t].sum())
                 # 带宽: IF 标准差, 钳制到合理范围
                 if len(if_vals) >= 2:
@@ -316,13 +396,15 @@ class MSSTNodeExtractor:
                 F_r, T = region_if.shape
                 counts = region_valid.sum(dim=0)           # [T]
 
-                # ── Median IF (sort over small F_r, vectorized over T) ──
-                region_if_sort = region_if.clone()
-                region_if_sort[~region_valid] = float('inf')
-                region_if_sorted, _ = torch.sort(region_if_sort, dim=0)  # [F_r, T]
-                med_idx = ((counts - 1) // 2).clamp(min=0).long()        # [T]
-                t_arange = torch.arange(T, device=device)
-                if_hz_n = region_if_sorted[med_idx, t_arange]             # [T]
+                # ── Energy-weighted mean IF (A2/B1: 取代无权重中位数) ──
+                # 中位数与能量无关: 宽带里大量噪声 bin 会把 IF 拉向频带几何中心
+                # (实测 LOW_FREQ 偏高 6-12 Hz), 是 r_obs = 2.13 ≠ 2.00 的直接来源。
+                if_sum = (region_if * region_valid.float()).sum(dim=0)   # [T]
+                arith_mean = if_sum / counts.clamp(min=1)                # [T]
+                w_e = region_energy_map * region_valid.float()           # [F_r, T]
+                w_sum = w_e.sum(dim=0)                                   # [T]
+                if_hz_n = (region_if * w_e).sum(dim=0) / w_sum.clamp(min=1e-12)
+                if_hz_n = torch.where(w_sum > 0, if_hz_n, arith_mean)    # 无能量取算术均值
                 if_hz_n[counts == 0] = (region.f_min + region.f_max) / 2.0
                 if_hz_b[n_idx] = if_hz_n
 
@@ -331,9 +413,7 @@ class MSSTNodeExtractor:
                 energy_b[n_idx] = torch.log1p(region_energy)
 
                 # ── Bandwidth / std (vectorized) ──
-                if_sum = (region_if * region_valid.float()).sum(dim=0)  # [T]
-                mu = if_sum / counts.clamp(min=1)                       # [T]
-                sq_dev = (region_if - mu.unsqueeze(0)) ** 2             # [F_r, T]
+                sq_dev = (region_if - arith_mean.unsqueeze(0)) ** 2      # [F_r, T]
                 sq_sum = (sq_dev * region_valid.float()).sum(dim=0)     # [T]
                 bw_n = torch.sqrt(sq_sum / counts.clamp(min=1)).clamp(max=20.0)
                 bw_n[counts < 2] = 1.0

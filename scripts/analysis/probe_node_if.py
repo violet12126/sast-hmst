@@ -1,7 +1,8 @@
 """
 节点 IF 聚合方式 与 "分量存在度" 体检
 ======================================
-对每个工况抽样, 检查 MSSTNodeExtractor 的三个节点:
+对每个工况抽样, 检查 MSSTNodeExtractor 的四个物理节点
+(B4 拆节点后: LOW_FREQ / BPF_DRIFT / BPF_LINE / 2xBPF):
 
   1. IF 估计的三种口径对比
        IF_med      现行做法: 带内 omega_final 的无权重中位数
@@ -39,7 +40,8 @@ except Exception:
 CLASS_NAMES = ['空转', '低负荷', '中负荷', '高负荷', '抽水']
 N_RATED, Z_R = 333.3, 9.0
 F_ROT = N_RATED / 60.0
-ANCHOR = [None, Z_R * F_ROT, 2.0 * Z_R * F_ROT]   # LOW_FREQ 无绝对锚
+# 绝对锚直接取节点定义 (B4 后: BPF_LINE 49.995±1.5, 2xBPF 99.990±1.5; 其余无锚)
+ANCHOR = [r.f_anchor for r in PUMP_TURBINE_REGIONS]
 
 
 def presence(band_spec: np.ndarray, frac: float = 0.1) -> float:

@@ -24,8 +24,11 @@ sys.path.insert(0, str(_PROJ_ROOT))
 
 from sast_model import load_checkpoint          # noqa: E402
 from sast_config import SastConfig              # noqa: E402
+from models.sast_nodes import PUMP_TURBINE_REGIONS   # noqa: E402
 
-NODE_NAMES = ['LOW_FREQ (2-25Hz)', 'BPF (42-55Hz)', '2xBPF (90-105Hz)']
+# 节点名直接由节点定义导出 (B4 拆节点后 4 个: LOW_FREQ/BPF_DRIFT/BPF_LINE/2xBPF)
+NODE_NAMES = [f'{r.name} ({r.f_min:.0f}-{r.f_max:.0f}Hz)'
+              for r in PUMP_TURBINE_REGIONS]
 CLASS_NAMES = ['空转', '低负荷', '中负荷', '高负荷', '抽水']
 
 
@@ -64,15 +67,15 @@ def main():
             xt = torch.from_numpy(X[idx].astype(np.float32)).unsqueeze(0).to(dev)
             with torch.no_grad():
                 res = model(xt, return_all=True, training=False)
-            w_list.append(res['w_i'][0].cpu().numpy())           # [3, T]
-            if_list.append(res['node_if'][0].cpu().numpy())      # [3, T]
+            w_list.append(res['w_i'][0].cpu().numpy())           # [N_phys, T]
+            if_list.append(res['node_if'][0].cpu().numpy())      # [N_phys, T]
             sg_list.append(res['sigma_sq'][0].cpu().numpy())     # [F, T]
 
-        w = np.stack(w_list)        # [n, 3, T]
-        fif = np.stack(if_list)     # [n, 3, T]
+        w = np.stack(w_list)        # [n, N_phys, T]
+        fif = np.stack(if_list)     # [n, N_phys, T]
 
-        w_mean = w.mean(axis=(0, 2))            # [3]
-        if_mean = fif.mean(axis=(0, 2))         # [3]
+        w_mean = w.mean(axis=(0, 2))            # [N_phys]
+        if_mean = fif.mean(axis=(0, 2))         # [N_phys]
         lam = np.round(w_mean * n_sqz_max).astype(int)
 
         print(f'\n{"=" * 74}')
@@ -80,7 +83,7 @@ def main():
               f'w_i spread(max-min)={w_mean.ptp():.3f}')
         print(f'{"node":<22s} {"IF(Hz)":>8s} {"w_i":>7s} {"σ(bin)":>9s} {"λ":>3s}')
         print('-' * 54)
-        for n in range(3):
+        for n in range(len(NODE_NAMES)):
             sigma = cfg.sigma_min + (1 - w_mean[n]) * (cfg.sigma_max - cfg.sigma_min)
             print(f'{NODE_NAMES[n]:<22s} {if_mean[n]:8.1f} {w_mean[n]:7.3f} '
                   f'{sigma:9.2f} {lam[n]:3d}')

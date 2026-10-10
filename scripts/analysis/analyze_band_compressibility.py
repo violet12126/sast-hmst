@@ -47,6 +47,7 @@ sys.path.insert(0, str(_PROJ_ROOT))
 sys.path.insert(0, str(_PROJ_ROOT / 'scripts' / 'plot'))
 
 from tfr_common import apply_plot_style, FMAX_DEFAULT       # noqa: E402
+from models.sast_nodes import PUMP_TURBINE_REGIONS           # noqa: E402
 
 apply_plot_style()
 
@@ -64,11 +65,20 @@ FMAX = FMAX_DEFAULT    # 500 Hz
 
 CLASS_NAMES = ['空转', '低负荷', '中负荷', '高负荷', '抽水']
 
-# 物理分量定义 (频带为"候选区间", 实际中心频率由实测峰值决定)
+# 物理分量定义 — 与节点的频段划分一一对应 (B4 拆节点后 4 个分量),
+# 频带为"候选区间", 实际中心频率由实测峰值决定。
+# 注意: 42-55 Hz 原本是单一 BPF 带, 现按 B4 拆成
+#   BPF_DRIFT (42-48, 工况漂移宽峰) / BPF_LINE (48-53, 转速锁定线) ——
+# 二者机制不同 (是否锁转速), 用一个 B6dB 去判定"该不该硬挤压"会互相污染。
+_COMPONENT_BANDS = [
+    ('低频水力分量 (涡带/压力脉动)', 10.0),
+    ('工况漂移宽峰 (BPF 漂移族)', 6.0),
+    ('叶片通过频率 1×BPF (转速锁定线)', 1.5),
+    ('二倍叶片通过频率 2×BPF', 2.0),
+]
 COMPONENTS = [
-    ('低频水力分量 (涡带/压力脉动)', 2.0, 25.0, 10.0),
-    ('叶片通过频率 BPF', 42.0, 55.0, 8.0),
-    ('二倍叶片通过频率 2×BPF', 90.0, 105.0, 10.0),
+    (name, r.f_min, r.f_max, half)
+    for (name, half), r in zip(_COMPONENT_BANDS, PUMP_TURBINE_REGIONS)
 ]
 OTHER_LABEL = '其他/高频'
 # 高频宽带区 (无显著峰, 用于"宽带噪声不可挤压"的对照)
@@ -290,8 +300,8 @@ def sast_sigma_by_class(checkpoint, device, X, y, per_class, data_path):
                 res = model(xt, return_all=True, training=False)
             w_list.append(res['w_i'][0].cpu().numpy())
             if_list.append(res['node_if'][0].cpu().numpy())
-        w_mean = np.stack(w_list).mean(axis=(0, 2))     # [3]
-        if_mean = np.stack(if_list).mean(axis=(0, 2))   # [3]
+        w_mean = np.stack(w_list).mean(axis=(0, 2))     # [N_phys]
+        if_mean = np.stack(if_list).mean(axis=(0, 2))   # [N_phys]
         sigma_bin = cfg.sigma_min + (1 - w_mean) * (cfg.sigma_max - cfg.sigma_min)
         out[c] = dict(
             if_hz=if_mean,
@@ -391,8 +401,8 @@ def main():
 
         # ── 与 SAST 对照 ──
         if sast is not None and c in sast:
-            node_names = ['LOW_FREQ', 'BPF', '2xBPF']
-            for n in range(3):
+            node_names = [r.name for r in PUMP_TURBINE_REGIONS]
+            for n in range(len(node_names)):
                 comp = COMPONENTS[n][0]
                 hit = [r for r in peak_rows
                        if r[0] == c and r[2] == comp]
@@ -433,7 +443,8 @@ def main():
     for ax, c in zip(axes[0], classes):
         f, pxx, p_db = curves[c]
         ax.plot(f, p_db, lw=0.9, color='#4C72B0')
-        for lo, hi, lbl in [(2, 25, 'LOW_FREQ'), (42, 55, 'BPF'), (90, 105, '2×BPF')]:
+        for r in PUMP_TURBINE_REGIONS:
+            lo, hi, lbl = r.f_min, r.f_max, r.name
             ax.axvspan(lo, hi, color='#C44E52', alpha=0.10)
             ax.axvline(lo, color='#C44E52', lw=0.5, ls='--', alpha=0.6)
             ax.axvline(hi, color='#C44E52', lw=0.5, ls='--', alpha=0.6)
@@ -458,7 +469,7 @@ def main():
     fig.savefig(outdir / 'welch_psd_by_class.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
-    # ── 相关性小结: 三个候选判据分别与 SAST σ 比 ──
+    # ── 相关性小结: 各候选判据分别与 SAST σ 比 ──
     def _col(i):
         return np.array([r[i] for r in comp_rows], dtype=float)
 

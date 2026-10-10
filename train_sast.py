@@ -96,7 +96,11 @@ Examples:
     p.add_argument('--lambda_range', type=float, default=0.3,
                    help='w_i per-node 逐帧范围约束 loss 权重')
     p.add_argument('--lambda_anchor', type=float, default=0.2,
-                   help='绝对频率锚 loss 权重 (BPF 49.995±4Hz, 2xBPF 99.990±1.5Hz)')
+                   help='绝对频率锚 loss 权重 (BPF_LINE 49.995±1.5Hz, 2xBPF 99.990±1.5Hz)')
+    p.add_argument('--lambda_ratio', type=float, default=0.2,
+                   help='谐波比值一致性 loss 权重 (作用在可微 if_hat 上, 0=禁用)')
+    p.add_argument('--ratio_tol', type=float, default=0.06,
+                   help='比值允许的相对偏差 (flat-bottom 半宽, 默认 6%%)')
     p.add_argument('--presence_frac', type=float, default=0.1,
                    help='分量存在度估计: 计入"峰"的带内 bin 比例')
     p.add_argument('--w_low_min', type=float, default=0.05,
@@ -134,6 +138,8 @@ Examples:
         lambda_lowfreq=args.lambda_lowfreq,
         lambda_range=args.lambda_range,
         lambda_anchor=args.lambda_anchor,
+        lambda_ratio=args.lambda_ratio,
+        ratio_tol=args.ratio_tol,
         presence_frac=args.presence_frac,
         w_low_min=args.w_low_min,
         data_path=args.data, val_split=args.val_split,
@@ -238,10 +244,13 @@ def main():
     print(f"  λ_sc={config.lambda_supcon}  λ_e={config.lambda_entropy}")
     print(f"  λ_p={config.lambda_physics}  λ_b={config.lambda_balance}")
     print(f"  λ_var={config.lambda_var}  λ_c={config.lambda_consistency}  λ_lf={config.lambda_lowfreq}  λ_r={config.lambda_range}")
-    print(f"  λ_anchor={config.lambda_anchor}  presence_frac={config.presence_frac}  w_low_min={config.w_low_min}")
+    print(f"  λ_anchor={config.lambda_anchor}  λ_ratio={config.lambda_ratio}  "
+          f"ratio_tol={config.ratio_tol}")
+    print(f"  presence_frac={config.presence_frac}  w_low_min={config.w_low_min}")
+    print(f"  节点 ({len(PUMP_TURBINE_REGIONS)} 物理节点, B4 拆节点):")
     for r in PUMP_TURBINE_REGIONS:
         anch = '—' if r.f_anchor is None else f'{r.f_anchor:.3f}±{r.anchor_tol}Hz'
-        print(f"    {r.name:<9s} [{r.f_min:.0f},{r.f_max:.0f}] Hz  "
+        print(f"    {r.name:<10s} [{r.f_min:.0f},{r.f_max:.0f}] Hz  {r.f_type:<15s} "
               f"w∈[{r.w_range_low},{r.w_range_high}]  锚 {anch}")
     if has_val:
         print(f"  Val split: {config.val_split:.0%} (KNN accuracy via z_freq centroids)")
@@ -293,6 +302,8 @@ def main():
                 lambda_lowfreq=config.lambda_lowfreq,
                 lambda_range=config.lambda_range,
                 lambda_anchor=config.lambda_anchor,
+                lambda_ratio=config.lambda_ratio,
+                ratio_tol=config.ratio_tol,
                 presence_frac=config.presence_frac,
                 w_low_min=config.w_low_min,
             )
@@ -371,6 +382,8 @@ def main():
                     lambda_lowfreq=config.lambda_lowfreq,
                     lambda_range=config.lambda_range,
                     lambda_anchor=config.lambda_anchor,
+                    lambda_ratio=config.lambda_ratio,
+                    ratio_tol=config.ratio_tol,
                     presence_frac=config.presence_frac,
                     w_low_min=config.w_low_min,
                 )

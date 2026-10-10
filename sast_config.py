@@ -48,7 +48,9 @@ class SastConfig:
     lambda_consistency: float = 0.3
     lambda_lowfreq: float = 0.05
     lambda_range: float = 0.3
-    lambda_anchor: float = 0.2      # 绝对频率锚 (BPF 49.995±4, 2xBPF 99.990±1.5)
+    lambda_anchor: float = 0.2      # 绝对频率锚 (BPF_LINE 49.995±1.5, 2xBPF 99.990±1.5)
+    lambda_ratio: float = 0.2       # 谐波比值一致性 (作用在可微 if_hat 上, A2)
+    ratio_tol: float = 0.06         # 比值允许的相对偏差 (flat-bottom 半宽)
     presence_frac: float = 0.1      # 分量存在度: 计入"峰"的带内 bin 比例
     w_low_min: float = 0.05         # 分量缺席时 w_range/balance 下界松弛到该值
 

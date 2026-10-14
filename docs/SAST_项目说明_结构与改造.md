@@ -862,9 +862,9 @@ KNN 验证精度会下降——而 KNN 测的是**分类能力**，不是时频�
 | # | 问题 | 处理 |
 |---|---|---|
 | 1 | 推理 `n_sqz_per_bin` 下界卡 1，永远不可能 0 轮，与 §18.0 矛盾 | 已由软门控取代 |
-| 2 | 导出侧重算 `sigma_i` 漏了 `sigma_soft_cap=3.0`（顶到 15），训练侧封顶 3 | **未修**，见 §16.7 |
+| 2 | 导出侧重算 `sigma_i` 漏了 `sigma_soft_cap=3.0`（顶到 15），训练侧封顶 3 | **已修**（§16.9）：把 `sigma_max` 由 15.0 改为 3.0，导出侧 `delta = sigma_max − sigma_min = 2.5` 与训练侧 `min(sigma_max, soft_cap) − sigma_min = 2.5` 自动一致 |
 | 3 | `return_all` 是空操作（从不被读到） | 已在 docstring 标注为已废弃 |
-| 4 | `lambda_balance` 配置 0.5 vs 函数签名默认 0.01，两处真值源 | **未修**，见 §16.7 |
+| 4 | `lambda_balance` 配置 0.5 vs 函数签名默认 0.01，两处真值源 | **已修**（§16.9）：签名默认改为 0.5 |
 | 5 | 「阶 / order」陈旧命名 + 描述不存在的 `PerBinOrderSelector` | 已修 `models/sast.py` 类 docstring、`papers/SAST_完整设计文档.md` §18.0/18.1、`papers/SAST_讲解文档.md` §5.1 |
 
 ### 16.7 待同步（本轮**未做**，明确登记）
@@ -873,13 +873,14 @@ KNN 验证精度会下降——而 KNN 测的是**分类能力**，不是时频�
   `export_sast_onnx.py` 与 `quantize_sast_modelopt.py` 的 `OUTPUT_NAMES`
   （`n_sqz_per_bin` 已被 `w_bin` 取代）、`sast_jetson_infer.py` 的 `_reassign_cuda`
   逐轮循环。**训练侧已改而导出侧未改，两边现在不一致**，导出模型不会复现训练行为。
-- **`ReassignerFunction` 对 `tfr_weighted` 的 VJP**（scatter 的伴随即 gather：
-  `grad_src[f] = Σ_k w_k·grad_out[ω̂[f]+k]`，与现有 k 循环同构）。补上后源门控语义即可
-  精确可微，无需新增门控代数；代价是改 `reassigner.cu` / `reassigner_opt.cu` / Python
-  fallback 三处并重编译。Python fallback 里已有 `grad_at = grad_out.gather(1, target)`，
-  增量很小。
+- ~~**`ReassignerFunction` 对 `tfr_weighted` 的 VJP**~~ → **已降级为「不建议做」**。
+  原理：补上 VJP 可把「输出混合」还原为「源门控」语义（二者实测差 σ=0.5 时 5.4% /
+  σ=1.0 时 14.2% / σ=2.0 时 17.5%），代价是改三个 CUDA kernel 并重编译。但 §16.4.1
+  已证明**门控路径梯度对最终收敛无实质影响**（`--gate_detach` 与 base 几乎逐位相同），
+  即 σ 才是承重机制。既然改造不带来可测收益，就不值得动 kernel。
+  **保留条件**：若将来让门控路径变成承重的（例如给它独立的监督），这个 VJP 才重新有意义。
 - **导出侧 σ soft-cap 不一致**（§16.6 #2）与 **`lambda_balance` 双真值源**（#4）。
-- **transpose 提升**（已实测但未做）：`use_opt` 路径每次调用做 5 次
+- **transpose 提升**（已实测但未做，优先级低）：`use_opt` 路径每次调用做 5 次
   `transpose(1,2).contiguous()`，其中 `omega_hat_int` 是 int64/153 MB。把 `sigma` /
   `omega_hat_int` 常驻 `[B,T,F]`、整条链只在进出各转一次，M=3 从 192 ms 降到 155 ms
   （−19% 重排时间，−12% 峰值显存），折合步时约 −3.6%。未做是因为需要引入第二份
@@ -936,3 +937,96 @@ bin）；不做无证据的断言。
 **（5）一个反直觉但重要的旁证**：`sigma_detach` 的 Val acc 最高（0.985）却在 hard 带
 时频质量最差（Rényi 8.200）。这正是把 KNN 精度当作主指标的隐患 —— 它测的是工况
 可分辨性，与时频集中度**可以背离**。这也是本轮补 `evaluate_tf_quality` 的直接理由。
+
+### 16.4.2 ridge_factor 的机制：已量化验证，且是 BPF_LINE 专属效应
+
+§16.4.1 的 (4) 只报了「`--train_ridge 0` 更好」这个现象，未解释机制。现已量化验证。
+
+**机制**：在输出混合递推 `S ← (1-part)·S + part·Reassign(S)`（`part = g_m·ridge`）下，
+一个源 bin 每轮保留 `(1-part)` 倍自身能量在**原位**。M 轮后的残余比例是
+
+```
+∏_m (1 − g_m(f)·ridge(f))
+```
+
+`ridge` 是**源 bin 到脊线的距离**的钟形衰减（floor 0.15）。而 MSST 的作用恰恰是把
+**远离脊线的侧翼 bin** 的 ω̂ 指向脊线中心——也就是说，最该被搬走的 bin，正是
+`ridge` 压得最低的那些。于是侧翼能量被 `(1-part)` 反复留在原地，谱线两侧的
+STFT 泄漏裙边搬不干净。
+
+**实测（逐 bin 的 `∏(1-part)`，真数据）：**
+
+| 节点 | 带宽内 bin 数 | ridge 均值 | ridge 最小 | 残留均值 | **残留 >0.1 的 bin 占比** |
+|---|---|---|---|---|---|
+| **BPF_LINE** | 9 | **0.774** | **0.150**（floor） | **0.165** | **50.9%** |
+| 2xBPF | 30 | 0.965 | 0.856 | 0.027 | 2.3% |
+| BPF_DRIFT | 14 | 0.927 | 0.216 | 0.045 | 13.7% |
+| LOW_FREQ | 32 | 0.958 | 0.590 | 0.027 | 3.9% |
+
+**开/关 ridge 的直接对照（同一前向、同一输入）：**
+
+| 节点 | 带内 std（ridge 开） | 带内 std（ridge 关） | 比值 |
+|---|---|---|---|
+| **BPF_LINE** | 1.0310 Hz | **0.6342 Hz** | **0.615** |
+| 2xBPF | 1.4405 Hz | 1.3559 Hz | 0.941 |
+
+**三点结论：**
+
+1. **机制成立且可精确预测**。按 `(1−0.15)³ = 0.614` 估算的残留比例，与 BPF_LINE 实测的
+   std 比值 **0.615** 吻合到 0.2%。这不是相关性，是可以算出来的。
+2. **但它是 BPF_LINE 专属效应，不是两个硬带共有**。2xBPF 只变化 6%，因为它的
+   `bw_expected = 4.5` 使 `ridge_dist = |Δf|/9` 增长很慢，带内 `ridge` 始终 ≥ 0.856，
+   残留仅 2.7%。**「BPF_LINE 和 2xBPF 都受影响」的说法与数据不符。**
+3. **⚠ 这个效应是被本轮的 `bw_expected` 标定放大的**。§15.4 把 BPF_LINE 的
+   `bw_expected` 从 1.5 收到 1.0，使 `ridge_dist = |Δf|/2` 更陡。在 `|Δf| = 3 Hz` 处：
+   - 旧值 1.5 → `ridge = exp(−1/8) = 0.882` → 3 轮残留 `(0.118)³ = 0.0016`
+   - 新值 1.0 → `ridge = exp(−9/32) = 0.755` → 3 轮残留 `(0.245)³ = 0.0147`
+
+   即**放大约 9 倍**。换言之该缺陷一直潜伏，是本轮的标定把它激活的。教训：对一个
+   与架构不匹配的机制做参数标定，可能把潜在缺陷变成显性缺陷。
+
+**架构层面的判断**：`ridge_factor` 源自 §18.2，那里的设想是「远离脊线的 bin 应跳过
+挤压」。这个设想在**源门控**语义下是自洽的（不参与 = 源能量不动，那本来也是错的，
+但至少不是被反复钉死）。但在**输出混合**语义下，`part < 1` 的含义变成「每轮把
+`(1-part)` 的原始能量留在原地」，于是一个「跳过」的意图变成了一个**洗不掉的残留
+基底**。二者不匹配，这才是根因 —— 所以正确的处置不是调 `ridge` 的参数，而是
+**关掉它**（`part = g_m`）。
+
+**残余不确定性**：以上全部基于 2 epoch / 765 样本的短跑与单样本前向。20 epoch 全量
+对照正在进行（见 §16.4.1 的 (4)），结论以那次为准。
+
+### 16.9 收口：三项小修与本轮的最终待办
+
+**已修（本轮追加）**
+
+| 项 | 改动 | 依据 |
+|---|---|---|
+| `sigma_max` 15.0 → **3.0** | `sast_config.py` / `SAST.__init__` / `SparseGaussianReassigner.__init__` / CLI 默认 | 实际 `sigma_i = 0.5 + (1−w_i)·2.5 ∈ [0.5, 3.0]`，15.0 从未被达到，却把重排半径算成 `K = ceil(3.0×15.0) = 45`。改成 3.0 后 `K = 9`。**附带自愈**了导出侧 σ soft-cap 不一致（§16.6 #2）：导出用 `delta = sigma_max − sigma_min = 2.5`，与训练侧 `min(sigma_max, soft_cap) − sigma_min = 2.5` 相同。 |
+| `lambda_balance` 签名默认 0.01 → **0.5** | `models/sast_losses.py` | 消除与 `sast_config.py` 的双真值源（§16.6 #4） |
+| VJP 改造 | **降级为「不建议做」** | §16.4.1 证明门控路径梯度对收敛无实质影响，改造无收益（§16.7） |
+
+**`K` 45 → 9 的实际收益（需按 kernel 分别说，不能一概而论 5×）**
+
+| 路径 | 循环范围 | 收益 |
+|---|---|---|
+| `reassigner.cu`（base）与 Python fallback | 满 ±K，无动态截断 | **≈5×** |
+| `reassigner_opt.cu`（训练实际使用） | `K_eff = min(ceil(6σ), K)` | **仅 σ > 1.5 时被截断**（12/15/18 → 9），最大 2×；σ ≤ 1.5 不变 |
+
+⚠ 而 `σ > 1.5` 只出现在 **LOW_FREQ（σ≈2.8）与 BPF_DRIFT（σ≈1.8）** 两个**软带**；
+hard 带（BPF_LINE / 2xBPF）训练后 `w_i ≈ 1.0` → `σ = 0.50` → `K_eff = 3`，远低于 9，
+**完全不受影响**。截断代价是 σ=3 时核被截到 ±3σ，丢失 **0.27%** 高斯质量（归一化
+后能量仍守恒），落在本就该宽的软带上，可接受。
+
+**待办（按优先级）**
+
+1. **20 epoch 全量 `train_ridge` 对照**（进行中）。若 `--train_ridge 0` 的优势保持，
+   则把默认值改为 `False`，并考虑直接删除 `SqueezeIterationController` 的
+   `ridge_factor` 计算（省掉 `[B, N_phys, F, T]` 距离矩阵的显存与算力）。
+   依据见 §16.4.2：ridge 与输出混合架构根本不匹配，不是参数没调好。
+2. **`deploy/` 全链路同步**（等主干超参锁定后一次性做）：`sast_export_model.py`
+   的 `_multi_round_reassign_export`、`export_sast_onnx.py` 与 `quantize_sast_modelopt.py`
+   的 `OUTPUT_NAMES`（`n_sqz_per_bin` → `w_bin`）、`sast_jetson_infer.py` 的
+   `_reassign_cuda`；并装 `onnxscript` 完成导出验证。**注意训练侧已改而导出侧未改，
+   两边现在不一致。**
+3. **transpose 提升**（低优先级，已实测：M=3 从 192 ms → 155 ms，−12% 峰值显存）。
+   未做是因为要引入第二份重排实现。

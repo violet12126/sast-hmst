@@ -23,7 +23,15 @@ class SastConfig:
     n_heads: int = 4
     n_layers: int = 2
     sigma_min: float = 0.5
-    sigma_max: float = 15.0
+    # sigma_max = 3.0 (= sigma_soft_cap). 实际 sigma_i = 0.5 + (1-w_i)*2.5 ∈ [0.5,3.0],
+    # 故 15.0 从未被达到; 而 K = ceil(kernel_radius(3.0)*sigma_max) 被算成 45,
+    # 白跑 5 倍循环 (base kernel 与 Python fallback 用满 ±K; opt kernel 的
+    # K_eff=min(ceil(6σ),K) 只在 σ>1.5 时被新 K=9 截断)。
+    # 附带修掉 deploy 侧 sigma soft-cap 不一致: 导出用 delta = sigma_max - sigma_min,
+    # sigma_max=3.0 时 = 2.5, 与训练侧 min(sigma_max, soft_cap)-sigma_min 相同。
+    # 代价: σ=3 时核被截到 ±3σ, 丢 0.27% 高斯质量 (重归一化); 只影响 LOW_FREQ /
+    # BPF_DRIFT 两个**软带** (hard 带 σ=0.5 -> K_eff=3, 远低于 9), 硬带不受影响。
+    sigma_max: float = 3.0
     msst_num: int = 4
     d_cond: int = 32
     f_type_embed_dim: int = 16

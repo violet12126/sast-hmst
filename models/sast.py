@@ -805,7 +805,7 @@ class SparseGaussianReassigner(nn.Module):
         kernel_radius: 核半径倍数 (default 3.0 -> 3*sigma)
     """
 
-    def __init__(self, sigma_min: float = 0.5, sigma_max: float = 15.0,
+    def __init__(self, sigma_min: float = 0.5, sigma_max: float = 3.0,
                  n_sigma_levels: int = 20, kernel_radius: float = 3.0,
                  N_max: int = 4):
         super().__init__()
@@ -926,7 +926,7 @@ class SAST(nn.Module):
         n_heads:          注意力头数
         n_layers:         GAT 层数
         sigma_min:        最小核宽 (bin)
-        sigma_max:        最大核宽 (bin)
+        sigma_max:        最大核宽 (bin, = sigma_soft_cap)
         N_max:            MSST 最大迭代次数
         msst_num:         MSST 迭代次数 (训练时使用, 应 >= N_max)
         d_cond:           工况上下文维度
@@ -936,7 +936,7 @@ class SAST(nn.Module):
     def __init__(self, fs: int = 1000,
                  freq_regions: Optional[List[FreqRegion]] = None,
                  d_h: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 sigma_min: float = 0.5, sigma_max: float = 15.0,
+                 sigma_min: float = 0.5, sigma_max: float = 3.0,
                  N_max: int = 4, msst_num: int = 4,
                  msst_hlength: Optional[int] = None,
                  d_cond: int = 32,

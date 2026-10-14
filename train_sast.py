@@ -67,7 +67,9 @@ Examples:
     p.add_argument('--n_heads', type=int, default=4)
     p.add_argument('--n_layers', type=int, default=2)
     p.add_argument('--sigma_min', type=float, default=0.5)
-    p.add_argument('--sigma_max', type=float, default=15.0)
+    p.add_argument('--sigma_max', type=float, default=3.0,
+                   help='最大核宽 (bin)。= sigma_soft_cap; 也决定重排半径 '
+                        'K=ceil(3*sigma_max)。15.0 是历史遗留, 实际 σ 上限只有 3.0')
     p.add_argument('--msst_num', type=int, default=4,
                    help='MSST 迭代次数 (=N_max=4)')
     p.add_argument('--d_cond', type=int, default=32)

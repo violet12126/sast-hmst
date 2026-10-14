@@ -669,7 +669,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      lambda_supcon: float = 1.0,
                      lambda_entropy: float = 0.1,
                      lambda_physics: float = 0.5,
-                     lambda_balance: float = 0.01,
+                     lambda_balance: float = 0.5,   # 与 sast_config 对齐 (原为 0.01, 双真值源)
                      lambda_var: float = 0.5,
                      lambda_consistency: float = 0.3,
                      lambda_lowfreq: float = 0.05,

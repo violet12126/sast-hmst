@@ -4,28 +4,35 @@ SAST: Structure-Aware Synchrosqueezing Transform (v3)
 异构物理图 + 静态原型软匹配 + 自适应阶数 SST + 稀疏高斯重排.
 
 核心架构:
-  Signal -> MSST (N_max, save_trajectory) -> Node Features + omegas
+  Signal -> MSST (num, save_trajectory) -> Node Features + omegas [B,num,F,T]
   -> StaticPrototypeMatcher (soft matching) -> OperatingToken
-  -> PPM (ratio-gated + type-embed) -> GAT (6 edges) -> w_i
-  -> PerBinOrderSelector (w_i + convergence + structure) -> N*(eta,b)
-  -> SparseGaussianReassigner (banded sparse A_n) -> TFR_sast
+  -> PPM (ratio-gated + type-embed) -> GAT (11 edges) -> w_i
+  -> SparseGaussianReassigner(sigma_i, 软门控 g_m) -> TFR_sast
+     ↑ 无 per-bin IF 层选择器 (历史上写作 PerBinOrderSelector, 从未实现;
+       实测最优 IF 层恒为 omegas[-1], 详见 papers/SAST_讲解文档.md §5.1)
 
-物理图 (异构, 4 节点 / 6 边):
-  OP (virtual) --CONDITION--> LOW_FREQ, BPF, 2xBPF
-  LOW_FREQ <--DRIFT--> BPF
-  BPF --HARMONIC(r=2.0)--> 2xBPF
+物理图 (异构, 5 图节点 = 4 物理 + 1 OP / 11 边):
+  OP (virtual) --CONDITION--> LOW_FREQ, BPF_DRIFT, BPF_LINE, 2xBPF
+  LOW_FREQ <--DRIFT--> BPF_DRIFT
+  BPF_LINE --HARMONIC(r=2.0)--> 2xBPF
 
-GAT 输出 w_i -> 四参数策略:
-  w_i   : IF 可信度 (GAT 直接输出)
-  sigma_i: 核宽 = sigma_min + (1-w_i)*Delta_sigma (连续, 可微)
-  lambda_i: 迭代深度 = round(w_i * N_max) (离散, 推理用)
-  IF 阶数: omegas 索引 = round(w_i * (N_max-1)) (离散, 推理用)
+GAT 输出 w_i -> 两参数策略 (自适应次数改造后的现状):
+  w_i     : IF 可信度 (GAT 直接输出)
+  sigma_i : 核宽 = sigma_min + (1-w_i)*Delta_sigma   (连续, 可微) —— 控「挤多宽」
+  g_m     : 轮数软门控 = clamp(w_i*M-(m-1), 0, 1)   (连续, 可微) —— 控「挤几轮」
+
+  ⚠ 旧稿在此列的「lambda_i (离散, 推理用)」与「IF 阶数 (离散, 推理用)」均已删除:
+    - lambda_i 的整数路径训练时不启用、round() 不可微、且被 clamp(1,..) 卡在 ≥1
+      (推理永远到不了 0 轮), 已由上面的连续门控取代;
+    - 「IF 阶数」从未实现。omegas[k] 是固定点 lookup 迭代层而非相位导数阶,
+      且实测最优层恒为 omegas[-1] (即已在用的那层), 详见图结构文档与
+      papers/SAST_讲解文档.md §5.1。
 
 模块分工:
   models/tfr.py        - MSST (omega estimation + trajectory)
   models/sast_nodes.py - MSSTNodeExtractor (per-region aggregation)
   models/sast_graph.py - Heterogeneous physics graph topology + edge features
-  models/sast.py       - StaticPrototypeMatcher + PPM + GAT + PerBinOrderSelector
+  models/sast.py       - StaticPrototypeMatcher + PPM + GAT + SparseGaussianReassigner
                          + SparseGaussianReassigner + SAST (this file)
 """
 
@@ -589,51 +596,50 @@ class EdgeConditionedGAT(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. SqueezeIterationController (formerly PerBinOrderSelector)
+# 4. RidgeParticipationController (formerly SqueezeIterationController,
+#    originally PerBinOrderSelector)
 # ═══════════════════════════════════════════════════════════════
 
 class SqueezeIterationController(nn.Module):
     """
-    挤压迭代次数控制.
+    bin 级挤压参与因子 (ridge_factor) 计算.
 
-    关键洞察: MSST 的 lookup 迭代对所有 bin 无害 (总是朝能量集中方向走),
-    因此所有 bin 统一用 omega_5 (最优 IF)。GAT 控制的是挤压轮数:
-      - 2xBPF: lambda≈4 (w_i≈1.0, 多轮锐化)
-      - BPF:    lambda≈4 (w_i≈1.0, 多轮锐化)
-      - LOW_FREQ: lambda≥min_sqz (宽核 soft nudge, 不锐化但防全保留)
-
-    min_sqz=1: 所有 bin 至少挤一轮, LOW_FREQ 用宽 sigma 温柔拨动, 不伤低频.
+    ⚠ 语义收窄 (自适应次数改造):
+      本类原来还输出节点级**整数**轮数 lambda_i = round(w_i·N_max), 供推理时
+      构造 n_sqz_per_bin 硬掩码。那条路径的问题是:
+        1. 训练时根本不调用本类 (训练只跑 1 轮), 训推不一致;
+        2. round() 不可微, w_i 拿不到来自「轮数」的梯度;
+        3. n_sqz_per_bin 结果被 clamp(1, ...) 卡在 ≥1, 推理**永远不可能 0 轮**,
+           与设计文档 §18.0 写的「λ=0 (LOW_FREQ) 不挤」直接矛盾。
+      现在轮数改由 SparseGaussianReassigner 内的**可微软门控** g_m 承担
+      (见那里的注释), 本类只保留空间参与因子 ridge_factor。
     """
 
     def __init__(self, N_max: int = 5, min_sqz: int = 1):
         super().__init__()
+        # N_max / min_sqz 保留仅为兼容旧 checkpoint 的构造调用, 不再参与计算
         self.N_max = N_max
         self.min_sqz = min_sqz
 
     def forward(self, w_i: torch.Tensor,
                 tfr_mag: torch.Tensor, freqs: torch.Tensor,
                 node_if: torch.Tensor, bw_expected: torch.Tensor
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                ) -> torch.Tensor:
         """
         Args:
-            w_i:         [B, N_phys, T]  IF 可信度
-            tfr_mag:     [B, F, T]  STFT 幅值
+            w_i:         [B, N_phys, T]  IF 可信度 (本函数不再使用, 保留签名)
+            tfr_mag:     [B, F, T]  STFT 幅值 (同上)
             freqs:       [F] 频率轴 (Hz)
             node_if:     [B, N_phys, T]  节点 IF (Hz)
             bw_expected: [N_phys] 预期带宽 (Hz)
 
         Returns:
-            lambda_i:     [B, N_phys, T]  节点级挤压轮数 (0..N_max)
-            ridge_factor: [B, F, T]  逐 bin 挤压参与因子 (ridge_floor..1)
+            ridge_factor: [B, F, T]  逐 bin 空间参与因子 (ridge_floor..1)
         """
         B, N_phys, T = w_i.shape
         F = freqs.shape[0]
         device = w_i.device
         eps = 1e-8
-
-        # ── lambda_i: 节点级挤压轮数 ──
-        lambda_i = torch.round(w_i * self.N_max).long()  # [B, N_phys, T]
-        lambda_i = lambda_i.clamp(self.min_sqz, self.N_max)
 
         # ── ridge_factor: bin 级参与因子 ──
         # 基于 bin 频率到节点 IF 的归一化距离 (替代 energy-weighted ridge).
@@ -665,7 +671,7 @@ class SqueezeIterationController(nn.Module):
         # ridge_floor=0.15: 远端谐波也能参与, 至少 ~15% 每轮
         ridge_factor = ridge_factor.clamp(0.15, 1.0)
 
-        return lambda_i, ridge_factor
+        return ridge_factor
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -812,18 +818,47 @@ class SparseGaussianReassigner(nn.Module):
     def forward(self, tfr_mag: torch.Tensor, omegas: torch.Tensor,
                 sigma_sq: torch.Tensor, freqs: torch.Tensor,
                 ridge_factor: Optional[torch.Tensor] = None,
-                n_sqz_per_bin: Optional[torch.Tensor] = None,
-                N_max: int = 4) -> torch.Tensor:
+                w_bin: Optional[torch.Tensor] = None,
+                M: int = 3, gate_mode: str = 'clamp') -> torch.Tensor:
         """
         连续可微软高斯重排 (通过自定义 autograd Function 省显存).
 
         可微性: ReassignerFunction 前向/反向都循环重算, 不保存 91 个 [B,F,T]
         中间. sigma_sq 直接进高斯核权重 -> 梯度回流到 w_i.
 
-        推理时 (n_sqz_per_bin 非 None): 迭代挤压 λ 轮 (设计 §18).
-          LOW_FREQ(λ=0) 不挤=保留原貌; BPF/2xBPF 多轮锐化.
-          每轮仅挤压 src_mask 内的源 bin, 挤出后能量到 omega_final,
-          未挤的留原地. 用固定 omega_final=omegas[:,-1] (收敛的固定点).
+        ── 自适应挤压轮数 (软门控递推, 训练与推理同一代码路径) ──
+        轮数不再由 round(w_i·M) 的**整数掩码**决定 (那条路径训练时不启用、
+        且不可微, 见 SqueezeIterationController 的说明), 而由可微软门控:
+
+            r   = clamp(w_i · M, 0, M)           期望轮数 (连续)
+            g_m = clamp(r - (m-1), 0, 1)         满轮取 1, 末轮取小数, 之后恒 0
+            g_m_bin = gather(g_m, i_star) · ridge_factor
+
+          w_i=0.25, M=3 → r=0.75 → g=(0.75, 0, 0): 不到一整轮, 保留宽峰
+          w_i=0.90, M=3 → r=2.70 → g=(1, 1, 0.70): 近乎完整三轮, 极致锐化
+
+        递推为**输出混合**而非对源谱加权:
+            S ← (1 - g_m_bin)·S + g_m_bin·Reassign(S)
+        理由: ReassignerFunction.backward 对其第一个输入恒返回 None, 源码谱
+        拿不到梯度。若写成 S' = Reassign(S⊙g) + S⊙(1-g), autograd 只能看到
+        ∂S'/∂g = -S, 而真值是 A_θS - S (A_θ 为列随机重排矩阵) —— 误差恰好
+        删掉「能量真聚到目标 bin」那一项, 在重排确实浓缩处会**翻号**。输出
+        混合形式下 ∂S'/∂g = R - S, 两者都是前向张量, 直接偏导精确。
+        ⚠ 这是**语义变更**而非纯梯度修正: R(S⊙g) ≠ g⊙R(S) (源门控 vs 目标
+        门控), 二者在 σ 较大时不等价; 实测差值见 scripts/test 的对照。
+        根治方案是给 ReassignerFunction 补 tfr_weighted 的 VJP (scatter 的
+        伴随 gather), 但需改三个 CUDA kernel, 已登记为后续项。
+
+        Args:
+            tfr_mag:     [B, F, T] STFT 幅值
+            omegas:      [B, N_max, F, T] IF 轨迹 (只用 [:, -1])
+            sigma_sq:    [B, F, T] 逐 bin 核宽 (bin)
+            freqs:       [F] 频率轴 (Hz)
+            ridge_factor:[B, F, T] 逐 bin 空间参与因子 (None = 全 1)
+            w_bin:       [B, F, T] 逐 bin IF 可信度 (w_i 经 i_star 广播);
+                         None 时退化为单轮完整重排 (等价旧训练路径)
+            M:           最大轮数
+            gate_mode:   'clamp' (推荐, 上述) | 'sigmoid'
         """
         B, F, T = tfr_mag.shape
         # IF 目标位置 (常量, 不参与梯度)
@@ -833,25 +868,30 @@ class SparseGaussianReassigner(nn.Module):
         sigma = sigma_sq.clamp(self.sigma_min, self.sigma_max)
         K = int(np.ceil(self.kernel_radius * self.sigma_max))
 
-        if n_sqz_per_bin is not None:
-            # ── 推理: 按 bin 级挤压轮数迭代 ──
-            # 所有 bin 从原始 STFT 能量开始. n_sqz_per_bin 控制挤几轮,
-            # ridge_factor 控制每轮参与程度. 不挤的 bin 留原位.
-            tfr_cur = tfr_mag
-            for r in range(1, N_max + 1):
-                src_mask = (n_sqz_per_bin >= r).to(tfr_cur.dtype)
-                if src_mask.max() == 0:
-                    break
-                # bin 参与度 = mask * ridge_factor (ridge 低 → 部分参与)
-                part = src_mask * (ridge_factor if ridge_factor is not None else 1.0)
-                moved = ReassignerFunction.apply(
-                    tfr_cur * part, sigma, omega_hat_int, K, F)
-                tfr_cur = moved + tfr_cur * (1.0 - part)
-            return tfr_cur
-        else:
-            # ── 训练: 单 pass (可微, λ=1) ──
+        if w_bin is None:
+            # 无门控: 单轮完整重排 (保留给探针/消融使用)
             tfr_weighted = tfr_mag * ridge_factor if ridge_factor is not None else tfr_mag
             return ReassignerFunction.apply(tfr_weighted, sigma, omega_hat_int, K, F)
+
+        # ── 软门控递推 (训练与推理同一路径) ──
+        ridge = ridge_factor if ridge_factor is not None else 1.0
+        tfr_cur = tfr_mag
+        for m in range(1, M + 1):
+            if gate_mode == 'clamp':
+                g_m = (w_bin * M - (m - 1)).clamp(0.0, 1.0)      # [B, F, T]
+            elif gate_mode == 'sigmoid':
+                tau = 4.0
+                g_m = torch.sigmoid(tau * (w_bin * M - m))
+            else:
+                raise ValueError(f'未知 gate_mode: {gate_mode}')
+            part = g_m * ridge
+            # 早停: 该轮没有任何 bin 需要参与就不做这次重排 (与旧实现一致)。
+            # 未训练模型 w_i≈0.5 时最后一轮恒为 0, 直接省掉 1/3 重排开销。
+            if float(part.max()) <= 0.0:
+                break
+            moved = ReassignerFunction.apply(tfr_cur, sigma, omega_hat_int, K, F)
+            tfr_cur = (1.0 - part) * tfr_cur + part * moved
+        return tfr_cur
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -863,15 +903,21 @@ class SAST(nn.Module):
     Structure-Aware Synchrosqueezing Transform (v3).
 
     数据流:
-      Signal -> MSST (N_max=5, save_trajectory) -> NodeFeatures + omegas
+      Signal -> MSST (num, save_trajectory) -> NodeFeatures + omegas [B,num,F,T]
       -> V_obs from node energy -> StaticPrototypeMatcher -> cond_ctx, alpha
-      -> Per-frame: PPM (OP + phys nodes) -> GAT (6 edges) -> w_i
-      -> sigma_i = sigma_min + (1-w_i)*Delta_sigma
-      -> PerBinOrderSelector -> N_star (推理用)
-      -> SparseGaussianReassigner(omegas[N_star], sigma_i) -> TFR_sast
+      -> Per-frame: PPM (OP + phys nodes) -> GAT (11 edges) -> w_i
+      -> sigma_i = sigma_min + (1-w_i)*Delta_sigma      控「挤多宽」
+      -> 软门控 g_m = clamp(w_i*M - (m-1), 0, 1)         控「挤几轮」
+      -> SparseGaussianReassigner(omegas[-1], sigma_i, g_m) -> TFR_sast
 
-    训练时: 统一使用 omegas[-1] (最高阶), 仅 sigma_i 可微
-    推理时: 四参数全启用 (sigma_i + lambda_i + IF order + w_i)
+    ⚠ 命名与历史 (B4 之后的自适应次数改造):
+      - `omegas[k]` **不是** Taylor 相位导数阶, 而是同一个一阶 IF 估计的固定点
+        迭代层: omega_{k+1}[eta,b] = omega_k[omega_k[eta,b], b]。历史上曾称为
+        「阶/order」, 且 docstring 里写过的 `PerBinOrderSelector -> N_star ->
+        omegas[N_star]` **在代码中从未存在**(只活在注释与论文里); 生产路径一直
+        只用 omegas[:, -1]。旧的 SqueezeIterationController 输出整数轮数
+        lambda_i, 只在推理启用, 训练固定 1 轮 —— 现已由可微软门控取代。
+      - 训练与推理现在走**完全同一条**挤压路径 (无 `if not training` 分支)。
 
     Args:
         fs:               采样率 (Hz)
@@ -898,7 +944,11 @@ class SAST(nn.Module):
                  ppn_temperature: float = 0.08,
                  prototype_temperature: float = 0.1,
                  dropout: float = 0.1,
-                 n_sqz_max: int = 4):
+                 n_sqz_max: int = 3,
+                 gate_mode: str = 'clamp',
+                 train_ridge: bool = True,
+                 gate_detach: bool = False,
+                 sigma_detach: bool = False):
         super().__init__()
         self.fs = fs
         self.d_h = d_h
@@ -906,7 +956,21 @@ class SAST(nn.Module):
         self.sigma_max = sigma_max
         self.N_max = N_max
         self.msst_num = max(msst_num, N_max)
-        self.n_sqz_max = n_sqz_max  # 推理多轮挤压最大轮数
+        # M = 软门控最大轮数 (取代旧的整数 n_sqz_per_bin)
+        self.n_sqz_max = n_sqz_max
+        # 'clamp' (推荐) | 'sigmoid'; 见 SparseGaussianReassigner.forward
+        self.gate_mode = gate_mode
+        # 消融开关: False = 训练时不做 ridge 加权 (复现旧的「全 bin 满参与」)
+        self.train_ridge = train_ridge
+        # 是否把全尺寸的挤压诊断张量 ([B,F,T] 级) 放进返回字典。默认关:
+        # 它们在 B=10/T=2000 下各占 76 MB, 训练时白占显存。
+        self.emit_squeeze_diag = False
+        # ── 消融开关 (回答「门控是新的监督信号, 还是 w_range 的重参数化」) ──
+        # gate_detach: 断开门控路径 -> 只剩 sigma 路径 (σ-only)
+        # sigma_detach: 断开 sigma 路径 -> 只剩门控路径 (gate-only)
+        # 两者都开 = 两条路径都断 (预期 w_i 只剩 w_range/balance 先验)
+        self.gate_detach = gate_detach
+        self.sigma_detach = sigma_detach
 
         # ── 频率区域 ──
         self.regions = freq_regions if freq_regions is not None else PUMP_TURBINE_REGIONS
@@ -964,8 +1028,11 @@ class SAST(nn.Module):
         """
         Args:
             x:          [B, T] 或 [T] 原始信号
-            training:   是否训练模式 (True: 固定 N_max 阶; False: 逐 bin 自适应)
-            return_all: 是否返回完整诊断量
+            training:   **已不影响计算路径** (仅为兼容调用方保留)。挤压现在
+                        训练与推理走同一条可微软门控递推; 残差只来自
+                        reassigner 的 atomicAdd 非确定性。详见
+                        SparseGaussianReassigner.forward 的说明。
+            return_all: **已废弃 (no-op)** —— 本方法始终返回完整诊断字典
 
         Returns:
             dict with keys:
@@ -1099,7 +1166,8 @@ class SAST(nn.Module):
         gate_node = gate_node_bt.reshape(B, T_msst, -1).permute(0, 2, 1)  # [B, N_total, T]
 
         # ═══════════════════════════════════════════════════════
-        # Step 6: w_i -> sigma_i, N_star, order_idx
+        # Step 6: w_i -> sigma_i (挤多宽) + 软门控 g_m (挤几轮)
+        #   (旧标题写作 "N_star, order_idx" —— 那两项目前都不存在, 见类 docstring)
         # ═══════════════════════════════════════════════════════
         # sigma_i: per-node -> broadcast to per-bin
         # 原线性映射 sigma = sigma_min + (1-w_i)*(sigma_max-sigma_min) 会让保守节点
@@ -1121,29 +1189,30 @@ class SAST(nn.Module):
         T_idx_f = torch.arange(T_msst, device=device).view(1, 1, T_msst).expand(B, F_bins, -1)
         sigma_sq = sigma_i[B_idx_f, i_star, T_idx_f]  # [B, F_bins, T]
 
-        # ── Squeeze iteration control (推理时) ──
-        lambda_sqz = None
-        n_sqz_per_bin = None
-        if not training:
-            bw_expected = torch.tensor([r.bw_expected for r in self.regions],
-                                      device=device, dtype=torch.float32)
-            lambda_sqz, ridge_factor = self.sqz_controller(
-                w_i, tfr_mag, freqs, node_if, bw_expected)
-            # 推理: per-bin 挤压轮数 = round(λ_per_node * ridge_factor)
-            # λ=0 (LOW_FREQ) -> 0 轮不挤; λ=1 (BPF) -> 最多 n_sqz_max 轮
-            lambda_per_bin = lambda_sqz[B_idx_f, i_star, T_idx_f]
-            n_sqz_per_bin = (lambda_per_bin * ridge_factor).round().clamp(1, self.n_sqz_max).long()
-        else:
-            ridge_factor = None  # 训练时所有 bin 全参与
+        # ── 挤压参与因子与门控 (训练与推理**同一路径**) ──
+        # 旧实现: 推理才算 ridge_factor / n_sqz_per_bin, 训练走单轮全参与分支
+        # —— 训推不一致, 且「挤压轮数」在训练中从未获得梯度。现统一。
+        bw_expected = torch.tensor([r.bw_expected for r in self.regions],
+                                   device=device, dtype=torch.float32)
+        ridge_factor = self.sqz_controller(
+            w_i, tfr_mag, freqs, node_if, bw_expected)      # [B, F, T]
+        if not self.train_ridge:
+            ridge_factor = None      # 消融: 回到旧训练行为 (全 bin 满参与)
+        # w_i [B, N_phys, T] 经最近节点分配到 [B, F, T], 供软门控使用
+        w_bin = w_i[B_idx_f, i_star, T_idx_f]                # [B, F, T]
+        if self.gate_detach:          # 消融: 只剩 sigma 路径
+            w_bin = w_bin.detach()
+        if self.sigma_detach:         # 消融: 只剩门控路径
+            sigma_sq = sigma_sq.detach()
 
         # ═══════════════════════════════════════════════════════
         # Step 7: Sparse Gaussian Reassignment
-        # 所有 bin 统一使用 omega_5 (最优 IF), sigma + ridge_factor 控制挤压
-        # 推理: n_sqz_per_bin 控制每 bin 被挤轮数, λ=0 不挤保留原貌
+        # 所有 bin 统一使用 omega_5 (最优 IF); sigma 控「挤多宽」,
+        # 可微软门控 g_m 控「挤几轮」(取代旧的整数 n_sqz_per_bin)
         # ═══════════════════════════════════════════════════════
         tfr_enhanced = self.reassigner(
             tfr_mag, omegas, sigma_sq, freqs, ridge_factor,
-            n_sqz_per_bin=n_sqz_per_bin, N_max=self.n_sqz_max,
+            w_bin=w_bin, M=self.n_sqz_max, gate_mode=self.gate_mode,
         )
 
         # ── MSST 硬挤压 (可视化对比基准) ──
@@ -1177,10 +1246,17 @@ class SAST(nn.Module):
             'edge_dst': self.edge_dst,
             'edge_feats': edge_feats_t,
         }
-        if not training:
-            result['lambda_sqz'] = lambda_sqz         # [B, N_phys, T] — 挤压轮数
-            result['ridge_factor'] = ridge_factor     # [B, F, T] — bin 参与因子
-            result['n_sqz_per_bin'] = n_sqz_per_bin   # [B, F, T] — per-bin 挤压轮数
+        # 挤压控制的诊断量。⚠ 只放**小张量**: 全尺寸的 gate [M,B,F,T] 在
+        # B=3/T=2000 下是 228 MB, 每次前向都建会把 8 GB 卡顶到边缘 (实测
+        # 7477/8188 MiB, 训练近乎停滞)。这里只报节点级"有效轮数" Σ_m g_m,
+        # 由 w_i 在节点空间直接算, 与 bin 空间的门控等价且只有一个向量。
+        with torch.no_grad():
+            r_node = (w_i * self.n_sqz_max).clamp(0.0, self.n_sqz_max)
+            # 逐轮 Σ_m clamp(r-(m-1),0,1) 在该 w_i 下的值 = r 本身 (恒等)
+            result['gate_rounds_node'] = r_node.mean(dim=(0, 2))   # [N_phys]
+        if self.emit_squeeze_diag:
+            result['ridge_factor'] = ridge_factor      # [B,F,T]
+            result['w_bin'] = w_bin                    # [B,F,T]
         return result
 
     def get_freq_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -1243,10 +1319,14 @@ if __name__ == '__main__':
     w_i = result['w_i'][0].cpu().numpy()  # [N_phys, T]
     alpha = result['alpha'][0].cpu().numpy()  # [T, 5]
 
-    print(f"\nPer-node w_i (time-mean):")
-    node_names_phys = ['LOW_FREQ', 'BPF', '2xBPF']
+    print(f"\nPer-node w_i (time-mean) + 有效挤压轮数:")
+    node_names_phys = [r.name for r in PUMP_TURBINE_REGIONS]
+    _gr = result.get('gate_rounds_node')
     for i, name in enumerate(node_names_phys):
-        print(f"  {name:<12s} w_i={w_i[i].mean():.3f} +/- {w_i[i].std():.3f}")
+        _tail = (f"  Σ_m g_m={float(_gr[i]):.2f} (M={model.n_sqz_max})"
+                 if _gr is not None else '')
+        print(f"  {name:<12s} w_i={w_i[i].mean():.3f} +/- {w_i[i].std():.3f}"
+              f"{_tail}")
 
     print(f"\nPrototype attention (time-mean):")
     proto_names = ['No-load', 'Low load', 'Mid load', 'High load', 'Pumping']

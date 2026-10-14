@@ -256,7 +256,7 @@ def method_msst1(x):
 
 
 def method_msst4(x):
-    """四阶 MSST (num=4)."""
+    """MSST num=4 (4 次 lookup 迭代, 非常说的"四阶相位导数")."""
     return _msst(x, 4)
 
 

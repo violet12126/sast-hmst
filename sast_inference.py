@@ -161,3 +161,91 @@ def evaluate_accuracy(model: SAST, freq_encoder: FreqEncoder,
         'per_class_correct': per_class_correct.tolist(),
         'per_class_total': per_class_total.tolist(),
     }
+
+
+@torch.no_grad()
+def evaluate_tf_quality(model: SAST,
+                        X: np.ndarray,
+                        batch_size: int = 4,
+                        device: Optional[torch.device] = None) -> Dict:
+    """
+    验证集上的**时频质量**指标 (与 scripts/analysis/probe_if_layers.py 同口径).
+
+    WHY: λ_supcon 由 1.0 降到 0.2 后, KNN 精度 (由 z_freq 池化特征定义, 测的是
+    *工况可分辨性*) 不再能反映模型好坏 —— 优化重心已回到时频分布本身。本函数
+    补上一个直接测「时频表示有多忠实/多清晰」的验证指标。
+
+    逐节点三项 (带内, 用 region_weights 加权, 与训练侧 renyi_2d_loss 同加权口径):
+      renyi2d        带内 Rényi-2D 熵 (α=2, 越低越集中)
+      concentration  带内能量最高的 10% bin 的能量占比 (越高越集中)
+      band_spread_hz 带内能量加权频率标准差 (Hz, 越小越窄)
+
+    另给 hard / soft 分组均值, 便于看「该挤的挤了、该留的留了」这一分工是否成立
+    (hard = BLADE_PASS/BLADE_HARMONIC, soft = HYDRAULIC/BLADE_DRIFT, 见 SOFT_F_TYPES)。
+
+    Args:
+        X:          [N, T] 验证信号
+        batch_size: 批大小
+
+    Returns:
+        dict: 逐节点均值 + 'hard' / 'soft' 分组均值
+    """
+    from models.sast_nodes import (PUMP_TURBINE_REGIONS, region_weights,
+                                   SOFT_F_TYPES)
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+
+    regions = PUMP_TURBINE_REGIONS
+    n_nodes = len(regions)
+    eps = 1e-8
+    N = len(X)
+    acc = {k: np.zeros(n_nodes) for k in ('renyi2d', 'concentration',
+                                          'band_spread_hz')}
+    n_batches = 0
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch_x = torch.from_numpy(X[start:end]).float().to(device)
+        res = model(batch_x, training=False)
+        tfr, freqs = res['tfr_enhanced'], res['freqs']      # [B, F, T], [F]
+        B = tfr.shape[0]
+
+        for n, r in enumerate(regions):
+            w = region_weights(freqs, [r])[0]
+            m = w > 0.0
+            band = tfr[:, m, :] * w[m].view(1, -1, 1)          # [B, Fn, T]
+            fb = freqs[m]                                       # [Fn]
+            # Rényi-2D (逐样本 (F,T) 联合分布)
+            p = band.clamp(min=eps)
+            p = p / p.sum(dim=(1, 2), keepdim=True).clamp(min=eps)
+            h = torch.log((p ** 2).sum(dim=(1, 2)).clamp(min=eps)) / (1.0 - 2)
+            acc['renyi2d'][n] += h.mean().item() * B
+            # 集中度 (时间边际谱的 top-10% bin 占比)
+            col = band.sum(dim=1)                               # [B, Fn]
+            k = max(1, int(np.ceil(0.1 * col.shape[1])))
+            conc = (col.topk(k, dim=1).values.sum(dim=1) /
+                    col.sum(dim=1).clamp(min=eps))
+            acc['concentration'][n] += conc.mean().item() * B
+            # 带内能量加权频率标准差 (逐帧对频率求加权方差, 再对时间取均值)
+            wsum = band.sum(dim=1).clamp(min=eps)                # [B, T]
+            mu = (fb.view(1, -1, 1) * band).sum(dim=1) / wsum    # [B, T]
+            var = ((fb.view(1, -1, 1) - mu.unsqueeze(1)) ** 2 * band
+                   ).sum(dim=1) / wsum
+            acc['band_spread_hz'][n] += \
+                torch.sqrt(var.clamp(min=eps)).mean().item() * B
+        n_batches += B
+
+    out: Dict = {}
+    for k in acc:
+        out[k] = (acc[k] / max(1, n_batches)).tolist()
+    out['nodes'] = [r.name for r in regions]
+    soft_idx = [i for i, r in enumerate(regions) if r.f_type in SOFT_F_TYPES]
+    hard_idx = [i for i, r in enumerate(regions) if r.f_type not in SOFT_F_TYPES]
+    for key in ('renyi2d', 'concentration', 'band_spread_hz'):
+        v = np.asarray(out[key])
+        out[f'{key}_hard'] = float(v[hard_idx].mean()) if hard_idx else float('nan')
+        out[f'{key}_soft'] = float(v[soft_idx].mean()) if soft_idx else float('nan')
+    out['soft_nodes'] = [regions[i].name for i in soft_idx]
+    out['hard_nodes'] = [regions[i].name for i in hard_idx]
+    return out

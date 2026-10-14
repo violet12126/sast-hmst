@@ -526,12 +526,11 @@ GAT 问的是 "此时此刻, 我在图上读到的物理关系还有效吗？"
               |                         |
               v                         v
 +--------------------------+  +--------------------------+
-|  sigma_i 映射 (连续, 可微)|  |  PerBinOrderSelector      |
-|  sigma_i = sigma_min +   |  |  训练: 固定 N_max=5        |
-|    (1-w_i)*delta_sigma   |  |  推理: N*(eta,b) =         |
-|  -> sigma_sq [F, T]      |  |    round(lambda_i *        |
-|                          |  |      conv_decay *          |
-|                          |  |      struct_gate)          |
+|  sigma_i 映射 (连续, 可微)|  |  轮数软门控 (连续, 可微)   |
+|  sigma_i = sigma_min +   |  |  g_m = clamp(             |
+|    (1-w_i)*delta_sigma   |  |     w_i*M - (m-1), 0, 1)  |
+|  -> sigma_sq [F, T]      |  |  -> 逐轮 part = g_m·ridge  |
+|                          |  |  训练/推理同一路径         |
 +------------+-------------+  +------------+-------------+
              |                             |
              +-------------+---------------+
@@ -736,33 +735,63 @@ MSST 迭代:    omega_{k+1}[eta,b] = omega_k[omega_k[eta,b], b]
 不需要为不同 bin 选不同的 IF 层。
 ```
 
+> **本节论断已用实验验证**（原为断言；实验见 `scripts/analysis/probe_if_layers.py`
+> 与《讲解文档》§5.1）：四个分量 × 三项指标，最优 IF 层**一致落在 k = num−1 =
+> 生产路径已在用的那一层**，没有任何分量偏好更低的层。同时实测层间差异的效果方向
+> 与 σ / 挤压轮数完全同向且单调（层越深越集中），即「选低层」等价于「挤得更轻」——
+> 而 σ 已经能连续可微地表达这一点。用一个离散不可微的层索引去重复 σ 的功能是负收益。
+>
+> **术语警告**：`omegas[k]` 是**固定点 lookup 迭代层**，不是 Taylor 相位导数阶。
+> 本仓库多处（含 `models/sast.py` 的旧 docstring）曾把它称为「阶 / order」，且写过
+> 一个 `PerBinOrderSelector -> N_star -> omegas[N_star]` 的选择器 —— **该选择器在代码中
+> 从未存在**，生产路径一直只用 `omegas[:, -1]`。真实的一阶/二阶 SST 是另外的函数
+> （`sst2_stft`）。
+
 **真正需要 GAT 控制的不是"用哪个 IF"，而是"挤不挤、挤几次"**。挤压是一个破坏性的动作——它把能量从原始位置挪到 IF 指向的位置。这个动作对谐波是正确的（消除窗函数模糊），对滑差/噪声是错误的（虚构集中）。多次挤压-重估 IF-再挤压的循环，每轮提升 TFR 的 SNR，有助于 BPF 的 chirp 追踪：
 
 ```
-Algorithm:
-  1. 所有 bin: omega ← lookup 5 次 → omega_5 (最优 IF, 一次性, 无梯度)
-  2. GAT 输出 w_i → sigma_i (核宽) + lambda_i (挤压轮数)
-  3. 逐节点逐帧:
-       for round in 1..lambda_i:
-         squeeze(STFT, omega_5, sigma_i) → TFR_round
-         re-estimate omega_5 on TFR_round  (SNR 逐轮提升)
-         (训练时 lambda_i=1, 推理时启用多轮)
-  4. ridge_factor: 同节点内, 脊线 bin 全参与, 远离 bin 跳过
+Algorithm (现状, 训练与推理同一路径):
+  1. 所有 bin: omega ← lookup num-1 次 → omega_final = omegas[-1]
+     (一次性, 无梯度; 逐层质量见 §5.1 实验, 最优层就是这一层)
+  2. GAT 输出 w_i -> sigma_i (核宽, 连续) 与软门控 g_m (轮数, 连续)
+  3. 逐节点逐帧, m = 1..M:
+       g_m = clamp(w_i * M - (m-1), 0, 1)     ← 可微, 训练/推理同式
+       S   = (1 - g_m·ridge) · S + (g_m·ridge) · Reassign(S, omega_final, sigma_i)
+     **不重估 omega_final** —— 固定 IF 的迭代算子。
+  4. ridge_factor: 同节点内, 脊线 bin 全参与, 远离 bin 跳过 (空间参与因子)
 ```
 
-**sigma 和 lambda 的分工**: sigma 控制"挤多宽"（连续，可微，训练时使用），lambda 控制"挤几次"（离散，推理时使用）。两者都由 w_i 派生——w_i 高的分量（2xBPF）窄核 + 少轮（一轮到位），w_i 中等的分量（BPF）中核 + 多轮（逐轮追 chirp），w_i 低的分量（LOW_FREQ）宽核 + 零轮（不挤）。
+**sigma 与轮数门控的分工**: sigma 控制"挤多宽"（连续、可微），软门控 g_m 控制
+"挤几次"（连续、可微）。两者都由 w_i 派生——w_i 高的分量（BPF_LINE / 2xBPF）
+窄核 + 多轮，w_i 低的分量（LOW_FREQ）宽核 + 不足一轮。
 
-#### 18.1 节点级 lambda_i
+> ⚠ **与旧稿的两处更正**：
+> 1. 旧稿写「每轮重估 omega_5 (SNR 逐轮提升)」——**代码从未这样做，也不应该做**。
+>    重估需从挤压后幅度重算 IF 再 `round/gather`，**不可微**且是 CPU/numpy 操作，
+>    会同时破坏训推一致性与 A2 修好的量化断点。代价是：固定算子的 M 次迭代会
+>    **强化**落点，若 `omega_final` 本身偏了会放大错误（真实过挤压风险），靠
+>    M 小 + 门控早停控制。
+> 2. 旧稿的整数 `lambda_i = round(w_i·N_max)` 路径**已删除**，原因是它有三重问题：
+>    (a) 训练时根本不调用（训练固定 1 轮）→ 训推不一致；
+>    (b) `round()` 不可微 → w_i 拿不到来自"轮数"的梯度；
+>    (c) `n_sqz_per_bin` 被 `clamp(1, ...)` 卡在 ≥1 → 推理**永远不可能 0 轮**，
+>        与下面 §18.1 写的「w_i→0 (LOW_FREQ): lambda_i = 0 → 不挤压」直接矛盾。
+>    现由上面的软门控取代，`w_i = 0` 时 `Σg_m = 0`，**真正可以 0 轮**。
 
-GAT 输出的 w_i 确定每个物理节点的挤压轮数：
+#### 18.1 自适应轮数（软门控，取代旧的整数 lambda_i）
 
 ```
-lambda_i = round(w_i * N_max)    N_max=5
+r   = clamp(w_i * M, 0, M)            期望轮数 (连续)
+g_m = clamp(r - (m-1), 0, 1)          满轮取 1, 末轮取小数, 之后恒 0
 
-w_i -> 1 (2xBPF):  lambda_i = 5 → 全轮次 (但一轮已收敛, 多余无害)
-w_i -> 0.7 (BPF):  lambda_i = 3~4 → 多轮追 chirp
-w_i -> 0 (LOW_FREQ): lambda_i = 0 → 不挤压
+w_i = 0.90 (BPF_LINE / 2xBPF):  r = 2.70 → g = (1, 1, 0.70)  → 近三轮锐化
+w_i = 0.25 (LOW_FREQ):          r = 0.75 → g = (0.75, 0, 0)  → 不足一轮, 保留宽峰
+w_i = 0.00:                     r = 0    → g = (0, 0, 0)     → 完全不挤
 ```
+
+`Σg_m` 即"有效轮数"，处处单调、几乎处处可微（`∂g/∂w_i = M` 仅在末轮非零）。
+M 默认 3（实测代价：B=10/F=1000/T=2000 下 M=1 → 71 ms，M=3 → 192 ms，
+一步增量 +109 ms ≈ 步时 +18%）。
 
 #### 18.2 逐 bin 分化：ridge_factor
 
@@ -843,7 +872,12 @@ A_n(p, m; sigma, N*) = (1/Z) * exp[-(p - omega_hat[N*(m)])^2 / (2*sigma^2)]
 
 > **v4 更新**: 梯度路径已修复。v3 中 `tfr_enhanced` 对 `sigma_sq` 不可微导致梯度断裂；v4 连续高斯核使 TFR loss 经 `sigma_sq → w_i → GAT` 正常回流。主监督从 RE_2D 改为 SupCon（经 TFR → sigma → w_i 监督 GAT）。L_physics 约束 A_ij（非 w_i）提供独立梯度路径。
 
-**训练/推理差异**: 训练时 lambda_i=1（单轮挤压），推理时启用多轮挤压迭代。lambda_i 的离散选择不可微，但在推理时直接继承 w_i 的排序。所有 bin 统一使用 omegas[-1]（5 次 lookup 的最优 IF）。
+**训练/推理差异**: **已消除**。旧实现训练时 lambda_i=1（单轮）、推理时启用多轮，
+属训推不一致；且 `round()` 不可微、`n_sqz_per_bin` 被 clamp 到 ≥1 使 0 轮不可达。
+现改为连续可微的软门控 `g_m = clamp(w_i·M − (m−1), 0, 1)`，训练与推理走**同一条**
+路径（实测：两 flag 之差与同 flag 重跑之差之比 = 0.998，残差全部来自 kernel 的
+atomicAdd 非确定性）。所有 bin 统一使用 `omegas[-1]`——这一选择现已由实验验证
+（见 §18.0 的引用与《讲解文档》§5.1）。
 
 > **v4 更新**: 训练主监督改为 SupCon（监督对比），需 batch≥8 保证 batch 内同工况正样本对。评估改 KNN 近邻到类中心（无分类头）。训练命令 `python train_sast.py --batch_size 8`。
 

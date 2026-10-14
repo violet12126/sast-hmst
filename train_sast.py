@@ -35,7 +35,8 @@ from models.sast_graph import get_graph_summary, NODE_NAMES
 from sast_config import SastConfig, set_seed
 from sast_data import load_dataset, build_balanced_batch_indices
 from sast_model import create_model, create_freq_encoder, get_freq_bins
-from sast_inference import compute_class_centroids, infer_sast, evaluate_accuracy
+from sast_inference import (compute_class_centroids, infer_sast,
+                            evaluate_accuracy, evaluate_tf_quality)
 from sast_viz import plot_full_diagnostics
 
 
@@ -95,7 +96,9 @@ Examples:
     p.add_argument('--seed', type=int, default=42)
 
     # ── Loss weights ──
-    p.add_argument('--lambda_supcon', type=float, default=1.0)
+    p.add_argument('--lambda_supcon', type=float, default=0.2,
+                   help='SupCon 权重; 已由 1.0 降到 0.2 (不做分类, 仅作 '
+                        'cond_ctx 工况区分度的辅助正则, 重心回到时频分布)')
     p.add_argument('--lambda_entropy', type=float, default=0.1)
     p.add_argument('--lambda_physics', type=float, default=0.5)
     p.add_argument('--lambda_balance', type=float, default=0.5)
@@ -118,8 +121,22 @@ Examples:
                    help='分量缺席时 w_range/balance 下界松弛到该值')
 
     # ── New module settings ──
-    p.add_argument('--n_sqz_max', type=int, default=4,
-                   help='推理多轮挤压最大轮数')
+    p.add_argument('--n_sqz_max', type=int, default=3,
+                   help='软门控最大轮数 M (r=clamp(w_i*M,0,M), '
+                        'g_m=clamp(r-(m-1),0,1)); 训练推理同一路径')
+    p.add_argument('--gate_mode', type=str, default='clamp',
+                   choices=['clamp', 'sigmoid'],
+                   help="可微软门控形状; 'clamp' 无参且能真正到 0 轮")
+    p.add_argument('--train_ridge', type=int, default=1, choices=[0, 1],
+                   help='是否施加 ridge 空间参与因子。注意这不是"训推分歧开关": '
+                        '0 会让训练与推理**都**用 ridge=1.0, 两者仍统一。'
+                        '⚠ 实测 (docs §16.4.1) --train_ridge 0 的 hard 带集中度'
+                        '与 Val acc 都更好 (Rényi 7.634 vs 7.753), 默认值待更长'
+                        '训练复现后可能改为 0')
+    p.add_argument('--gate_detach', type=int, default=0, choices=[0, 1],
+                   help='消融: 断开门控路径 (只剩 sigma 路径)')
+    p.add_argument('--sigma_detach', type=int, default=0, choices=[0, 1],
+                   help='消融: 断开 sigma 路径 (只剩门控路径)')
 
     # ── Output ──
     p.add_argument('--device', type=str, default='cuda')
@@ -159,6 +176,10 @@ Examples:
         max_samples=args.max_samples,
         save_dir=args.save_dir, viz_every=args.viz_every,
         n_sqz_max=args.n_sqz_max,
+        gate_mode=args.gate_mode,
+        train_ridge=bool(args.train_ridge),
+        gate_detach=bool(args.gate_detach),
+        sigma_detach=bool(args.sigma_detach),
         resume=args.resume,
     )
     return config, args.device
@@ -403,6 +424,7 @@ def main():
               f"ent={epoch_losses.get('entropy_2d', 0):.3f} "
               f"phy={epoch_losses.get('physics', 0):.4f} "
               f"bal={epoch_losses.get('balance', 0):.4f} "
+              f"var={epoch_losses.get('w_var', 0):.4f} "
               f"wc={epoch_losses.get('w_consistency', 0):.4f} "
               f"wr={epoch_losses.get('w_range', 0):.4f} "
               f"lf={epoch_losses.get('lowfreq_sharp', 0):.4f} "
@@ -440,6 +462,22 @@ def main():
             if acc > best_val_acc:
                 best_val_acc = acc
             print(f"        Val acc={acc:.3f} ({val_metrics['n_correct']}/{val_metrics['n_total']}){marker}")
+
+        # ── 时频质量 (与 KNN 并列). λ_supcon 降到 0.2 后 KNN 只反映工况
+        #    可分辨性; 这一项才反映"时频表示本身有多集中/多清晰"。
+        if has_val:
+            _tfq = evaluate_tf_quality(
+                model, X_val[:min(len(X_val), 200)],
+                batch_size=max(1, eff_batch), device=device)
+            _hn = '/'.join(_tfq['hard_nodes'])
+            _sn = '/'.join(_tfq['soft_nodes'])
+            print(f"        TF quality  Rényi↓  hard({_hn})="
+                  f"{_tfq['renyi2d_hard']:.3f}  soft({_sn})="
+                  f"{_tfq['renyi2d_soft']:.3f}")
+            print(f"                    集中度↑  hard={_tfq['concentration_hard']:.4f}"
+                  f"  soft={_tfq['concentration_soft']:.4f}")
+            print(f"                    带内std  hard={_tfq['band_spread_hz_hard']:.3f}"
+                  f"  soft={_tfq['band_spread_hz_soft']:.3f} Hz")
 
         # ── Visualization ──
         if epoch % config.viz_every == 0 or epoch == config.epochs - 1:

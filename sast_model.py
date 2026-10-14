@@ -30,6 +30,10 @@ def create_model(config: SastConfig, device: torch.device) -> SAST:
         prototype_temperature=config.prototype_temperature,
         dropout=config.dropout,
         n_sqz_max=config.n_sqz_max,
+        gate_mode=config.gate_mode,
+        train_ridge=config.train_ridge,
+        gate_detach=config.gate_detach,
+        sigma_detach=config.sigma_detach,
     ).to(device)
     return model
 

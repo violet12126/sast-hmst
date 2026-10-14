@@ -56,7 +56,14 @@ class SastConfig:
     seed: int = 42
 
     # ── Loss weights ──
-    lambda_supcon: float = 1.0
+    # λ_supcon 1.0 -> 0.2: 不做分类的前提下, SupCon 只作为「让 cond_ctx 保持
+    # 工况区分度」的辅助正则, 优化重心回到时频分布本身。
+    # 实测加权贡献 (1.0 时): supcon 1.440 (62.3%) / RE_2D 0.798 (34.5%) / 其余 ≤0.05。
+    # 降到 0.2 后 supcon ≈ 0.288 (~26%), RE_2D 成为最大单项。
+    # ⚠ 代价: FreqEncoder 的**唯一**梯度来源就是 supcon_loss, 降 5 倍即梯度降 5 倍;
+    #   故 sast_inference 的 KNN 验证精度 (只测分类能力) 会下降 —— 这是预期内的,
+    #   时频质量改由 evaluate_tf_quality 观测。
+    lambda_supcon: float = 0.2
     lambda_entropy: float = 0.1
     lambda_physics: float = 0.5
     lambda_balance: float = 0.5
@@ -83,7 +90,24 @@ class SastConfig:
     max_samples: Optional[int] = None
 
     # ── New modules ──
-    n_sqz_max: int = 4
+    # ── 自适应挤压轮数 (可微软门控) ──
+    # n_sqz_max 现为软门控的 M (最大轮数): r = clamp(w_i*M, 0, M),
+    # g_m = clamp(r - (m-1), 0, 1)。取代旧的整数 n_sqz_per_bin 掩码
+    # (那条路径训练不启用、round() 不可微、且 clamp(1,..) 使 0 轮不可达)。
+    # M=3: 各节点 w_range 映射后 BPF_LINE≈2.6-3.8 轮 / LOW_FREQ≈0.4-1.8 轮。
+    # 实测代价 (B=10,F=1000,T=2000): 重排本体 M=1 71ms -> M=3 192ms (+109ms);
+    # 端到端 46s -> 51s per epoch (=+11%, 与 MSST 等环节重叠)。
+    # ⚠ 整模型显存实测已占 6.5-7.5 GB / 8 GB, 加大 M 或 batch 前需重估。
+    n_sqz_max: int = 3
+    # 门控形状: 'clamp' (推荐, 无参且能真正到 0 轮) | 'sigmoid'
+    gate_mode: str = 'clamp'
+    # 训练时是否施加 ridge 空间参与因子。旧行为是训练时 None (全 bin 满参与),
+    # 推理才用 ridge; 统一后默认 True。这是与门控**无关**的第二个动力学变更,
+    # 消融时用 --train_ridge 0 单独隔离。
+    train_ridge: bool = True
+    # 消融: 断开门控路径 / 断开 sigma 路径 (回答门控是否只是 w_range 的重参数化)
+    gate_detach: bool = False
+    sigma_detach: bool = False
     resume: Optional[str] = None  # checkpoint path for fine-tuning
 
     # ── Output ──

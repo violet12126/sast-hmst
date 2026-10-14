@@ -1192,12 +1192,15 @@ class SAST(nn.Module):
         # ── 挤压参与因子与门控 (训练与推理**同一路径**) ──
         # 旧实现: 推理才算 ridge_factor / n_sqz_per_bin, 训练走单轮全参与分支
         # —— 训推不一致, 且「挤压轮数」在训练中从未获得梯度。现统一。
-        bw_expected = torch.tensor([r.bw_expected for r in self.regions],
-                                   device=device, dtype=torch.float32)
-        ridge_factor = self.sqz_controller(
-            w_i, tfr_mag, freqs, node_if, bw_expected)      # [B, F, T]
-        if not self.train_ridge:
-            ridge_factor = None      # 消融: 回到旧训练行为 (全 bin 满参与)
+        if self.train_ridge:
+            bw_expected = torch.tensor([r.bw_expected for r in self.regions],
+                                       device=device, dtype=torch.float32)
+            ridge_factor = self.sqz_controller(
+                w_i, tfr_mag, freqs, node_if, bw_expected)   # [B, F, T]
+        else:
+            # 默认路径: 不做 ridge 加权 (part = g_m)。**不计算** —— 而非算完丢弃,
+            # 省掉 [B, N_phys, F, T] 距离矩阵的显存与算力 (docs §16.4.2)
+            ridge_factor = None
         # w_i [B, N_phys, T] 经最近节点分配到 [B, F, T], 供软门控使用
         w_bin = w_i[B_idx_f, i_star, T_idx_f]                # [B, F, T]
         if self.gate_detach:          # 消融: 只剩 sigma 路径

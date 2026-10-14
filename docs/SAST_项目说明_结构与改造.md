@@ -1019,10 +1019,10 @@ hard 带（BPF_LINE / 2xBPF）训练后 `w_i ≈ 1.0` → `σ = 0.50` → `K_eff
 
 **待办（按优先级）**
 
-1. **20 epoch 全量 `train_ridge` 对照**（进行中）。若 `--train_ridge 0` 的优势保持，
-   则把默认值改为 `False`，并考虑直接删除 `SqueezeIterationController` 的
-   `ridge_factor` 计算（省掉 `[B, N_phys, F, T]` 距离矩阵的显存与算力）。
-   依据见 §16.4.2：ridge 与输出混合架构根本不匹配，不是参数没调好。
+1. ~~**20 epoch 全量 `train_ridge` 对照**~~ → **已完成，默认值已改为 `False`**，
+   并改为"仅在开启时才计算"（省掉 `[B, N_phys, F, T]` 距离矩阵）。见 §16.4.3。
+   `SqueezeIterationController` 本身**保留**（论文消融需要可复现的对照臂），
+   而非删除。
 2. **`deploy/` 全链路同步**（等主干超参锁定后一次性做）：`sast_export_model.py`
    的 `_multi_round_reassign_export`、`export_sast_onnx.py` 与 `quantize_sast_modelopt.py`
    的 `OUTPUT_NAMES`（`n_sqz_per_bin` → `w_bin`）、`sast_jetson_infer.py` 的
@@ -1133,3 +1133,38 @@ BPF_LINE          (0.50, 3)       7.1719       1.000        7.1719    -0.00%    
 
 **因此 (b) 正式关闭。** 若将来引入非单调目标，「解耦轮数与 σ」可以重新评估——本节的
 实验脚本与判据可直接复用。
+
+#### 16.4.3 `train_ridge` 最终判定：默认改为 False（20 epoch 全量）
+
+§16.4.1 的 (4) 只跑了 2 epoch / 765 样本，结论是"证据不足，需复现"。现已在**全量数据
+（train 5475 / val 1160）、20 epoch、同一 seed** 上复现，结果一致且更明确：
+
+| 指标 | `ridge=1` | `ridge=0` | 判定 |
+|---|---|---|---|
+| hard 带 Rényi↓ | 7.853 | **7.721** | ridge=0 胜 |
+| hard 带内 std↓ | 0.873 | **0.659** | ridge=0 胜（**−24%**） |
+| soft 带 Rényi | 9.612 | 9.681 | ridge=0（软带更松 = 正确方向） |
+| soft 带内 std | 2.782 | 2.737 | 基本持平 |
+| Val acc | 1.000 | 1.000 | **打平（已饱和）** |
+| 总损失 T | 0.854 | **0.835** | ridge=0 |
+
+**它不是"某一项换另一项"的取舍，而是两个轴同时变好**：该集中的（hard 带）更集中，
+该宽松的（soft 带）更宽松。加上 §16.4.2 的机制（理论与实测吻合到 0.2%），结论是
+**`ridge_factor` 与输出混合架构不匹配，属设计缺陷而非参数问题**。
+
+**处置**：
+
+1. `sast_config.train_ridge` 默认 **`True` → `False`**；CLI `--train_ridge` 默认 0。
+   开关保留（论文消融需要可复现的对照臂）。
+2. **不再计算而非算完丢弃**：旧写法无条件调用 `SqueezeIterationController` 再置 None，
+   白跑 `[B, N_phys, F, T]` 距离矩阵；现改为仅在 `train_ridge=True` 时才计算。
+3. 验证：两条路径的 `tfr_enhanced` 相对 L1 差 **0.3381**（ridge 确实在起作用），
+   默认走 `False` 那条，输出有限。
+
+**⚠ 一个必须记录的副作用：Val acc 两组都到 1.000（1160/1160），且 `sc`（SupCon）
+塌到 0.000。** 这说明：
+
+- **KNN 验证精度已经饱和，不再具备区分配置的能力** —— 不能再拿它当选型依据。
+  这独立印证了 §16.5 把优化重心移出对比学习的判断；
+- 时频质量指标（`evaluate_tf_quality`）现在是唯一能区分配置的验证量，
+  本轮所有关于 ridge 的结论都建立在它之上，而不是建立在 KNN 上。

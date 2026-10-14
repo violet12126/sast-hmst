@@ -129,12 +129,11 @@ Examples:
     p.add_argument('--gate_mode', type=str, default='clamp',
                    choices=['clamp', 'sigmoid'],
                    help="可微软门控形状; 'clamp' 无参且能真正到 0 轮")
-    p.add_argument('--train_ridge', type=int, default=1, choices=[0, 1],
-                   help='是否施加 ridge 空间参与因子。注意这不是"训推分歧开关": '
-                        '0 会让训练与推理**都**用 ridge=1.0, 两者仍统一。'
-                        '⚠ 实测 (docs §16.4.1) --train_ridge 0 的 hard 带集中度'
-                        '与 Val acc 都更好 (Rényi 7.634 vs 7.753), 默认值待更长'
-                        '训练复现后可能改为 0')
+    p.add_argument('--train_ridge', type=int, default=0, choices=[0, 1],
+                   help='是否施加 ridge 空间参与因子。**默认 0 (关)**。'
+                        '20 epoch 全量实测: 关掉后 hard Rényi 7.721 vs 7.853、'
+                        'hard 带内 std 0.659 vs 0.873, 两个轴都更好, Val acc 同'
+                        '为 1.000。设 1 可复现旧行为 (docs §16.4.2)')
     p.add_argument('--gate_detach', type=int, default=0, choices=[0, 1],
                    help='消融: 断开门控路径 (只剩 sigma 路径)')
     p.add_argument('--sigma_detach', type=int, default=0, choices=[0, 1],

@@ -109,10 +109,15 @@ class SastConfig:
     n_sqz_max: int = 3
     # 门控形状: 'clamp' (推荐, 无参且能真正到 0 轮) | 'sigmoid'
     gate_mode: str = 'clamp'
-    # 训练时是否施加 ridge 空间参与因子。旧行为是训练时 None (全 bin 满参与),
-    # 推理才用 ridge; 统一后默认 True。这是与门控**无关**的第二个动力学变更,
-    # 消融时用 --train_ridge 0 单独隔离。
-    train_ridge: bool = True
+    # 是否施加 ridge 空间参与因子。**默认 False** —— 见 docs §16.4.2 / §16.4.1。
+    # WHY: 在输出混合递推下, part<1 意味着每轮把 (1-part) 的原始能量留在原位,
+    #   而 ridge 恰恰把"最该被搬走的侧翼 bin"压到 floor 0.15, 于是残余
+    #   ∏(1-g_m·ridge) 洗不掉。实测 (20 epoch 全量, 同 seed):
+    #     ridge=1: hard Rényi 7.853 / hard 带内 std 0.873
+    #     ridge=0: hard Rényi 7.721 / hard 带内 std 0.659   <- 两个轴都更好
+    #   Val acc 两组都是 1.000 (已饱和, 无损失)。ridge 与架构不匹配, 不是参数问题。
+    # 保留该开关是为了论文里的消融可复现; 设为 True 可复现旧行为。
+    train_ridge: bool = False
     # 消融: 断开门控路径 / 断开 sigma 路径 (回答门控是否只是 w_range 的重参数化)
     gate_detach: bool = False
     sigma_detach: bool = False

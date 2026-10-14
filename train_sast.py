@@ -33,7 +33,7 @@ from models.sast_nodes import PUMP_TURBINE_REGIONS
 from models.sast_graph import get_graph_summary, NODE_NAMES
 
 from sast_config import SastConfig, set_seed
-from sast_data import load_dataset
+from sast_data import load_dataset, build_balanced_batch_indices
 from sast_model import create_model, create_freq_encoder, get_freq_bins
 from sast_inference import compute_class_centroids, infer_sast, evaluate_accuracy
 from sast_viz import plot_full_diagnostics
@@ -77,7 +77,18 @@ Examples:
     # ── Training ──
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch_size', type=int, default=8,
-                   help='SupCon 需 batch 内同工况正样本对, 建议 >=8')
+                   help='仅在 --balanced_p 0 时生效; 否则由 P×K 覆盖 '
+                        '(实际 batch = balanced_p * balanced_k)')
+    # ── 类别均衡采样 (P×K) ──
+    p.add_argument('--balanced_p', type=int, default=2,
+                   help='每个类在 batch 内的样本数; 0 = 关闭均衡采样 '
+                        '(退回 randperm 均匀切片)。须 >=2, 否则每类仅 1 个样本, '
+                        'SupCon 无正样本对')
+    p.add_argument('--balanced_k', type=int, default=5,
+                   help='每个 batch 抽多少个类 (P×K 的 K)')
+    p.add_argument('--freq_constraints_active', action='store_true',
+                   help='方案 A 反向开关: 打开后 L_physics/L_anchor/L_ratio '
+                        '重新进入 L_total (默认降级为诊断, 不参与反向传播)')
     p.add_argument('--lr', type=float, default=0.001)
     p.add_argument('--weight_decay', type=float, default=1e-5)
     p.add_argument('--grad_clip', type=float, default=1.0)
@@ -128,6 +139,8 @@ Examples:
         prototype_temperature=args.prototype_temperature,
         dropout=args.dropout,
         epochs=args.epochs, batch_size=args.batch_size,
+        balanced_p=args.balanced_p, balanced_k=args.balanced_k,
+        freq_constraints_active=args.freq_constraints_active,
         lr=args.lr, weight_decay=args.weight_decay,
         grad_clip=args.grad_clip, seed=args.seed,
         lambda_supcon=args.lambda_supcon, lambda_entropy=args.lambda_entropy,
@@ -181,6 +194,23 @@ def main():
         print(f"  Val:   N={dataset['N_val']}")
         X_val, y_val = dataset['val_X'], dataset['val_y']
     print(f"  Classes: {np.unique(y_train)}, counts: {np.bincount(y_train)}")
+
+    # ── P×K 均衡采样: 有效 batch 大小 ──
+    # 关闭时退回 torch.randperm 均匀切片 + config.batch_size。
+    N_train = len(X_train)
+    if config.balanced_p > 0:
+        if config.balanced_p < 2:
+            print(f"  [WARN] balanced_p={config.balanced_p} < 2: 每类在 batch 内"
+                  f"仅 1 个样本 -> 无正样本对, SupCon 得不到梯度。")
+        eff_batch = config.balanced_p * config.balanced_k
+        n_batches = max(1, N_train // eff_batch)
+    else:
+        eff_batch = config.batch_size
+        n_batches = max(1, N_train // eff_batch)
+    print(f"  Batch: {'P×K 均衡' if config.balanced_p > 0 else 'randperm 均匀'}"
+          f"  P={config.balanced_p} K={config.balanced_k}"
+          f"  -> B={eff_batch}, {n_batches} batch/epoch, "
+          f"{eff_batch * n_batches}/{N_train} 样本/epoch")
 
     # ═══════════════════════════════════════════════════════════
     # 2. Create model + freq_encoder
@@ -240,17 +270,25 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Training SAST v3 (SupCon) for {config.epochs} epochs")
-    print(f"  Batch size: {config.batch_size}, LR: {config.lr}")
+    print(f"  Batch size: {eff_batch}"
+          f"{' (P×K)' if config.balanced_p > 0 else ''}, LR: {config.lr}")
     print(f"  λ_sc={config.lambda_supcon}  λ_e={config.lambda_entropy}")
-    print(f"  λ_p={config.lambda_physics}  λ_b={config.lambda_balance}")
+    print(f"  λ_p={config.lambda_physics}"
+          f"{'' if config.freq_constraints_active else ' (诊断, 见下)'}"
+          f"  λ_b={config.lambda_balance}")
     print(f"  λ_var={config.lambda_var}  λ_c={config.lambda_consistency}  λ_lf={config.lambda_lowfreq}  λ_r={config.lambda_range}")
-    print(f"  λ_anchor={config.lambda_anchor}  λ_ratio={config.lambda_ratio}  "
-          f"ratio_tol={config.ratio_tol}")
     print(f"  presence_frac={config.presence_frac}  w_low_min={config.w_low_min}")
+    tag = ('【消融: 参与反向传播】' if config.freq_constraints_active
+           else '【方案 A: 已降级为诊断, 不参与反向传播】')
+    print(f"  λ_anchor={config.lambda_anchor}  λ_ratio={config.lambda_ratio}  "
+          f"ratio_tol={config.ratio_tol}  {tag}")
+    if not config.freq_constraints_active:
+        print(f"      理由: 重排落点不可学, 三项只能经 σ 操纵测量窗内能量质心;"
+              f" 且实测五类 BPF_LINE 质心跨 0.74 Hz < ±1.5 Hz 容差。")
     print(f"  节点 ({len(PUMP_TURBINE_REGIONS)} 物理节点, B4 拆节点):")
     for r in PUMP_TURBINE_REGIONS:
         anch = '—' if r.f_anchor is None else f'{r.f_anchor:.3f}±{r.anchor_tol}Hz'
-        print(f"    {r.name:<10s} [{r.f_min:.0f},{r.f_max:.0f}] Hz  {r.f_type:<15s} "
+        print(f"    {r.name:<10s} [{r.f_min:.1f},{r.f_max:.1f}) Hz  {r.f_type:<15s} "
               f"w∈[{r.w_range_low},{r.w_range_high}]  锚 {anch}")
     if has_val:
         print(f"  Val split: {config.val_split:.0%} (KNN accuracy via z_freq centroids)")
@@ -259,20 +297,46 @@ def main():
     # ═══════════════════════════════════════════════════════════
     # 5. Training loop
     # ═══════════════════════════════════════════════════════════
-    N_train = len(X_train)
     best_val_acc = 0.0
+
+    if config.balanced_p > 0:
+        # 每 epoch 用 seed+epoch 的独立 Generator -> 采样可复现且跨 epoch 不同。
+        # 打印一次类直方图 + 各类每 epoch 期望出现次数 (供论文报告过采样倍数)。
+        _demo = build_balanced_batch_indices(
+            y_train, config.balanced_p, config.balanced_k, 1,
+            rng=np.random.default_rng(config.seed))
+        print(f"\n  [P×K] batch 0 类别直方图: "
+              f"{np.bincount(y_train[_demo[0]], minlength=int(y_train.max()) + 1).tolist()}"
+              f"  (共 {_demo.shape[1]} 个样本)")
+        cls_pool = np.bincount(y_train, minlength=int(y_train.max()) + 1)
+        n_cls = int((cls_pool > 0).sum())
+        # 每个类被抽中的概率 = k/n_cls, 每次抽 p 个
+        mult = n_batches * config.balanced_p * (config.balanced_k / max(1, n_cls)) \
+            / np.maximum(cls_pool, 1)
+        for c in range(len(cls_pool)):
+            if cls_pool[c] == 0:
+                continue
+            print(f"        class {c}: 池 {cls_pool[c]:>5d} -> 每 epoch 约 "
+                  f"{mult[c] * cls_pool[c]:>6.0f} 次 ({mult[c]:.2f}×)")
 
     for epoch in range(start_epoch, start_epoch + config.epochs):
         model.train()
         freq_encoder.train()
 
-        perm = torch.randperm(N_train)
-        n_batches = max(1, N_train // config.batch_size)
+        if config.balanced_p > 0:
+            batches = build_balanced_batch_indices(
+                y_train, config.balanced_p, config.balanced_k, n_batches,
+                rng=np.random.default_rng(config.seed + epoch))
+        else:
+            perm = torch.randperm(N_train)
         epoch_losses = {}
         epoch_start = time.time()
 
         for bi in range(n_batches):
-            idx = perm[bi * config.batch_size:(bi + 1) * config.batch_size]
+            if config.balanced_p > 0:
+                idx = batches[bi]
+            else:
+                idx = perm[bi * eff_batch:(bi + 1) * eff_batch]
             batch_x = torch.from_numpy(X_train[idx]).float().to(device)
             batch_y = torch.from_numpy(y_train[idx]).long().to(device)
 
@@ -306,6 +370,7 @@ def main():
                 ratio_tol=config.ratio_tol,
                 presence_frac=config.presence_frac,
                 w_low_min=config.w_low_min,
+                freq_constraints_active=config.freq_constraints_active,
             )
 
             # Additional diagnostics
@@ -344,17 +409,31 @@ def main():
               f"w_m={epoch_losses.get('w_mean', 0):.3f} "
               f"w_s={epoch_losses.get('w_spread', 0):.3f} "
               f"g={epoch_losses.get('gate_mean', 0):.3f}")
+        # 频率约束的诊断量 (方案 A 下不参与反向传播, 但须逐 epoch 记录:
+        # 这正是"锚在不被约束时也天然满足"的论文证据)。wλ 为生效乘数。
+        print(f"         [诊断] anc={epoch_losses.get('anchor', 0):.4f} "
+              f"rat={epoch_losses.get('ratio', 0):.4f}  "
+              f"wλ(p/a/r)={epoch_losses.get('w_physics', 0):.1f}/"
+              f"{epoch_losses.get('w_anchor', 0):.1f}/"
+              f"{epoch_losses.get('w_ratio', 0):.1f}")
+        for _r in PUMP_TURBINE_REGIONS:
+            _ih = epoch_losses.get(f'if_hat_{_r.name}', 0.0)
+            _pr = epoch_losses.get(f'presence_{_r.name}', 0.0)
+            _tail = (f"|锚-if_hat|={abs(_r.f_anchor - _ih):.3f}"
+                     if _r.f_anchor is not None else "(无锚)")
+            print(f"                {_r.name:<10s} if_hat={_ih:7.3f} Hz  "
+                  f"presence={_pr:.3f}  {_tail}")
 
         # ── Validation (KNN via z_freq centroids) ──
         if has_val:
             n_centroid = min(200, len(X_train))
             centroids = compute_class_centroids(
                 model, freq_encoder, X_train[:n_centroid], y_train[:n_centroid],
-                batch_size=max(1, config.batch_size), device=device,
+                batch_size=max(1, eff_batch), device=device,
             )
             val_metrics = evaluate_accuracy(
                 model, freq_encoder, X_val, y_val, centroids,
-                batch_size=max(1, config.batch_size), device=device,
+                batch_size=max(1, eff_batch), device=device,
             )
             acc = val_metrics['accuracy']
             marker = ' *' if acc > best_val_acc else ''
@@ -386,6 +465,7 @@ def main():
                     ratio_tol=config.ratio_tol,
                     presence_frac=config.presence_frac,
                     w_low_min=config.w_low_min,
+                    freq_constraints_active=config.freq_constraints_active,
                 )
                 # Attach losses to results for title context
                 viz_results['_losses'] = viz_losses

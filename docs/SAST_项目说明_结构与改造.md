@@ -1,0 +1,728 @@
+# SAST 项目说明：结构、端到端流程与本次改造
+
+> 用途：让外部模型快速掌握本项目的模型结构、执行流程，以及一次改造（代号 **B4 拆节点 + A2 可微节点频率**）前后的差异。
+> 代码仓库：`D:\aifile\SAST`，分支 `feat/band-split-differentiable-node-if`。
+> 改造提交：`942fe85`（主体）、`649f384`（修补遗漏）。改造前的版本即 `942fe85^`。
+
+---
+
+## 1. 项目定位
+
+**SAST = Structure-Aware Synchrosqueezing Transform（结构感知同步压缩变换）**。
+
+把多阶同步压缩变换（MSST）给出的瞬时频率（IF）轨迹，用一张"水泵水轮机物理结构图"组织起来，由图注意力网络（GAT）为每个物理节点、每一帧输出一个可信度 `w_i`，再用 `w_i` 控制时频重排（reassign）时每个频率 bin 的核宽，从而得到**自适应压缩**的时频图。监督信号来自工况标签，但模型**不做工况分类**，只用标签定义对比学习的正负对。
+
+| 项 | 值 |
+|---|---|
+| 输入 | 单通道振动信号，2000 点，fs = 1000 Hz（2 秒） |
+| 数据集 | `5_dataset.npz`，共 9669 样本 |
+| 工况类别 | `['空转','低负荷','中负荷','高负荷','抽水']`，样本数 293 / 2637 / 879 / 5274 / 586 |
+| 图 | `B, F, T` = batch、1000 频率 bin（0–500 Hz，0.5 Hz/bin）、2000 帧 |
+
+---
+
+## 2. 机器物理与频率约定
+
+| 量 | 值 | 说明 |
+|---|---|---|
+| 额定转速 `n` | 333.3 rpm | → 转频 `f_rot` = 5.5550 Hz |
+| 转轮叶片数 `Z_r` | 9 | |
+| 1×BPF | `Z_r·f_rot` = **49.995 Hz** | 与 50 Hz 电网频率相差 0.005 Hz，低于 0.5 Hz 分辨率，二者不可分辨 |
+| 2×BPF | 2·`Z_r·f_rot` = **99.990 Hz** | 实测 100.10 Hz（+0.108 Hz），低/中/高/抽水逐样本标准差 0.000 |
+
+⚠ 不要用"空转 ≈ 45.65% 转速 → 22.82 Hz"来区分 1×BPF 与电网频率：**该假设已被实测证伪**，22.82 Hz 处没有任何谱线，空转的主导峰在 45.9–46.4 Hz。详见 §14.4。
+
+**分量分类的正确依据是"是否锁定转速"，不是"机械 / 水力"：**
+
+| 类别 | 判据 | 例子 |
+|---|---|---|
+| **转速锁定分量** | f = k·`Z_r`·`f_rot`，位置唯一确定 | 1×BPF、2×BPF |
+| **工况漂移分量** | 频率由流动不稳定性（水头/负荷/导叶开度）决定，不锁转速 | 涡带、压力脉动、46–49 Hz 宽峰 |
+
+注意：动静干涉（RSI）本身也是流体激励，用"机械/水力"去分类是错的；应看频率是否锁转速。
+
+---
+
+## 3. 核心术语
+
+### 3.1 节点（物理频带）
+
+| 节点 | 频带 | `f_type` | 绝对锚 | `w_i` 允许范围 | 预期带宽 |
+|---|---|---|---|---|---|
+| LOW_FREQ | 2–18 Hz | HYDRAULIC | 无 | 0.10–0.45 | 12 Hz |
+| BPF_DRIFT | 42–48 Hz | BLADE_DRIFT | 无 | 0.10–0.50 | 6 Hz |
+| BPF_LINE | 48–53 Hz | BLADE_PASS | 49.995 ± 1.5 | 0.65–0.95 | 1.5 Hz |
+| 2xBPF | 90–105 Hz | BLADE_HARMONIC | 99.990 ± 1.5 | 0.65–0.90 | 2 Hz |
+
+`f_type` 中 HYDRAULIC 与 BLADE_DRIFT 被划为**软分量**（频率由流动决定，不该被压缩锐化）。
+
+### 3.2 两类节点频率（本次改造的核心概念）
+
+模型同时维护两个"节点频率"，用途**严格分开**：
+
+| | `IF_obs` | `IF_hat` |
+|---|---|---|
+| 来源 | MSST 的 `omega_final`，按频带聚合 | **增强后**时频图在频带内的能量质心 |
+| 形状 | `[B, N_phys, T]` | `[B, N_phys, T]` |
+| 有梯度 | **没有**（只依赖输入信号） | **有**（增强图依赖 `w_i → sigma → 重排`） |
+| 用途 | 边特征、边门控、bin→节点分配（**路由**） | `L_anchor`、`L_ratio`（**约束**） |
+| 实现 | 类 `MSSTNodeExtractor` | 函数 `band_centroid_if()` |
+
+### 3.3 其他
+
+- **presence（分量存在度）**：`[B, N_phys, T] ∈ [0,1]`，由**原始**（未增强）谱算出的带内能量集中度，用于门控 `w_range` / `balance` / `anchor`。必须用原始谱，否则模型可以靠制造尖锐谱线来抬高它。
+- **门控 `gate_edge` / `gate_node`**：由边特征决定的 0–1 权重，控制注意力强弱。
+
+---
+
+## 4. 端到端执行流程（当前版本，逐步骤标注与旧版的差异）
+
+### 第 1 步 STFT —— 无变化
+
+短时傅里叶变换 → `tfr_mag [B, 1000, 2000]`。无可学习参数。
+
+### 第 2 步 MSST 估计瞬时频率 —— 无变化
+
+多阶同步压缩 → `omegas [B, 3, 1000, 2000]`（MSST 保存的 IF 轨迹列表，取**最后一阶**为 `omega_final`）。无可学习参数。
+
+### 第 3 步 节点特征提取 —— **变化最大**
+
+把 0–500 Hz 切成频带，对每个频带、每一帧统计 4 个量：
+
+| 量 | 定义 | 有梯度 |
+|---|---|---|
+| `node_if` | 带内瞬时频率的代表值 | 否 |
+| `node_energy` | 带内总能量，取 `log1p` | 否 |
+| `node_bw` | 带内瞬时频率的标准差（带宽） | 否 |
+| `node_persist` | 整段信号中有能量的帧占比 | 否 |
+
+**变化 ①：频带数 3 → 4。**
+- 旧：`LOW_FREQ [2,18]`、`BPF [42,55]`、`2xBPF [90,105]`
+- 新：`LOW_FREQ [2,18]`、**`BPF_DRIFT [42,48]`**、**`BPF_LINE [48,53]`**、`2xBPF [90,105]`
+
+**变化 ②：`node_if` 的聚合方式，带内无权重中位数 → 带内能量加权平均。**
+计算式：`node_if = Σ(w·f) / Σw`，`w` = 该 bin 的 STFT 能量；带内无能量时退回算术均值。
+
+### 第 4 步 工况上下文 —— **有修补**
+
+由 4 个节点的能量算 4 维比例向量 `V_obs`，与 5 个离线统计的工况原型 `STATIC_PROTOTYPES [5,4]` 做余弦相似度，`softmax` 得权重 `alpha [B,T,5]`，加权混合可学习嵌入得 `cond_ctx [B,T,32]`。不输出工况类别。
+
+`V_obs = [R_LF, R_BPF, R_2xBPF, log10(E_BPF / E_2xBPF)]`
+
+**修补**：旧代码按位置索引 `E_lin[:,0]/[:,1]/[:,2]`。拆节点后位置语义全变（索引 2 变成 BPF_LINE，2xBPF 在索引 3 完全没被读到）。现改为按节点名取，并把 `E_bpf = E_drift + E_line` 合并回"BPF 族"，使 `V_obs` 的 4 维语义与冻结原型一致，**无需重做 EDA**。
+
+### 第 5 步 边特征 —— **有变化**
+
+每条边每帧算一个 5 维特征，5 维含义随边类型不同：
+
+| 边类型 | 5 维含义 |
+|---|---|
+| INTEGER_HARMONIC | 实测比值 `r_obs`、`r_obs` 波动、两端能量相关、边权重、两端最小持续性 |
+| CONDITION | 工况匹配度 `cond_sim`、其余留空 |
+| DRIFT | 能量相关、对数能量比、带宽耦合、边权重、最小持续性 |
+| ENERGY_COMPETITION | 负能量相关、对数能量比、比值稳定度、边权重、最小持续性 |
+
+**变化**：边数 10 → 11，倍频边改接。详见第 6 节。
+
+### 第 6 步 PPM + GAT → `w_i` —— 结构不变，规模随节点数变化
+
+**PhysicsPrototypeMemory (PPM)**：
+- 物理节点初始表示 = `[频率/BW/能量/持续性]` 线性投影 + 频带类型嵌入（`f_type`）+ 可学习原型嵌入
+- 节点 ↔ 原型交叉注意力（带 3.0 的自注意力偏置）→ `proto_context`
+- 边门控 `gate_node` 融合：`h = (1-g)·h_raw + g·proto_context`
+- 虚拟节点 OP 由 `cond_ctx` 投影得到
+
+**GAT**：2 层、4 头，边特征参与注意力计算。
+
+输出：
+- **`w_i [B, 4, 2000]`** — 每个物理节点每一帧的可信度 ∈ (0,1)
+- `A_ij [B, 11, 4, 2000]` — 每条边每一帧的注意力
+
+### 第 7 步 `w_i` → 核宽 → 重排 —— 无变化
+
+```
+sigma_i = sigma_min + (1 - w_i) × (min(sigma_max, 3.0) - sigma_min)
+```
+`sigma_min=0.5`、`sigma_max=15.0`，但有效上限被 `sigma_soft_cap=3.0` 截断（否则 `w_i≈0.3` 的保守节点会拿到 `sigma≈10.7` bin，高斯重排把低频脊线摊平）。
+
+每个频率 bin 按 `|f − node_if|` 取 `argmin` 分配给最近节点，用该节点的 `sigma`。
+
+**重排**：把每个 bin 的能量沿 `omega_final` 搬走，落点用宽度 `sigma` 的高斯核铺开。
+- 训练：单遍完成，可微
+- 推理：按 per-bin 轮数迭代，轮数 = `round(λ_node × ridge_factor)`，由 `SqueezeIterationController` 决定
+
+输出 `tfr_enhanced [B, 1000, 2000]`。
+
+### 第 8 步 损失 —— **改动两项、新增一项**
+
+见第 7 节。
+
+---
+
+## 5. 图结构对照
+
+### 旧图（4 节点 / 10 边）
+
+```
+节点: [0] OP, [1] LOW_FREQ, [2] BPF, [3] 2xBPF
+
+OP → LOW_FREQ / BPF / 2xBPF     CONDITION  ×3   w=0.6
+LOW_FREQ ↔ BPF                  DRIFT      ×2   w=0.15
+BPF → 2xBPF                     HARMONIC   ×1   r=2.0, w=0.8
+LOW_FREQ ↔ 2xBPF                COMPETITION ×2  w=0.25
+BPF ↔ 2xBPF                     COMPETITION ×2  w=0.20
+```
+
+### 新图（5 节点 / 11 边）
+
+```
+节点: [0] OP, [1] LOW_FREQ, [2] BPF_DRIFT, [3] BPF_LINE, [4] 2xBPF
+
+OP → LOW_FREQ / BPF_DRIFT / BPF_LINE / 2xBPF   CONDITION  ×4  w=0.6
+LOW_FREQ ↔ BPF_DRIFT                            DRIFT      ×2  w=0.15
+BPF_LINE → 2xBPF                                HARMONIC   ×1  r=2.0, w=0.8
+LOW_FREQ ↔ 2xBPF                                COMPETITION ×2  w=0.25
+BPF_DRIFT ↔ 2xBPF                               COMPETITION ×2  w=0.20
+```
+
+两处实质变化：
+1. **倍频边改接**：`BPF → 2xBPF` 变成 `BPF_LINE → 2xBPF`。只有位置锁转速的那条线才可能是 2xBPF 的基频。
+2. **DRIFT 边改接**：`LOW_FREQ ↔ BPF` 变成 `LOW_FREQ ↔ BPF_DRIFT`。漂移边只连两个"不锁转速"的分量。
+
+---
+
+## 6. 为什么要改：旧版的四个问题
+
+### 问题 1：频带粒度混装
+
+旧 `BPF [42,55]` 一个带里装了两类性质完全不同的东西：
+
+| 成分 | 频率 | 锁转速 | 期望核宽 |
+|---|---|---|---|
+| 转速锁定线 | ~49.995 Hz，宽 ≤1 Hz | 是 | 极窄（该挤） |
+| 工况漂移宽峰 | 46–49 Hz，宽 2–3 Hz | 否 | 宽（不该挤） |
+
+但模型对一个带只输出一个标量 `w_i`（进而一个 `sigma`），一个 `sigma` 无法同时"挤窄线"和"留宽峰"，训练只能收敛到折中值。
+
+### 问题 2：唯一的物理锚实际上没起作用
+
+`L_anchor` 的作用是防止两个频带的频率被**同时同比例**高估/低估——比值约束对此完全无感，因为比值是**尺度不变量**（`f_dst/f_src` 在共模缩放下不变）。
+
+但旧版把锚在 `node_if` 上，而 `node_if` **没有 `grad_fn`**（只依赖输入信号）。因此：
+
+- `L_anchor` 在任何频率量上的梯度恒为 **0**
+- 模型可以在完全不满足 `f(2xBPF) = 2·f(BPF_LINE)` 的条件下把这一项降到最低
+
+同理 `L_physics` 的 `ℓ` 由 `edge_feats`（源自 `node_if`）构造，也是常数，**唯一可微输入是注意力 `A_ij`**。
+
+数值验证（`scripts/test/probe_physics_grad.py`）：
+
+| 量 | 值 |
+|---|---|
+| 倍频边 `ℓ` | 0.065 |
+| 倍频边 `w·ℓ` | **0.052**（全图 11 条边中最小的） |
+| `∂L_physics/∂A_harmonic` | **−0.00093 < 0** |
+
+结论：梯度下降反而**增大**对该边的注意力。也就是说 `L_physics` 没有约束频率，只是产生了一个与样本无关的固定注意力先验。
+
+### 问题 3：`r_obs = 2.13 ≠ 2.00` 是聚合口径造成的假象，不是物理不一致
+
+实测证据（旧聚合口径）：
+
+| 节点 | 带内能量峰 | IF 聚合值（中位数） | 偏差 |
+|---|---|---|---|
+| LOW_FREQ | 2.00–8.38 Hz | 11.92–14.27 Hz | 被抬到频带几何中心 |
+| BPF | 46.42–48.75 Hz | 46.12–48.16 Hz | 被漂移宽峰拉低 |
+| 2xBPF | 100.00–100.38 Hz | 97.37–99.46 Hz | 同样被拉向带中 |
+
+中位数与能量无关：宽带（LOW_FREQ 宽 16 Hz）里绝大多数 bin 是噪声，中位数落在频带中间。于是 `r_obs` 被算成 2.13。**问题 3 是问题 2 症状的成因。**
+
+### 问题 4：`compute_V_obs` 的节点索引
+
+拆节点后按位置索引会静默取错节点（见第 4 节第 4 步）。
+
+---
+
+## 7. 损失函数对照
+
+### 旧版：9 项
+
+| 项 | λ | 作用 |
+|---|---|---|
+| `L_supcon` | 1.0 | 监督对比（Khosla 2020），同工况表示拉近、不同工况推远 |
+| `L_entropy`（Rényi 2D） | 0.1 | 鼓励时频图能量集中 |
+| `L_physics` | 0.5 | 让注意力与物理一致性对齐 |
+| `L_balance` | 0.5 | 防退化 |
+| `L_var` | 0.5 | 控制 `w_i` 分布宽度 |
+| `L_consistency` | 0.3 | `w_i` 时间平滑 |
+| `L_lowfreq` | 0.05 | 低频脊线锐化 |
+| `L_range` | 0.3 | `w_i` 逐帧限制在节点允许范围内（按 presence 松弛） |
+| `L_anchor` | 0.2 | 绝对频率锚（**作用在 `node_if` 上，无效**） |
+
+### 新版：10 项
+
+| 项 | λ | 变化 |
+|---|---|---|
+| `L_supcon` | 1.0 | — |
+| `L_entropy` | 0.1 | **跳过 HYDRAULIC / BLADE_DRIFT 两个软频带** |
+| `L_physics` | 0.5 | 保留（已知只影响注意力先验，不约束频率） |
+| `L_balance` | 0.5 | `w_min`/`w_max` 改为按节点的 `[N_phys]` 张量 |
+| `L_var` / `L_consistency` / `L_lowfreq` | 0.5 / 0.3 / 0.05 | — |
+| `L_range` | 0.3 | — |
+| `L_anchor` | 0.2 | **改为作用在可微的 `if_hat` 上** |
+| **`L_ratio`** | **0.2** | **新增** |
+
+新增项定义：
+
+```
+ell_m = clamp( |f_dst/f_src − r_nom| / r_nom − tol, 0 )        tol = 0.06
+L_ratio = Σ_m mean_t[ ell_m × min(presence_src, presence_dst) ]
+```
+
+`L_anchor` 与 `L_ratio` 都采用 **flat-bottom hinge**：只有超出容差的漂移才被惩罚，真实工况漂移不罚；且二者互补——比值是尺度不变量（管形状），锚提供绝对参考系（管尺度）。
+
+---
+
+## 8. 本次改造清单
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `models/sast_nodes.py` | 频带 3 → 4（BPF 拆为 BPF_DRIFT / BPF_LINE） |
+| 2 | `models/sast_nodes.py` | `node_if` 聚合：带内中位数 → 带内能量加权平均（numpy 与 GPU 两条路径都改） |
+| 3 | `models/sast_nodes.py` | 新增 `band_centroid_if()`，得到可微的 `if_hat` |
+| 4 | `models/sast_nodes.py` | 新增 `SOFT_F_TYPES = ('HYDRAULIC','BLADE_DRIFT')` |
+| 5 | `models/sast_graph.py` | 图 4 节点 / 10 边 → 5 节点 / 11 边；倍频边改接 BPF_LINE |
+| 6 | `models/sast_losses.py` | Rényi 2D 熵跳过软频带；`L_anchor` 改作用在 `if_hat`；新增 `L_ratio` |
+| 7 | `models/sast.py` | `compute_V_obs` 按新节点布局取能量（修补遗漏）—— **随后被 §15.7 取代**：`V_obs` 4 → 6 维、`expm1` 修正、`STATIC_PROTOTYPES` 按 4 节点重算 |
+| 8 | `sast_config.py` / `train_sast.py` | 新增超参 `lambda_ratio=0.2`、`ratio_tol=0.06` |
+| 9 | `scripts/**` | 4 个按 3 节点硬编码的脚本改为从 `PUMP_TURBINE_REGIONS` / `PHYSICS_EDGES` 导出；`analyze_band_compressibility.py` 的测量频带随 B4 一并拆成 4 段 |
+
+> **本节记录的是 B4 拆节点那一轮。其后的边界解耦 / 窗软化 / 均衡采样 / 原型重算 / 频率约束降级见 §15。**
+
+---
+
+## 9. 代码文件地图
+
+| 文件 | 内容 |
+|---|---|
+| `models/tfr.py` | MSST / WSST2 / SST2 等 TFR 基座 + CUDA STFT wrapper |
+| `models/sast_nodes.py` | `FreqRegion` / `PUMP_TURBINE_REGIONS`（节点定义）、`band_centroid_if`（可微 IF）、`MSSTNodeExtractor`（节点特征提取，含 numpy 与 GPU 两条路径） |
+| `models/sast_graph.py` | 节点索引、`PHYSICS_EDGES`（图定义）、`compute_edge_features`（numpy）与 `compute_edge_features_torch`（GPU 向量化） |
+| `models/sast.py` | `StaticPrototypeMatcher`、`PhysicsPrototypeMemory`(PPM)、`EdgeConditionedGAT`、`SqueezeIterationController`、`SparseGaussianReassigner`、主模块 `SAST.forward` |
+| `models/sast_losses.py` | 全部损失函数 + `FreqEncoder` + `total_sast_loss` |
+| `sast_config.py` | `SastConfig`（所有超参的唯一来源）+ `set_seed` |
+| `sast_model.py` | `create_model` / `create_freq_encoder` / `load_checkpoint` |
+| `train_sast.py` | 训练入口（CLI） |
+| `deploy/sast_export_model.py` | ONNX / TensorRT 导出（节点数已泛化） |
+| `scripts/test/` | `probe_physics_grad.py`（梯度流向探针）、`smoke_anchor_presence.py`（锚 / presence 冒烟）、`benchmark_sast.py` |
+| `scripts/analysis/` | `probe_node_if.py`（节点 IF 口径体检）、`analyze_band_compressibility.py`（频带可压缩性）、`summarize_sast_per_class.py`、`check_spectral_bands.py`、`probe_harmonic_comb.py` |
+
+---
+
+## 10. 关键超参
+
+| 参数 | 值 | 参数 | 值 |
+|---|---|---|---|
+| `fs` | 1000 | `d_h` | 96 |
+| `max_len` | 2000 | `n_heads` | 4 |
+| `sigma_min` | 0.5 | `n_layers` | 2 |
+| `sigma_max` | 15.0 | `msst_num` | 4 |
+| `sigma_soft_cap` | 3.0（代码内常量） | `d_cond` | 32 |
+| `n_sqz_max` | 4 | `f_type_embed_dim` | 16 |
+| `epochs` | 20 | `ppn_temperature` | 0.08 |
+| `batch_size` | 2 | `prototype_temperature` | 0.1 |
+| `lr` | 1e-3 | `dropout` | 0.1 |
+| `grad_clip` | 1.0 | `seed` | 42 |
+| `presence_frac` | 0.1 | `w_low_min` | 0.05 |
+| `val_split` | 0.15 | | |
+
+⚠ `batch_size` 有**配置分歧**：`sast_config.py:36` 默认 2，`train_sast.py:79` 的 CLI 默认 8（help 明确写"SupCon 需 batch 内同工况正样本对, 建议 >=8"）。正常训练走 CLI，实际是 8；直接构造 `SastConfig()` 会落到 2，而 B=2 会让 SupCon 在约 61.5% 的 batch 上不产生任何梯度。详见 §14.3。
+
+---
+
+## 11. 验证结果（改造后，均为实测）
+
+| 检查 | 结果 |
+|---|---|
+| numpy 与 GPU 两条 IF 聚合路径 | 一致到 2 位小数：2.35 / 47.21 / 49.19 / 99.48 Hz |
+| LOW_FREQ 的 IF | 旧口径 11.9–14.3 Hz → 新口径 **2.37 Hz**（落在能量实际所在处） |
+| 端到端 forward + backward | 形状正确：`w_i [B,4,T]`、`A_ij [B,11,4,T]`、`tfr_enhanced [B,1000,T]` |
+| `L_anchor` flat-bottom | 质心在容差带内梯度为 0；越界后非零（1.80 Hz→0.307、2.55 Hz→1.058） |
+| `L_ratio` 可微性 | `r_obs=2.133`（相对偏差 6.65% > 6%）时 `dL_ratio/dκ = +4.94e-2 ≠ 0` |
+| `L_physics` 对频率量 | 梯度仍恒为 0（这是它本身的性质，未改变） |
+
+合成验证信号：3 / 47 / 50 / 100 Hz 四条正弦线叠加。
+
+> ⚠ **两处引用说明**（防止后续被误读）：
+> 1. 上表 49.19 Hz 是**合成信号**上 `IF_obs` 的 numpy / GPU 两条路径一致性测试值，**不是**实测数据的 `IF_hat` 串扰量。实测 `IF_hat[BPF_LINE]` 的五类质心为 49.294–50.033 Hz（改前）/ 49.807–50.298 Hz（改后），见 §15.3。
+> 2. 本表的数值均为**改前**口径。§15 引入过渡带加权后，提取器/质心/损失的绝对数值均已变化，本表数字不可与新口径直接对照。
+
+---
+
+## 12. 已知遗留问题
+
+> 状态截至 §15 那一轮之后。已解决项保留在表中并标注修订位置，便于追溯。
+
+1. **旧 checkpoint 不兼容**，必须重训。（仍然成立，且原因增加：`PROTOTYPE_DIM` 4→6）
+   `C_prior_logit`、`prototype_embed`、`f_type_embed` 的维度都随节点数变化。
+2. ~~**工况原型仍基于旧 3 频带划分离线统计**~~ → **已在 §15.7 解决**。
+   按 4 节点重做，`V_obs` 4 → 6 维（新增 `log10(E_DRIFT/E_LINE)` 判别子），并修正了 `exp(log1p(·)) = 1+x` 的换算错误与原型/在线归一化不一致。新表见 §15.7。
+3. ~~**`L_physics` 是否保留待定**~~ → **已在 §15.5 定案（方案 A）**。
+   `L_physics` / `L_anchor` / `L_ratio` 三项一并降级为诊断量，不进 `L_total`；`--freq_constraints_active` 可一键复现原行为。
+4. **论文文档已过时**（**未解决，本轮范围外**）。
+   `docs/SAST_汇报与论文初稿.docx` 的 §4.2.4(6) 及第 4/5 章中"4 节点 / 10 条边"的描述与数字（如 `∂L/∂A = −0.00087`）需按新拓扑更新（新值 −0.00093，`ℓ=0.065`、`w·ℓ=0.052` 不变）；还需补 §15 的边界变更、`bw_expected` 新值、P×K 与 6 维 `V_obs`。
+   另有 `scripts/doc/build_sast_docx.js:560`（"46.4 Hz 与理论值 2×Z_r×f_rot,空转 = 45.6 Hz 吻合"）承袭已被证伪的 45.65% 前提，需一并改写。
+5. **待定设计项**：节点 IF 的聚合口径、频带粒度，记录在 `待补充实验清单.md`（该文件 .gitignore，仅本地）。
+   频带粒度已在 §15.2 定案（48.5 + 半开 + 单位分解过渡带）。
+6. ~~**"空转 45.65% 转速 → 22.82 Hz"的说法需从论文与脚本注释中清除**~~ → **脚本侧已在 §15.8 清除**。
+   `check_spectral_bands.py` 与 `probe_harmonic_comb.py` 已删 `F_ROT_IDLE` / `F_IDLE_ROT` 及其梳齿候选；论文草稿侧仍待处理（见第 4 条）。
+7. **ONNX 导出脚本缺依赖**（新发现）。
+   `deploy/export_sast_onnx.py` 在 `torch.onnx.export` 处报 `ModuleNotFoundError: No module named 'onnxscript'`（新版 torch 的导出器依赖该包，`my_work` 环境未装）。导出模型的**数值**已另行验证与训练侧逐位一致（§15.8），仅 ONNX 写盘这一步被阻塞。修复：`pip install onnxscript`。
+
+---
+
+## 13. 复现命令
+
+```bash
+# 图结构冒烟（输出 5 节点 / 11 边）
+python -m models.sast_graph
+
+# 损失冒烟（输出 10 项损失 + 逐节点 presence / if_hat）
+python -m models.sast_losses
+
+# 锚 / presence / 比值约束冒烟
+python scripts/test/smoke_anchor_presence.py
+
+# L_physics 梯度流向探针
+python scripts/test/probe_physics_grad.py --r-obs 2.13
+
+# 节点 IF 聚合口径与存在度体检（需 5_dataset.npz）
+python scripts/analysis/probe_node_if.py --per-class 12
+```
+
+运行脚本使用 conda 环境 `my_work`；Windows 下打印中文需 `PYTHONUTF8=1`。
+
+---
+
+## 14. 补充核对：三处细节的代码 / 数据级答案
+
+### 14.1 `band_centroid_if()` 是否只在硬边界内求能量加权频率均值
+
+**是，完全如此。** 实现在 `models/sast_nodes.py:143-187`，逐节点做：
+
+```python
+m    = (freqs >= r.f_min) & (freqs <= r.f_max)      # 硬边界, 两端闭区间
+E    = tfr.abs().pow(2)                              # 能量 = 幅值平方
+cent = (E * freqs[m]).sum(dim=band) / E.sum(dim=band)  # 逐帧能量加权频率均值
+```
+
+- **矩形硬边界**：无窗函数、无软锥度、无过渡带、无重叠。
+- **无任何可学习参数**。它只是把 `tfr_enhanced` 映射成可微频率的一个量；`E` 对 `tfr` 是二阶齐次，梯度良态。
+- 带内 `ΣE ≤ 1e-12` 时退化为频带中心 `(f_min + f_max)/2`。
+- ⚠ **48.0 Hz 这一个 bin 同时属于 BPF_DRIFT 与 BPF_LINE**（前者 `f_max=48`，后者 `f_min=48`，两端都是闭区间；频率轴步长 0.5 Hz，48.0 是真实 bin）。因此它在两个节点里各被计一次。量级影响很小，但严格说节点划分在该 bin 上不互斥。
+
+### 14.2 `SparseGaussianReassigner` 中是否另有可学习参数改变重排落点频率
+
+**没有。落点频率完全不可学，只有一个通道能影响重排，而它只改变核宽、不改变落点。**
+
+| 量 | 来源 | 可微 |
+|---|---|---|
+| 落点 `omega_hat_int` | `omegas[:, -1]`（MSST 输出）→ `.round().long()` | **否**（离散整数索引，无 `grad_fn`） |
+| `sigma` | `w_i` → N(0,σ) 核宽 | 是 |
+| `lambda_i`（推理轮数） | `round(w_i·N_max).long()` | 否（整数） |
+| `ridge_factor` | `argmin` 掩码 + `node_if` | 否 |
+
+关键代码 `models/sast.py:788-789`：
+
+```python
+omega_final   = omegas[:, -1, :, :].float()                        # MSST 估计, 无 grad_fn
+omega_hat_int = (omega_final - 1.0).clamp(0, F - 1).round().long()  # 整数索引
+```
+
+`ReassignerFunction.backward` 一律 `return None, grad_sigma, None, None, None`（见 `models/sast.py:708/716/741`）：梯度**只回传给 `sigma`**，对 `omega_hat_int` 返回 `None`，**对 `tfr_weighted` 也返回 `None`**。`SqueezeIterationController` 里没有任何 `nn.Parameter`。
+
+因此：**`w_i` 经由 `sigma_i` 改变的只是高斯核的宽度（能量散布范围），落点的位置完全由 MSST 固定。若把"落点频率"理解为高斯核中心，则没有任何可学习参数参与改变它。**
+
+这与 §3.2 的 `IF_obs` 是一体两面：**路由（bin→节点）与重排落点都来自 MSST，都不参与梯度。**
+
+### 14.3 `L_supcon` 的输入张量形状（batch_size = 2）
+
+**先池化成整段向量，再进 MLP。`batch_size = 2` 时输入 `supcon_loss` 的就是 `z_freq [2, 128]`——只有 2 个向量。**
+
+`models/sast_losses.py:62-72`（`FreqEncoder.forward`）：
+
+```python
+feat = tfr.mean(dim=-1)          # [B, F]  —— 沿整条时间轴 GlobalAvgPool
+feat = torch.log1p(feat)
+z    = MLP(feat)                 # [B, 128], LayerNorm 替代 BatchNorm
+z    = F.normalize(z, dim=-1)
+```
+
+- **没有在时间帧维度切子窗口，也不存在 `[B·N_win, D]` 这种构造**；全代码库无任何窗口切分逻辑。每个 2 秒样本 → 1 个 128 维向量。
+- 后果：`supcon_loss`（`sast_losses.py:96-127`）在 B=2 时，若两样本工况不同，`has_pos.any()` 为 `False` → **直接返回 `0.0`，梯度为零**（`sast_losses.py:119-121`）。
+- 按训练集分布（空转 234 / 低负荷 2110 / 中负荷 703 / 高负荷 4219 / 抽水 469，共 7735），随机 2 样本同工况的概率 = `Σ p² ≈ 0.385`。即 **B=2 时约 61.5% 的 batch 完全不产生对比梯度**。
+- 配置分歧：`sast_config.py:36` 默认 `batch_size = 2`，而 `train_sast.py:79` 的 CLI 默认是 8。按 CLI 走是 8 没问题；任何直接构造 `SastConfig()` 的入口会落到 2。
+
+### 14.4 空转样本的实际谱峰：不是 22.82 Hz，也不是 50 Hz
+
+**结论：空转（293 个样本）的主导谱峰在 45.90–46.39 Hz。22.82 Hz 处没有谱线。**
+
+本项目自己的普查结果（`results/band_census/`，仅用 train 集）与本次对全量 293 个样本的复测一致。
+
+`peak_census.csv` — 空转的候选峰：
+
+| 候选 | 逐样本峰位中位 | 逐样本 std | 相对电平 | 存在率 |
+|---|---|---|---|---|
+| 45.90 Hz | **46.39 Hz** | 0.611 Hz | **0.00 dB（最强）** | 1.00 |
+| 1.95 Hz | 1.95 Hz | 0.937 Hz | −6.99 dB | 1.00 |
+| 15.14 Hz | 13.18 Hz | 2.597 Hz | −11.36 dB | 1.00 |
+| 100.10 Hz | 100.10 Hz | 1.322 Hz | −12.94 dB | 1.00 |
+
+`bp_line_check.csv` — 空转在 50.00 Hz 处：窗内峰在 **45.898 Hz**，50.00 Hz 电平比它低 **9.87 dB**。
+
+`comb_check.csv` 直指问题：
+
+| 理论分量 | 理论 Hz | 最近实测峰 | 偏差 |
+|---|---|---|---|
+| 空转 `Z_r·f_rot` | 22.823 | **15.137** | **−7.69 Hz** ← 无信 |
+| 空转 `2·Z_r·f_rot` | 45.645 | **45.898** | +0.25 Hz ← 吻合 |
+
+本次复测（全量 293 = train 234 + test 59）：
+
+| 检查 | 结果 |
+|---|---|
+| 1–120 Hz 平均谱中 ≥8% 峰值的局部极大 | **只有 46.0 Hz** |
+| 逐样本全局最强峰（1–120 Hz） | 240/293 落在 45–48 Hz（45–46: 57，46–47: 114，47–48: 60）；44–45: 1；48–49: 9；50–51: 9 |
+| [45,47] Hz 窗内逐样本峰 | 中位 **46.00 Hz**，10–90 分位 [45.50, 47.00] |
+| [20,26] Hz 窗内逐样本峰 | 中位 22.50 Hz，10–90 分位 [22.00, 23.50] —— **近似均匀 ⇒ 噪声底** |
+| [20,26] Hz 能量占比 | 中位 **1.16%** |
+| [48,52] Hz 能量占比 | 中位 1.72%，但 50.00 Hz 处幅度中位 **344.9**，仅为 46 Hz 峰（4679）的 **1/14** |
+| [1,18] Hz 能量占比 | 中位 10.33% |
+
+**所以"空转 ≈ 45.65% 额定转速 → 1×BPF = 22.82 Hz"不成立。**
+该假设预言 1×BPF 在 22.82 Hz（通常应是该工况最强的 RSI 线），但那里完全无峰；而它顺带预言的 2×BPF = 45.65 Hz 恰好落在实测主峰 45.9 Hz 上。**这个百分比看起来是从观测到的 ~46 Hz 峰反推出来的，不是在 22.8 Hz 上测出来的。**（`check_spectral_bands.py:23,79` 与 `probe_harmonic_comb.py:21` 原本就把它写作"假设"。）
+
+数据支持的读法是：空转的主导 45.9–46.4 Hz 是一个**工况漂移分量**。
+
+- 空转类内逐样本 std **0.611 Hz**（若是转速/电网锁定线，应像 100.10 Hz 那样为 0.000）；
+- 同一候选峰在各类间中位位置随工况移动：**46.39（空转）→ 46.88（高负荷）→ 47.36（中负荷）→ 47.85（抽水）→ 49.80（低负荷）** Hz；
+- 46.39 / 5.5550 = **8.35 阶**，在额定转速下不是整数阶，因而不是转速锁定谐波；
+- 它落在 **BPF_DRIFT [42,48]** 内，正是 B4 拆出来的那个节点。
+
+**这构成对 B4 拆分的一次独立验证**：空转这个工况的主能量恰好是"漂移族"；而旧版把 [42,55] 合成一个带时，它与 50 Hz 尖线共用一个 `sigma`，物理上无法同时兼顾。
+
+顺带两条对照事实：
+
+1. 上述候选峰的中位位置**跨过了 48 Hz 边界**（空转 46.39 / 高负荷 46.88 / 中负荷 47.36 / 抽水 47.85 落在 BPF_DRIFT；低负荷 49.80 落在 BPF_LINE）。这意味着 `L_anchor`（BPF_LINE 49.995±1.5 → 窗口 [48.5, 51.5]）在空转、中负荷、高负荷、抽水下**根本不会被激活**（主峰在窗外），只有低负荷会真正触发它。设计上这由 presence 门控 + flat-bottom 正确处理，但评估锚的有效性时必须意识到它只在部分工况生效。
+2. **100.10 Hz 是全数据集最稳的谱线**（低/中/高/抽水的逐样本 std = **0.000 Hz**），且在中负荷与高负荷是最强分量（0.00 dB）。理论 2×BPF 为 99.990 Hz，实测偏移 +0.108 Hz。因此在 0.5 Hz 分辨率下，"100.10 Hz 是机器的 2×BPF"与"100.10 Hz 是 50 Hz 的二次谐波"同样无法区分——**`L_anchor` 被满足并不构成"模型找到了转子 2×BPF"的证据**，这一点与 §6 问题 2 的结论一致。
+---
+
+## 15. 本轮改造：边界解耦 / 窗软化 / 均衡采样 / 原型重算 / 频率约束降级
+
+§14 暴露了一个结构性问题：**48.0 Hz 这条硬边界同时压在两个峰之间和 bin 语义的两端**。本节记录本轮如何消除它，以及随之重算的所有量。所有数字均为实测。
+
+### 15.1 问题：48.0 Hz 硬边界的三重后果
+
+1. **bin 48.0 被双重计入。** 全仓库 7 处区域掩码都是两端皆闭的 `(freqs >= f_min) & (freqs <= f_max)`，`BPF_DRIFT[42,48]` 与 `BPF_LINE[48,53]` 在 48.0 处重叠一格。后果是 `Σ E_n > E_total`，而 `compute_V_obs` 的比例运算依赖 `Σ E_n = E_total`。
+2. **空转的 `BPF_LINE` 带内出现“单峰劈裂”伪峰。** 实测该窗内 `E峰f = 48.000 Hz` —— 这不是 50 Hz 线，而是 46.4 Hz 漂移峰的右翼堆在**窗口左边缘**形成的伪极值。后果：空转的 `presence_e(BPF_LINE) = 0.317`，**全类最高**，与物理直觉完全相反（低负荷最低 0.082）。
+3. **泄漏是单向的，硬边界却对称地切。** `σ_drift ∈ [1.75, 2.75]` bin（std 0.875–1.375 Hz），单个 46.9 Hz 源在 σ=2.75 时 **18.0% 的能量落在 48 Hz 以上**；而 `σ_line ∈ [0.625, 1.375]` bin（std 0.31–0.69 Hz）几乎不向左漏。结果是 `IF_hat[BPF_LINE]` 被系统性压低（偏置约 −1.3 Hz）。
+
+### 15.2 方案：半开重划 + 共享内边单位分解过渡带
+
+**边界**（只动内部共享边，外缘全不动）：
+
+| 区域 | 原 | 新 |
+|---|---|---|
+| `BPF_DRIFT` | `[42.0, 48.0]` | `[42.0, 48.5)` |
+| `BPF_LINE` | `[48.0, 53.0]` | `[48.5, 53.0)` |
+
+`LOW_FREQ[2,18]` / `2xBPF[90,105]` 与间隙侧边界保持硬 0/1。选 48.5 的理由：它是 σ 分配的自然分割点 `(node_if_DRIFT + node_if_LINE)/2 ≈ 48.45 Hz`（`sast.py` 的 `i_star = dist.argmin(dim=1)`），把静态边界对齐到动态分配点，两者不再互相矛盾。
+
+**权重函数**（`models/sast_nodes.region_weights`，单一真源）：
+
+```python
+SOFT_SPLIT_HZ = 0.5                       # 共享内部边的过渡带半宽 (Hz)
+w_lower(f) = 1 - 0.5 * (1 - cos(pi * clamp((f - (b-h)) / (2h), 0, 1)))
+w_upper(f) = 0.5 * (1 - cos(pi * clamp((f - (b-h)) / (2h), 0, 1)))
+```
+
+在共享边 `b = 48.5` 两侧用互补升余弦过渡（`[48.0, 49.0]`），使 **`Σ_n w_n(f) ≡ 1`**（单位分解）。
+
+**为什么是单位分解而不是两侧各自软窗**：`node_energy` 与 `compute_V_obs` 的比例运算依赖 `Σ E_n = E_total`。若两侧各自升余弦，47.5–48.5 Hz 的能量会被两边同时打折，`R_LF+R_DRIFT+R_LINE+R_2x` 不再为 1，需额外重归一化；互补过渡带从构造上免掉这件事。
+
+**为什么外缘不加过渡带**：抽水/中负荷的真实漂移峰实测达 `E峰f = 47.583–47.708 Hz`。若在 `BPF_DRIFT` 上沿加对称升余弦会削掉真实信号。
+
+**7 处掩码副本收敛到一处**：`band_centroid_if`、numpy 提取器、GPU 提取器、`renyi_2d_loss`、`node_presence`、`deploy/sast_export_model.py`、`get_region_bounds`。过渡带位置取自**规范表** `PUMP_TURBINE_REGIONS` 而非调用方传入的 `regions`，否则只传单个区域的调用方（如 Rényi 逐区域遍历）会因 `range(N-1)` 为空而丢掉过渡带。
+
+### 15.3 边界修复的实测效果（改前 / 改后）
+
+`python scripts/analysis/probe_node_if.py --per-class 12`，真数据（`--legacy` 复现改前口径）：
+
+| 检查项 | 改前 | 改后 |
+|---|---|---|
+| 空转 `BPF_LINE` 的 `E峰f` | **48.000 Hz**（劈裂伪峰） | **49.000 Hz** ✅ |
+| 空转 `BPF_LINE` 的 `E质心` | 49.294 Hz | 49.807 Hz |
+| 空转 `presence_e(BPF_LINE)` | **0.317**（全类最高） | 0.135（降 57%，但仍为全类最高，见下） |
+| `BPF_LINE` 五类 `E质心` 跨度 | 49.294–50.033（0.739 Hz） | 49.807–50.298（0.491 Hz） |
+| 五类 `abs(锚 − E峰f)` | 1.995 / 0.912 / 1.870 / 1.870 / 1.370 | 0.995 / 0.537 / 0.995 / 0.953 / 0.870 |
+| `BPF_DRIFT` 五类 `E峰f` | 46.417 / 47.667 / 47.583 / 46.625 / 47.708 | **完全不变** ✅ |
+| `presence_e(2xBPF)` | 0.097 / 0.319 / 0.338 / 0.343 / 0.335 | 0.074 / 0.238 / 0.252 / 0.256 / 0.250 |
+
+要点：
+
+- **`BPF_DRIFT` 侧逐位不变** —— 过渡带没有削掉任何真实漂移峰，验证了“外缘不加软化”的选择是对的（47.708 Hz 在过渡带内仍保留权重 1.0，因为过渡带是 `[48.0, 49.0]`，与 47.708 无交集）。
+- **五类 `abs(锚 − E峰f)` 全部落入 ±1.5 Hz 容差** —— 改前空转/中负荷/高负荷都越界，改后全部在带内。这**加强**了 §15.5 的结论：锚不是“按类失效”，而是结构性失效。
+- **`presence_e(BPF_LINE)` 空转仍是全类最高**（0.135）。这一项**没有完全达成**预期的“不再全类最高”。原因是诚实的：空转的 `BPF_LINE` 窗内没有独立的 50 Hz 线，但 46.4 Hz 漂移峰的右翼确实是真实存在的能量，过渡带只能把它压掉约一半。若把 `SOFT_SPLIT_HZ` 加宽到 1.0 Hz 可进一步压低，但代价是抽水 47.708 Hz 的真实峰权重从 1.0 掉到 0.973 —— 属于拿真实信号换指标，不做。
+
+**权重分区自检**（`Σ_n w_n(f)`）：
+
+| 检查 | 结果 |
+|---|---|
+| 覆盖集 `[2,18) ∪ [42,53) ∪ [90,105)` 上 `Σ_n w_n(f)` | `1.000000000`（逐 bin） |
+| 间隙上 `Σ_n w_n(f)` | `0` |
+| bin 48.0 的归属 | `BPF_DRIFT = 1.0 / BPF_LINE = 0.0`（原为两侧各 1，双计） |
+| 过渡带 `[48.0, 49.0]` 两侧权重 | 48.5 → 0.5/0.5；49.0 → 0.0/1.0 |
+| numpy / torch 两条路径 | 逐位一致 |
+
+### 15.4 `bw_expected` 标定
+
+`ridge_decay = exp(-(|f - if| / (2·bw_expected))² / 8)`，bw 偏大 → 远端 `ridge_factor ≈ 1` → 挤压参与因子失效。四个值全部按**改后**的实测带内 IF 标准差（五类均值）重新标定：
+
+| 区域 | 原值 | 实测均值（改后） | 新值 |
+|---|---|---|---|
+| `LOW_FREQ` | 12.0 | 4.53 | **4.5** |
+| `BPF_DRIFT` | 6.0 | 1.70 | **1.7** |
+| `BPF_LINE` | 1.5 | 1.03 | **1.0** |
+| `2xBPF` | 2.0 | 4.52 | **4.5** |
+
+`ridge_factor` 实测剖面（典型 `node_if = [8.0, 46.1, 49.9, 99.5]`）：
+
+| f (Hz) | 30 | 40 | 55 | 75 | 90 | 100 | 105 | 110 | 150 |
+|---|---|---|---|---|---|---|---|---|---|
+| 改前 | 0.799 | 0.968 | 0.697 | 0.150 | 0.494 | 0.998 | 0.790 | 0.423 | 0.150 |
+| 改后 | **0.150** | 0.669 | 0.444 | 0.396 | **0.870** | 1.000 | **0.954** | **0.844** | 0.150 |
+
+- 30 Hz（无物理内容的间隙）从 0.80 掉到 floor 0.15 ✅，40 Hz 从 0.97 掉到 0.67；
+- `2xBPF` 带内（90/105/110 Hz）从 0.49/0.79/0.42 升到 0.87/0.95/0.84 —— 改前 **2xBPF 自己的带边只拿到 46% 参与度**，这是原值 2.0 偏小造成的；
+- ⚠ 副作用：75 Hz 从 0.150 升到 0.396（`2xBPF` 取 4.5 使 53–90 Hz 空带的参与度被抬起）。取实测均值的理由是标定方法可复现；若改取“分量自身宽度”（约 2.0）可消除该副作用但失去可复现口径。
+
+### 15.5 方案 A：频率约束降级为诊断（`freq_constraints_active = False`）
+
+`L_physics` / `L_anchor` / `L_ratio` **照旧计算**并写入 `losses_dict`，但不进入 `L_total` 的反向图。`total_sast_loss` 新增形参 `freq_constraints_active: bool = False`，`losses_dict` 新增 `w_physics` / `w_anchor` / `w_ratio` 三个**生效乘数**（降级时为 0.0），日志自证。`train_sast.py --freq_constraints_active` 一个开关即可复现消融。
+
+**生效项 7 项**：`L_supcon`、`RE_2D`、`L_balance`、`L_var`、`L_consistency`、`L_lowfreq`、`L_range`。**报告项仍 10 项**。
+
+理由（3 条）：
+
+1. 重排落点 `omega_hat_int` 完全不可学 —— `ReassignerFunction.backward` 三条路径皆返回 `None`，只有 σ 有梯度。因此基于 `IF_hat` 的锚/比值约束无法校准瞬时频率，只能经 `w_i → σ_i` 反向操纵**测量窗口内的能量质心**，属伪物理约束。
+2. 实测五类 `BPF_LINE` 带内质心仅跨 0.74 Hz（49.294/50.033/49.801/49.517/49.945），**窄于 ±1.5 Hz 容差**，锚值 49.995 天然落在该范围内 —— 对**任何**工况都不触发，是结构性失效而非按类失效。§15.3 显示改后全部五类 `abs(锚 − E峰f) < 1.5 Hz`，结论不变。
+3. 保留诊断输出正是论文价值：`if_hat_{name}` 与 `abs(anchor − if_hat)` 每 epoch 照旧记录，可实证给出“锚在不被约束时也天然满足”。
+
+`train_sast.py` 每 epoch 现在会打印一段 `[诊断]` 块（`anc` / `rat` 值与三个生效乘数 `wλ(p/a/r)`，以及逐节点 `if_hat` / `presence` / `abs(锚 − if_hat)`）。首次实跑（`--epochs 1 --max_samples 900`，降级态）的结果即为方案 A 的直接证据：
+
+| 节点 | `if_hat` | `presence` | `abs(锚 − if_hat)` |
+|---|---|---|---|
+| LOW_FREQ | 10.093 Hz | 0.146 | —（无锚） |
+| BPF_DRIFT | 45.990 Hz | 0.080 | —（无锚） |
+| BPF_LINE | 49.535 Hz | 0.048 | **0.460 Hz** |
+| 2xBPF | 99.409 Hz | 0.145 | **0.581 Hz** |
+
+两条带锚的节点在**完全没有约束梯度**的情况下，1 个 epoch 后 `if_hat` 距锚仅 0.46 / 0.58 Hz，远在 ±1.5 Hz 容差之内 —— 即 `L_anchor` 在这份数据上不可能产生非零贡献。
+
+### 15.6 P×K 类别均衡采样（P=2, K=5 → B=10）
+
+**问题**：训练集各类 196 / 1786 / 587 / 3604 / 402（val_split=0.15），而训练循环是 `torch.randperm` 均匀切片。SupCon 需要每个类在 batch 内有正样本对，而 `torch.randperm + B=8` 下各类“batch 内 <2 个样本 ⇒ 无正样本对”的 batch 占比实测为：
+
+| class | 空转 | 低负荷 | 中负荷 | 高负荷 | 抽水 |
+|---|---|---|---|---|---|
+| 池大小 | 196 | 1786 | 587 | 3604 | 402 |
+| 旧 `randperm`/B=8 | **97.6%** | 32.8% | **84.8%** | 2.1% | **91.6%** |
+| 新 P×K | **0.0%** | 0.0% | 0.0% | 0.0% | 0.0% |
+
+**实现**：`sast_data.build_balanced_batch_indices(y, p, k, n_batches, rng)` 返回 `[n_batches, p·k_eff]` 的 `int64` 索引矩阵。类内**不放回**抽 p 个（放回会让同一样本自配成假正样本对）；类池 < p 时退化为放回；batch 内索引最后打乱。`train_sast.py` 每 epoch 用 `np.random.default_rng(seed + epoch)`，`n_batches = max(1, N_train // (p·k))`。
+
+**代价与收益**：
+
+| | 旧（B=8） | 新（P×K=2×5） |
+|---|---|---|
+| batch 大小 | 8 | 10 |
+| batch 数 / epoch | 821 | 657 |
+| 样本覆盖 / epoch | 6568 / 6575 | 6570 / 6575 |
+| 各类每 epoch 出现次数 | 按池比例 | 各 1314 次 |
+| 过采样倍数（空转/低/中/高/抽水） | 1× | **6.70× / 0.74× / 2.24× / 0.36× / 3.27×** |
+
+K=5 恰等于类别数 ⇒ 每个 batch 必含全部 5 个类（`k_eff = min(k, 非空类数)` 的退化情形）；若 `K<5` 则每 batch 随机抽 K 个类。
+
+**注意**：`sast_config.batch_size` 的默认值此前是 2，与 `train_sast.py` 的 CLI 默认 8 长期分歧；已统一为 8，并注明它只在 `--balanced_p 0` 时生效。`balanced_p < 2` 时启动打印 WARN（P=1 时每类在 batch 内仅 1 个样本，无正样本对，等于没修）。
+
+### 15.7 工况原型重算（5×4 → 5×6）
+
+**旧表的三个缺陷**（均以 `compute_V_obs` 为同一计算路径重算后根治）：
+
+| 缺陷 | 证据 | 修正 |
+|---|---|---|
+| **归一化不一致** | 旧原型前三列之和 0.273/0.911/0.620/0.819/0.806，而在线的 `E_total = Σ 带能量` 使 `V_obs` 前三列恒和为 1.0。余弦相似度**不是**对“R 块 vs log 比值列”相对权重不变的，故 `alpha` 被系统性扭曲 | 重算时统一走 `compute_v_obs` |
+| **`exp(log1p(·)) ≠ ·`** | `E_lin = torch.exp(node_energy)`，而 `node_energy = log1p(band_energy)` → `E_lin = 1 + band_energy`，弱带被 `+1` 地板抬高 | 改 `torch.expm1`（`log1p` 的精确逆） |
+| **好耦合被丢掉** | 为对齐旧原型，把 `BPF_DRIFT`/`BPF_LINE` 重新合并为 `E_bpf`，恰好抹掉 B4 拆分最有判别力的特征 | 拆开，新增第 5 维 |
+
+**新 V_obs（6 维）**：
+
+```
+V_obs = [ R_LF, R_DRIFT, R_LINE, R_2x,
+          log10(E_DRIFT / E_LINE),              # 新增: 漂移/线 判别子
+          log10((E_DRIFT + E_LINE) / E_2x) ]    # 保留: 原 4 维里的谐波比值
+```
+
+保留原比值是因为 `log10(E_bpf/E_2x)` 编码了 `BPF_LINE → 2xBPF` 的整数谐波边（`r_nom = 2.0`）。`PROTOTYPE_DIM` / `N_PROTOTYPES` 由 `STATIC_PROTOTYPES.shape` 派生；`obs_proj` 在 `forward` 中从未被调用（`alpha` 直接来自 `cosine`），故加宽无额外风险。
+
+**新表**（`scripts/analysis/build_static_prototypes.py`，train 划分 N=6575，class 0 全量 196、其余各类抽 400，逐列取中位数后把 R 块重新归一化到 1）：
+
+| cls | 工况 | R_LF | R_DRIFT | R_LINE | R_2x | log10(E_DRIFT/E_LINE) | log10((E_DRIFT+E_LINE)/E_2x) |
+|---|---|---|---|---|---|---|---|
+| 0 | 空转 | 0.138863 | 0.671624 | 0.112759 | 0.076755 | +0.738565 | +1.014024 |
+| 1 | 低负荷 | 0.078291 | 0.414625 | 0.494852 | 0.012232 | −0.080094 | +1.868020 |
+| 2 | 中负荷 | 0.098077 | 0.209527 | 0.118380 | 0.574016 | +0.181772 | −0.205221 |
+| 3 | 高负荷 | 0.016501 | 0.093141 | 0.037490 | 0.852869 | +0.389718 | −0.778678 |
+| 4 | 抽水 | 0.049762 | 0.455254 | 0.345705 | 0.149280 | +0.118111 | +0.746714 |
+
+**三点自检**：
+
+1. **R 块恒和为 1**（逐点实测 min 0.999999762 / max 1.000000238；逐列中位数之和为 0.935–0.975，故重归一化）——与任何在线样本落在同一流形上。
+2. **新增的第 5 维随负荷单调**：低负荷 −0.080 < 中负荷 +0.182 < 高负荷 +0.390（负 = 线占优，正 = 漂移占优），空转 +0.739 最大（无转速锁定线，漂移占绝对主导）。这正是 B4 拆分想要的特征。
+3. **R_2x 随负荷递增**：低负荷 0.012 → 中负荷 0.574 → 高负荷 0.853，与 §14.4 的 2×BPF 结论一致（空转时该分量近消失，presence 0.074 vs 带负荷 0.24–0.26）。
+
+**根本方案与循环依赖**：脚本必须复用模型代码路径，但又不能实例化 `StaticPrototypeMatcher`（后者的 `PROTOTYPE_DIM` 依赖被重算的表）。解法是把 `compute_V_obs` 提为模块级纯函数，方法体退化为薄委托；脚本则在 `MSSTNodeExtractor` 的 numpy/GPU 输出上直接调用它，全程不实例化模型。
+
+### 15.8 顺带修正
+
+| # | 项 | 内容 |
+|---|---|---|
+| 1 | ONNX 导出侧掩码 | `deploy/sast_export_model.py:_extract_nodes_export` 改为 `import region_weights`（原为独立副本，边界一改即静默过期） |
+| 2 | ONNX 导出侧 **IF 聚合口径** | 同文件原为**无权重中位数**，而训练侧已在 `942fe85`（A2）改为**能量加权均值**，导出副本未同步 → 导出模型的 `node_if` 与训练不一致（下游 edge_feats / gate / `i_star` 全部偏移）。已同步，并保留 `torch.where` 以替代布尔就地赋值（ONNX 不支持后者） |
+| 3 | 清理已被证伪的 45.65% 假设 | `check_spectral_bands.py` 删 `F_ROT_IDLE` 及其两条梳齿候选、`probe_harmonic_comb.py` 删 `F_IDLE_ROT` 及两条参考线；两处改为陈述证伪结论。**同文件 `SAST_NODES` 仍是 3 节点旧边界 `('BPF', 42.0, 55.0)`，一并改为 4 节点新边界** |
+| 4 | 旁路硬编码频带 | `scripts/plot/tfr_common.py` 的 `'harm':(42,105)` / `'low':(2,25)` 改为从 `PUMP_TURBINE_REGIONS` 导出；`analyze_band_compressibility.py` 的 42–48/48–53 注释更正为 48.5 |
+| 5 | 文档 | 本节 + §8/§12 回填 |
+
+**残留**：`scripts/doc/build_sast_docx.js:560` 仍写“46.4 Hz 与理论值 2×Z_r×f_rot,空转 = 45.6 Hz 吻合”。该句的数值巧合确实成立（2× 预测 45.645 vs 实测 45.898），但它承袭自已被证伪的 45.65% 前提（1× 预测 22.823 vs 最近实测峰 15.137，落空）。论文 docx 按计划在结果稳定后统一回填。
+
+**导出侧一致性验证**（`_extract_nodes_export` vs `MSSTNodeExtractor.extract_gpu`）：
+
+| 检查 | 结果 |
+|---|---|
+| `region_weights` 是否同源 | 两侧 `import` 同一函数对象；覆盖集 84 bin 上 `Σ_n w_n` 最大偏差 `0.00e+00` |
+| 48.0 Hz 归属（导出轴） | `BPF_DRIFT = 1.0 / BPF_LINE = 0.0` |
+| 构造谱（44.0–44.5 Hz 强线 @100 + 46–48 Hz 次强宽带 @1）上 `node_if[BPF_DRIFT]` | 导出侧返回 **44.251 Hz**（能量加权均值），无权重中位数应为 45.000 Hz → 口径已同步 |
+| 6 条真信号端到端 | 四个节点的 `\|Δ if\|` / `\|Δ energy\|` / `\|Δ bw\|` **全部 0.000** |
+
+（注：ONNX 写盘本身因 `my_work` 缺 `onnxscript` 而中断，见 §12 第 7 条；上述数值一致性检查绕开了写盘步骤。）
+
+### 15.9 本轮未做
+
+- `FreqEncoder` 的 `mean(dim=-1)` → `mean+std` 时间动态；
+- 方案 B（可学习 Δf_i）；
+- CUDA kernel 改动（`deploy/reassigner.cu` / `reassigner_opt.cu` 只在全谱两端 clamp，**不存在 48 Hz 处的通道截断**，截断效应只存在于测量窗口内，改这里是白费力气）。
+
+### 15.10 影响与不兼容
+
+- **旧 checkpoint 全部不兼容**：`PROTOTYPE_DIM` 4→6 改变 `obs_proj.weight` 形状（尽管是 dead code，仍是 `state_dict` 条目），且 `STATIC_PROTOTYPES` 值已变。必须重训。
+- `band_centroid_if` / 提取器 / 损失侧的数值均有变化（过渡带加权），旧指标的绝对数值不可直接对照。

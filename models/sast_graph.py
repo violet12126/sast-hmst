@@ -29,8 +29,8 @@ SAST Physics Graph — 异构物理图 (工况上下文 + 倍频 + 能量耦合)
 节点 (5 个):
   [0] OP:        虚拟节点, 来自 StaticPrototypeMatcher 的 soft matching 嵌入
   [1] LOW_FREQ:  流动不稳定性 (涡带/压力脉动), 2-18 Hz
-  [2] BPF_DRIFT: 工况漂移宽峰, 42-48 Hz (频率不锁转速)
-  [3] BPF_LINE:  转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48-53 Hz
+  [2] BPF_DRIFT: 工况漂移宽峰, 42-48.5 Hz (频率不锁转速)
+  [3] BPF_LINE:  转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48.5-53 Hz
   [4] 2×BPF:     二倍叶片通过频率 99.990 Hz, 90-105 Hz
 
 边 (11 条有向):

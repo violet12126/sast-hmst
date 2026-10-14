@@ -33,7 +33,23 @@ class SastConfig:
 
     # ── Training ──
     epochs: int = 20
-    batch_size: int = 2
+    # batch_size 仅在 balanced_p == 0 (关闭均衡采样) 时生效。
+    # 旧默认值 2 与 train_sast.py 的 CLI 默认 (8) 长期分歧。SupCon 需要每个类
+    # 在 batch 内有 >=2 个样本才有正样本对, 实测 (train 划分, val_split=0.15,
+    # 池 196/1786/587/3604/402) 该事件缺席的 batch 占比:
+    #   B=2 : 空转 99.9%, 抽水 99.6%   -> 稀疏类基本拿不到梯度
+    #   B=8 : 空转 97.6%, 中负荷 84.8%, 抽水 91.6%, 低负荷 32.8%, 高负荷 2.1%
+    # 现值 8 与 CLI 对齐; 均衡采样开启时实际 batch 大小 = balanced_p·balanced_k。
+    batch_size: int = 8
+    # ── 类别均衡采样 (P×K) ──
+    # 每 batch 抽 balanced_k 个类 × 每类 balanced_p 个样本, 类内不放回。
+    # P=2/K=5 → B=10: 每个出现的类都必有 >=1 正样本对 (实测 0.0% 缺席);
+    # 各类每 epoch 出现次数拉平为 n_batches·P = 1314 次
+    # (过采样倍数 空转 6.70× / 低负荷 0.74× / 中负荷 2.24× / 高负荷 0.36× / 抽水 3.27×);
+    # 每 epoch batch 数 657 (旧 B=8 为 821), 样本覆盖 6570/6575, 吞吐基本不变。
+    # balanced_p < 2 会使每类在 batch 内只有 1 个样本 → 无正样本对, 等于没修。
+    balanced_p: int = 2
+    balanced_k: int = 5
     lr: float = 0.001
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
@@ -53,6 +69,13 @@ class SastConfig:
     ratio_tol: float = 0.06         # 比值允许的相对偏差 (flat-bottom 半宽)
     presence_frac: float = 0.1      # 分量存在度: 计入"峰"的带内 bin 比例
     w_low_min: float = 0.05         # 分量缺席时 w_range/balance 下界松弛到该值
+    # ── 方案 A: 频率约束 (伪物理约束) 降级为诊断 ──
+    # False (默认): L_physics / L_anchor / L_ratio 不进入 L_total, 仅写入
+    # losses_dict 作诊断。理由见 sast_losses.total_sast_loss 的说明与 docs §14.2:
+    # 重排落点不可学, 这三项只能经 σ 操纵测量窗内的能量质心; 且实测五类
+    # BPF_LINE 质心仅跨 0.74 Hz < ±1.5 Hz 容差, 锚对任何工况都不触发。
+    # True 可一键复现消融。
+    freq_constraints_active: bool = False
 
     # ── Data ──
     data_path: str = '5_dataset.npz'

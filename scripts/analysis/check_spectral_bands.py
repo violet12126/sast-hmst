@@ -20,13 +20,22 @@
        (Z_g-Z_r)*f_rot       -> 61.1
        (Z_g+Z_r)*f_rot       -> 161.1
        f_rot=5.56, 2*f_rot=11.11 (轴频/二倍轴频)
-       空转假设: 45.65% 额定 -> f_rot=2.536 Hz, Z_r*f_rot=22.8, 2*Z_r*f_rot=45.7
   D. 判别力: 对每个候选频带取带内能量, 单独做 5 类 silhouette / 1-NN,
      与 SAST 的 4 个节点对比, 看是否值得加节点.
 
+  ⚠ 已删除的假设: 曾把空转主峰归因于"45.65% 额定转速 -> f_rot=2.536 Hz,
+    Z_r·f_rot=22.82 Hz"。该假设已被实测**证伪**:
+      - 空转主峰实测在 45.90-46.39 Hz (不是 22.82 Hz, 也不是 50 Hz);
+      - comb_check.csv 独立印证: 22.8227 Hz 的最近实测峰是 15.137 Hz
+        (偏移 -7.686 Hz, 落空), 而 2×Z_r·f_rot 预测的 45.645 Hz 与实测
+        45.898 Hz 相符 (偏移 +0.253 Hz) —— 即该假设的"倍频"预测命中、
+        "基频"预测落空, 说明 45.9 Hz 不是 22.8 Hz 的二次谐波。
+      - 结论: 该分量是**工况漂移分量** (频率由流动不稳定性决定), 不是
+        转速锁定分量。详见 docs §14.4。
+
 输出 (默认 results/band_census/):
   peak_census.csv       每个候选峰 × 每类: f_c, level, df, 是否为候选
-  band_discriminability.csv  每个候选带 (以及 SAST 3 节点/带宽) 的判别力
+  band_discriminability.csv  每个候选带 (以及 SAST 节点/带宽) 的判别力
   comb_check.csv        理论梳齿 vs 实测最近峰
   psd_candidates.png    5 类类均值 PSD + 候选峰 + 梳齿线
   peak_stability.png    候选峰: 跨样本漂移 vs 峰级, 分类着色
@@ -76,10 +85,12 @@ Z_R = 9                  # 转轮叶片数
 Z_G = 20                 # 活动导叶数
 F_GRID = 50.0
 F_ROT = N_RATED / 60.0                 # 5.5556 Hz — 电网锁定
-F_ROT_IDLE = 0.4565 * F_ROT            # 空转 ≈ 2.536 Hz
+# F_ROT_IDLE (0.4565·F_ROT ≈ 2.536 Hz, "空转 45.65% 转速") 已删除 —— 该假设
+# 被实测证伪, 见文件头 ⚠ 段。
 
-# ── SAST 现有节点 ──
-SAST_NODES = [('LOW_FREQ', 2.0, 25.0), ('BPF', 42.0, 55.0), ('2xBPF', 90.0, 105.0)]
+# ── SAST 现有节点 (跟随 models/sast_nodes.PUMP_TURBINE_REGIONS, B4 后 4 节点) ──
+SAST_NODES = [('LOW_FREQ', 2.0, 18.0), ('BPF_DRIFT', 42.0, 48.5),
+              ('BPF_LINE', 48.5, 53.0), ('2xBPF', 90.0, 105.0)]
 
 LOCK_HALF = 4.0          # 逐样本峰锁定搜索半径 (Hz)
 PROM_DB = 6.0            # 类均值谱峰显著性门限
@@ -163,9 +174,9 @@ def the_comb():
     c.append(('f_rot (轴频)', F_ROT))
     c.append(('2·f_rot', 2 * F_ROT))
     c.append(('3·f_rot', 3 * F_ROT))
-    # 空转假设
-    c.append(('空转 Z_r·f_rot', Z_R * F_ROT_IDLE))
-    c.append(('空转 2·Z_r·f_rot', 2 * Z_R * F_ROT_IDLE))
+    # (原"空转 Z_r·f_rot / 空转 2·Z_r·f_rot"已删除 —— 45.65% 转速假设被证伪。
+    #  其 2×BPF 预测 45.645 Hz 虽与实测 45.898 接近, 但 1×BPF 预测 22.823 Hz
+    #  落空 (最近实测峰 15.137), 说明 45.9 Hz 并非 22.8 Hz 的二次谐波。)
     return [(n, fq) for n, fq in c if fq <= FMAX]
 
 
@@ -187,8 +198,8 @@ def main():
 
     print(f'f_rot = {F_ROT:.4f} Hz (额定 {N_RATED} rpm, 电网锁定)')
     print(f'BPF = Z_r·f_rot = {Z_R * F_ROT:.2f} Hz,  2×BPF = {2 * Z_R * F_ROT:.2f} Hz')
-    print(f'空转假设 (45.65%): f_rot = {F_ROT_IDLE:.3f} Hz, '
-          f'Z_r·f_rot = {Z_R * F_ROT_IDLE:.2f} Hz')
+    print('空转主峰: 实测 45.90-46.39 Hz, 属工况漂移分量 '
+          '(45.65% 转速假设已证伪, 见文件头)')
     print(f'频率分辨率 {BIN_HZ:.3f} Hz, Hann-{NPERSEG} -6 dB 主瓣 {WIN_6DB:.2f} Hz\n')
 
     # ── 逐类 PSD ──

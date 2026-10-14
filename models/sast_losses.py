@@ -28,7 +28,7 @@ import math
 from typing import Dict, Tuple, Optional, List
 
 from models.sast_nodes import (FreqRegion, PUMP_TURBINE_REGIONS, N_PHYSICS_NODES,
-                               SOFT_F_TYPES, band_centroid_if)
+                               SOFT_F_TYPES, band_centroid_if, region_weights)
 from models.sast_graph import PHYSICS_EDGES, N_EDGES, EdgeType
 
 
@@ -163,10 +163,13 @@ def renyi_2d_loss(tfr: torch.Tensor,
     for region in regions:
         if region.f_type in SOFT_F_TYPES:
             continue  # LOW_FREQ / BPF_DRIFT: 保留展宽, 不惩罚
-        f_mask = (freqs >= region.f_min) & (freqs <= region.f_max)
+        # 区域支撑用统一真源的布尔掩码; 共享内部边的过渡带内 bin 按 w<1
+        # 加权参与 (旧实现为两端皆闭的硬矩形)
+        w_f = region_weights(freqs, [region])[0]        # [F]
+        f_mask = w_f > 0.0
         if not f_mask.any():
             continue
-        tfr_r = tfr[:, f_mask, :]                      # [B, F_r, T]
+        tfr_r = tfr[:, f_mask, :] * w_f[f_mask].view(1, -1, 1)   # [B, F_r, T]
         tfr_pos = tfr_r.clamp(min=eps)
         total = tfr_pos.sum(dim=(1, 2), keepdim=True).clamp(min=eps)
         p = tfr_pos / total
@@ -474,9 +477,15 @@ def node_presence(tfr_mag: torch.Tensor,
 
     定义 (能量集中度, 与频率轴分辨率无关):
       c_n(t) = 带内能量最高的 k 个 bin 的能量 / 带内总能量,  k = ceil(frac·F_n)
-      p      = k / F_n        (平坦谱时的期望占比)
+      p      = 权重最大的 k 个 bin 的权重占比  (平坦谱时的期望占比;
+               硬边界下 w≡1 退化为 k / F_n)
       e_n(t) = clamp((c - p)/(1 - p), 0, 1)
       平坦宽带谱 → c≈p → e≈0 ; 独立谱线 → c→1 → e→1
+
+    频带权重 w_n(f) 见 sast_nodes.region_weights (半开区间 + 共享内部边
+    的单位分解过渡带)。过渡带内 bin 按 w<1 加权 —— 旧实现是两端皆闭的
+    硬矩形, 使空转的漂移峰右翼 (48.0-49.0 Hz) 整体计入 BPF_LINE, 造出
+    presence_e = 0.317 这个反常的"全类最高"值。
 
     注意: 必须传**原始** (未增强) 谱, 否则模型可通过制造尖锐谱线提高 e。
 
@@ -498,16 +507,22 @@ def node_presence(tfr_mag: torch.Tensor,
     e = torch.zeros(B, len(regions), T, device=tfr_mag.device, dtype=dtype)
 
     for n, r in enumerate(regions):
-        m = (freqs >= r.f_min) & (freqs <= r.f_max)
+        # 区域支撑用统一真源 (半开区间 + 共享内部边过渡带)
+        w_in = region_weights(freqs, [r])[0]             # [F]
+        m = w_in > 0.0
         Fn = int(m.sum().item())
         if Fn == 0:
             continue
-        band = tfr_mag[:, m, :].clamp(min=0.0)          # [B, Fn, T]
-        k = max(1, int(math.ceil(frac * Fn)))
+        w_in = w_in[m]                                   # [Fn]
+        # 过渡带内的 bin 按 w<1 加权 (旧实现为两端皆闭的硬矩形)
+        band = (tfr_mag[:, m, :] * w_in.view(1, -1, 1)).clamp(min=0.0)  # [B, Fn, T]
+        kk = min(max(1, int(math.ceil(frac * Fn))), Fn)
         tot = band.sum(dim=1)                            # [B, T]
-        top = band.topk(min(k, Fn), dim=1).values.sum(dim=1)   # [B, T]
+        top = band.topk(kk, dim=1).values.sum(dim=1)     # [B, T]
         c = top / tot.clamp(min=eps)
-        p = k / Fn
+        # 平坦谱基线: 权重最大的 kk 个 bin 的权重占比 (硬边界下 = kk / Fn)
+        p = float(w_in.topk(kk).values.sum().item() /
+                  w_in.sum().clamp(min=eps).item())
         e[:, n, :] = ((c - p) / max(eps, 1.0 - p)).clamp(0.0, 1.0)
     return e
 
@@ -666,6 +681,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      regions: Optional[List[FreqRegion]] = None,
                      presence_frac: float = 0.1,
                      w_low_min: float = 0.05,
+                     freq_constraints_active: bool = False,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     SAST v4 总损失 (SupCon 自监督).
@@ -673,6 +689,20 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     L_total = λ_sc*L_supcon + λ_e*RE_2D + λ_p*L_physics
             + λ_b*L_balance + λ_var*L_var + λ_c*L_consistency
             + λ_lf*L_lowfreq + λ_r*L_range + λ_a*L_anchor + λ_q*L_ratio
+
+    ⚠ 方案 A (freq_constraints_active=False, 默认): L_physics / L_anchor /
+      L_ratio 这三项**不进入** L_total, 仅作为诊断量照旧计算并写入 losses_dict。
+      理由 (详见 docs §14.2 及本轮结论):
+        1. 重排落点 omega_hat_int 完全不可学 —— ReassignerFunction.backward 的
+           三条路径皆返回 None, 只有 σ 有梯度。因此基于 IF_hat 的锚/比值约束
+           无法校准瞬时频率, 只能经 w_i → σ_i 反向操纵**测量窗口内的能量质心**,
+           属于伪物理约束。
+        2. L_anchor 结构性失效: 实测五类 BPF_LINE 带内质心仅跨 0.74 Hz
+           (49.294/50.033/49.801/49.517/49.945), 窄于 ±1.5 Hz 容差, 锚值
+           49.995 天然落在该范围内 —— 对**任何**工况都不会触发。
+        3. 保留 losses_dict 中的 physics/anchor/ratio 与 if_hat_* 诊断,
+           使"锚在不被约束时也天然满足"成为可复现的实验证据而非断言。
+      需要复现消融时传 freq_constraints_active=True 即可 (一个开关)。
 
     Args:
         tfr_raw:      [B, F, T] 原始 STFT 幅值 (用于估计分量存在度, 须未增强)
@@ -698,6 +728,8 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         regions:      物理节点频段定义 (默认 PUMP_TURBINE_REGIONS)
         presence_frac: 存在度估计计入"峰"的 bin 比例 (默认 0.1)
         w_low_min:     分量缺席时 w_range 下界松弛到的值 (默认 0.05)
+        freq_constraints_active: 是否让 L_physics/L_anchor/L_ratio 参与反向图。
+                         默认 False (方案 A: 降级为诊断, 见上方说明)
 
     Returns:
         total_loss:  scalar
@@ -747,14 +779,23 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     # ── 加权求和 ──
     total = (lambda_supcon * l_supcon +
              lambda_entropy * l_entropy +
-             lambda_physics * l_physics +
              lambda_balance * l_balance +
              lambda_var * l_var +
              lambda_consistency * l_consistency +
              lambda_lowfreq * l_lowfreq +
-             lambda_range * l_range +
-             lambda_anchor * l_anchor +
-             lambda_ratio * l_ratio)
+             lambda_range * l_range)
+
+    # ── 方案 A: 频率约束 (伪物理约束) 是否参与反向图 ──
+    # 三项照旧在下方诊断中计算。降级时只把它们的加权贡献从 total 里摘掉,
+    # 不动 losses_dict —— 这样日志仍能看到 if_hat_* / anchor / ratio 的实际值,
+    # 供论文论证"锚在不被约束时也天然满足"。
+    w_physics = lambda_physics if freq_constraints_active else 0.0
+    w_anchor = lambda_anchor if freq_constraints_active else 0.0
+    w_ratio = lambda_ratio if freq_constraints_active else 0.0
+    total = (total +
+             w_physics * l_physics +
+             w_anchor * l_anchor +
+             w_ratio * l_ratio)
 
     # ── 诊断 ──
     losses_dict = {
@@ -769,6 +810,10 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'w_range': l_range.item(),
         'anchor': l_anchor.item(),
         'ratio': l_ratio.item(),
+        # 生效乘数 (方案 A 下为 0.0) —— 让日志自证哪几项真正参与训练
+        'w_physics': w_physics,
+        'w_anchor': w_anchor,
+        'w_ratio': w_ratio,
         'w_mean': w_i.mean().item(),
         'w_min': w_i.min().item(),
         'w_max': w_i.max().item(),

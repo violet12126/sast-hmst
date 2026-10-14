@@ -34,6 +34,9 @@ _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
+# 区域频带权重: 与训练侧共用同一真源, 避免导出副本随边界改动静默过期
+from models.sast_nodes import region_weights  # noqa: E402
+
 
 # ═══════════════════════════════════════════════════════════════
 # 1. MSST — 可导出纯 torch 版
@@ -161,33 +164,46 @@ def _extract_nodes_export(tfr_stft: torch.Tensor, omega_final: torch.Tensor,
     energy = torch.zeros(N_phys, T, device=device, dtype=torch.float32)
     bw = torch.zeros(N_phys, T, device=device, dtype=torch.float32)
 
+    # 区域权重 [N_phys, F] — 与训练侧 MSSTNodeExtractor.extract_gpu 同一真源
+    # (半开区间 + 共享内部边单位分解过渡带)。此前这里是独立副本
+    # `(freqs >= f_min) & (freqs <= f_max)`, 会随边界改动静默过期。
+    w_all = region_weights(freqs, list(regions))          # [N_phys, F]
+
     for n_idx, region in enumerate(regions):
-        freq_mask = (freqs >= region.f_min) & (freqs <= region.f_max)  # [F]
+        w_f = w_all[n_idx]                                  # [F]
+        freq_mask = w_f > 0.0                               # [F] 区域支撑
         region_if = if_map[freq_mask, :]                    # [F_r, T]
         region_valid = valid_mask[freq_mask, :]             # [F_r, T]
-        region_energy_map = stft_energy[freq_mask, :]       # [F_r, T]
+        # 加权能量: 过渡带内的 bin 按 w<1 打折
+        region_energy_map = (stft_energy[freq_mask, :] *
+                             w_f[freq_mask].unsqueeze(1))   # [F_r, T]
         F_r = region_if.shape[0]
         counts = region_valid.sum(dim=0)                    # [T]
 
-        # median IF: 无效位置置 inf 后排序, 取中位 (gather 替代动态索引)
-        region_if_sort = torch.where(region_valid, region_if,
-                                     torch.full_like(region_if, float('inf')))
-        region_if_sorted, _ = torch.sort(region_if_sort, dim=0)  # [F_r, T]
-        med_idx = ((counts - 1) // 2).clamp(min=0).long()         # [T]
-        if_hz_n = torch.gather(region_if_sorted, 0, med_idx.view(1, T))[0]  # [T]
+        # IF: **能量加权均值** (与训练侧 A2 口径一致)。
+        # ⚠ 此处原为无权重中位数 —— 训练侧已在 942fe85 改为能量加权均值, 导出
+        #   副本未同步, 会让导出模型的 node_if 与训练不一致 (下游 edge_feats /
+        #   gate / i_star 全部偏移)。中位数与能量无关, 宽带里的噪声 bin 会把 IF
+        #   拉向频带几何中心 (实测 LOW_FREQ 偏高 6-12 Hz)。
         center = (region.f_min + region.f_max) / 2.0
-        if_hz_n = torch.where(counts == 0,
-                              torch.full_like(if_hz_n, center), if_hz_n)
+        if_sum = (region_if * region_valid.float()).sum(dim=0)
+        arith_mean = if_sum / counts.clamp(min=1)
+        w_e = region_energy_map * region_valid.float()      # [F_r, T]
+        w_sum = w_e.sum(dim=0)                              # [T]
+        if_hz_n = (region_if * w_e).sum(dim=0) / w_sum.clamp(min=1e-12)
+        if_hz_n = torch.where(w_sum > 0, if_hz_n, arith_mean)
+        # 用 where 而非 `if_hz_n[counts == 0] = ...`: 后者是布尔就地赋值,
+        # ONNX 导出不支持 (本文件整体为此而写)。
+        if_hz_n = torch.where(counts > 0,
+                              if_hz_n, torch.full_like(if_hz_n, center))
         if_hz[n_idx] = if_hz_n
 
         # energy (log1p)
         region_energy = (region_energy_map * region_valid.float()).sum(dim=0)
         energy[n_idx] = torch.log1p(region_energy)
 
-        # bandwidth / std
-        if_sum = (region_if * region_valid.float()).sum(dim=0)
-        mu = if_sum / counts.clamp(min=1)
-        sq_dev = (region_if - mu.unsqueeze(0)) ** 2
+        # bandwidth / std (以算术均值为中心, 与训练侧一致)
+        sq_dev = (region_if - arith_mean.unsqueeze(0)) ** 2
         sq_sum = (sq_dev * region_valid.float()).sum(dim=0)
         bw_n = torch.sqrt(sq_sum / counts.clamp(min=1)).clamp(max=20.0)
         bw_n = torch.where(counts < 2, torch.ones_like(bw_n), bw_n)

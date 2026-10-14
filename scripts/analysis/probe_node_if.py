@@ -23,6 +23,7 @@
 import argparse
 import csv
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,8 @@ import numpy as np
 _PROJ = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PROJ))
 
-from models.sast_nodes import MSSTNodeExtractor, PUMP_TURBINE_REGIONS  # noqa: E402
+from models.sast_nodes import (MSSTNodeExtractor, PUMP_TURBINE_REGIONS,  # noqa: E402
+                               region_weights)
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -44,15 +46,23 @@ F_ROT = N_RATED / 60.0
 ANCHOR = [r.f_anchor for r in PUMP_TURBINE_REGIONS]
 
 
-def presence(band_spec: np.ndarray, frac: float = 0.1) -> float:
-    """带内谱 (按 bin, 时间已合并) 的能量集中度 -> 存在度 e。"""
+def presence(band_spec: np.ndarray, w: np.ndarray | None = None,
+             frac: float = 0.1) -> float:
+    """带内谱 (按 bin, 时间已合并) 的能量集中度 -> 存在度 e。
+
+    w: 区域频带权重 (region_weights)。平坦谱基线取"权重最大的 k 个 bin 的
+    权重占比", 硬边界 (w≡1) 下退化为 k/F_n。None 表示历史硬矩形口径。
+    """
     e = np.maximum(band_spec, 0.0)
     tot = e.sum()
     Fn = e.size
     if tot <= 0 or Fn == 0:
         return 0.0
     k = max(1, int(np.ceil(frac * Fn)))
-    p = k / Fn
+    if w is None:
+        p = k / Fn
+    else:
+        p = float(np.sort(w)[::-1][:k].sum() / max(1e-12, float(w.sum())))
     c = float(np.sort(e)[::-1][:k].sum() / tot)
     return float(np.clip((c - p) / max(1e-8, 1.0 - p), 0.0, 1.0))
 
@@ -62,9 +72,21 @@ def main():
     ap.add_argument('--data', default='5_dataset.npz')
     ap.add_argument('--per-class', type=int, default=12)
     ap.add_argument('--outdir', default='results/band_census')
+    ap.add_argument('--legacy', action='store_true',
+                    help='用**历史**口径 (BPF_DRIFT[42,48] + BPF_LINE[48,53] + '
+                         '两端皆闭硬矩形 + p=k/F_n) 复现改前行为, 用于对照')
     args = ap.parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # 改后: 直接用规范表 + region_weights。--legacy 时还原历史边界以便同机对照。
+    if args.legacy:
+        regions = [replace(r, f_max=48.0) if r.name == 'BPF_DRIFT'
+                   else replace(r, f_min=48.0) if r.name == 'BPF_LINE' else r
+                   for r in PUMP_TURBINE_REGIONS]
+        print('*** --legacy: 历史口径 (42/48 硬边界 + 两端皆闭 + p=k/F_n) ***\n')
+    else:
+        regions = PUMP_TURBINE_REGIONS
 
     d = np.load(args.data, allow_pickle=True)
     X, y = d['train_X'], d['train_y'].ravel().astype(np.int64)
@@ -75,10 +97,10 @@ def main():
     rows = []
 
     print(f'节点定义: ' + '  '.join(
-        f'{r.name}[{r.f_min:.0f},{r.f_max:.0f}]' for r in PUMP_TURBINE_REGIONS))
+        f'{r.name}[{r.f_min:.1f},{r.f_max:.1f})' for r in regions))
     print(f'绝对锚: ' + '  '.join(
         f'{r.name}→{"—" if a is None else f"{a:.3f}Hz"}'
-        for r, a in zip(PUMP_TURBINE_REGIONS, ANCHOR)))
+        for r, a in zip(regions, ANCHOR)))
     print()
 
     for c in sorted(np.unique(y).tolist()):
@@ -88,17 +110,25 @@ def main():
         Xs = X[idx].astype(np.float64)
 
         acc = {}
-        for n, r in enumerate(PUMP_TURBINE_REGIONS):
+        for n, r in enumerate(regions):
             acc[n] = {'med': [], 'cen': [], 'arg': [], 'e': [], 'bw': [], 'p': []}
 
         for x in Xs:
             nf = ex(x)
             freqs = nf.freqs
             E = np.abs(nf.tfr_stft) ** 2                     # [F, T]
-            for n, r in enumerate(PUMP_TURBINE_REGIONS):
-                m = (freqs >= r.f_min) & (freqs <= r.f_max)
+            for n, r in enumerate(regions):
+                if args.legacy:
+                    # 历史口径: 两端皆闭的硬矩形
+                    m = (freqs >= r.f_min) & (freqs <= r.f_max)
+                    w_in = None
+                    Eb = E[m]                                # [F_n, T]
+                else:
+                    # 与训练侧同源: 半开区间 + 共享内部边单位分解过渡带
+                    w_in = region_weights(freqs, [r])[0]     # [F]
+                    m = w_in > 0.0
+                    Eb = E[m] * w_in[m][:, None]             # [F_n, T]
                 fb = freqs[m]
-                Eb = E[m]                                    # [F_n, T]
                 col = Eb.sum(axis=1)                         # 带内 bin 谱
                 tot = col.sum()
                 if tot <= 0:
@@ -108,7 +138,7 @@ def main():
                 acc[n]['med'].append(float(np.mean(nf.if_hz[n])))
                 acc[n]['cen'].append(cen)
                 acc[n]['arg'].append(arg)
-                acc[n]['e'].append(presence(col))
+                acc[n]['e'].append(presence(col, w_in))
                 acc[n]['bw'].append(float(np.mean(nf.bandwidth[n])))
                 acc[n]['p'].append(float(nf.persistence[n]))
 
@@ -116,7 +146,7 @@ def main():
         print(f'{CLASS_NAMES[c]}  (n={len(Xs)})')
         print(f'{"node":<10s} {"IF_med":>8s} {"E质心":>8s} {"E峰f":>8s} '
               f'{"|锚-f_med|":>11s} {"|锚-E峰|":>10s} {"存在度e":>8s} {"bw":>6s}')
-        for n, r in enumerate(PUMP_TURBINE_REGIONS):
+        for n, r in enumerate(regions):
             med = float(np.mean(acc[n]['med']))
             cen = float(np.mean(acc[n]['cen']))
             arg = float(np.mean(acc[n]['arg']))

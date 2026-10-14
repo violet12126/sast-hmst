@@ -20,10 +20,17 @@ SAST Node Feature Extraction — 从 MSST omega_final 直接提取物理节点�
 
   保留节点 (B4 拆节点: 42-55 Hz 原为单一 BLADE_PASS 节点, 同时装着两种机制,
             一个标量 σ_i 无法既挤窄线又留宽峰 → 拆成两个同质节点):
-    LOW_FREQ:  2-18 Hz   — 流动不稳定性 (涡带/压力脉动); 无绝对锚
-    BPF_DRIFT: 42-48 Hz  — 工况漂移宽峰; 无绝对锚 (频率由流动不稳定性决定)
-    BPF_LINE:  48-53 Hz  — 转速锁定线 1×Z_r·f_rot; 绝对锚 49.995 Hz ±1.5
-    2xBPF:     90-105 Hz — 二倍叶片通过频率, 尖峰, 极度稳定; 绝对锚 99.990 Hz ±1.5
+    LOW_FREQ:  2-18 Hz    — 流动不稳定性 (涡带/压力脉动); 无绝对锚
+    BPF_DRIFT: 42-48.5 Hz — 工况漂移宽峰; 无绝对锚 (频率由流动不稳定性决定)
+    BPF_LINE:  48.5-53 Hz — 转速锁定线 1×Z_r·f_rot; 绝对锚 49.995 Hz ±1.5
+    2xBPF:     90-105 Hz  — 二倍叶片通过频率, 尖峰, 极度稳定; 绝对锚 99.990 Hz ±1.5
+
+  频带划分 (统一由 region_weights 实现, 全仓库单一真源):
+    区间语义为左闭右开 [f_min, f_max); 共享内部边 (BPF_DRIFT|BPF_LINE 的
+    48.5 Hz) 两侧用互补升余弦过渡带 (±SOFT_SPLIT_HZ) 构成**单位分解**,
+    既消除旧实现"两端皆闭 → 48.0 Hz 被两个区域双计"的问题, 又消除旧边界
+    压在漂移峰右翼造成的**单峰劈裂伪峰** (实测: 空转 BPF_LINE 带内
+    E峰f = 48.000 Hz, 且其 presence_e = 0.317 反常地成为全类最高)。
 
   边: BPF_LINE → 2xBPF (r_nom=2.0, INTEGER_HARMONIC) — 唯一的确定性倍频关系
       (只有锁转速的 BPF_LINE 才是 2xBPF 的基频; BPF_DRIFT 不参与倍频约束)
@@ -44,6 +51,7 @@ IF 聚合 (A2 可微 node_if):
   # nodes.freqs: [F] 频率轴 (Hz)
 """
 
+import math
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -94,29 +102,45 @@ PUMP_TURBINE_REGIONS: List[FreqRegion] = [
     #     - 15.14 Hz 在低负荷是最强线 (凸出 11.2 dB), 属同一"水力"族的漂移分量
     #     - >17 Hz 各工况均为平坦宽带 (PMR 0.8-1.5 dB), 无独立峰
     #   → 上界由 25 Hz 收到 18 Hz: 去掉纯宽带尾部, 避免 IF 中位数被抬到带中
-    #   预期宽频 (12 Hz), 中低持续性 (涡带仅部分工况显著)
+    #   预期宽频, 中低持续性 (涡带仅部分工况显著)
     #   w_range: [0.10, 0.45] — 保守, 宽核, 不锐化
     #   无绝对锚: 水力分量频率由流动不稳定性决定, 不锁定转速
-    FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.30, 12.0, 0.50, 0.10, 0.45),
-    # BPF_DRIFT: 工况漂移宽峰, 42-48 Hz (B4 拆节点)
-    #   实测: 带内能量峰在 46.4-48.8 Hz; 45.9 Hz 候选分量在空转 (45.65% 转速)
-    #   仍位于 46.39±0.61 Hz → 频率不锁转速, 由流动不稳定性决定。
+    #   bw_expected 旧值 12.0 是错的: ridge_decay = exp(-(|f-if|/(2·bw))²/8),
+    #   bw=12 使 ±24 Hz 内的 decay 恒 ≈ 0.90, 挤压参与因子在该节点内失效。
+    FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.30,  4.5, 0.50, 0.10, 0.45),
+    # BPF_DRIFT: 工况漂移宽峰, 42-48.5 Hz (B4 拆节点)
+    #   实测 (probe_node_if.py, 每类 12 样本): 带内能量峰在 46.4-47.7 Hz
+    #   (空转 46.417 / 低负荷 47.667 / 中负荷 47.583 / 高负荷 46.625 / 抽水 47.708);
+    #   组内 f 标准差 0.611 Hz, 跨工况中位漂移 46.39 (空转) → 47.85 (抽水),
+    #   与转速不成整数倍 (46.39 / 5.5550 = 8.35 阶) → 频率由流动不稳定性决定。
     #   故: 无绝对锚, w_range 下界低 (允许不挤压), 不参与倍频约束。
+    #   ⚠ 旧注释曾把该分量归因于"空转 45.65% 转速 → 22.82 Hz", 该假设已被
+    #     实测证伪 (20-26 Hz 窗内为均匀噪声底, 能量占比仅 1.16%; 详见 docs §14.4)。
     #   w_range: [0.10, 0.50] — 不信任其"线"性, 保留展宽
-    FreqRegion('BPF_DRIFT', 42.0, 48.0,  'BLADE_DRIFT',    0.30,  6.0, 0.60, 0.10, 0.50),
-    # BPF_LINE: 转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48-53 Hz (B4 拆节点)
-    #   该线位置由转速唯一确定 (与 50 Hz 电网频率数值重合, 只能靠空转换速区分)。
+    FreqRegion('BPF_DRIFT', 42.0, 48.5,  'BLADE_DRIFT',    0.30,  1.7, 0.60, 0.10, 0.50),
+    # BPF_LINE: 转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48.5-53 Hz (B4 拆节点)
+    #   该线位置由转速唯一确定。与 50 Hz 电网频率仅差 0.005 Hz, 远低于 0.5 Hz
+    #   的频率分辨率, 二者数值上不可区分。
+    #   下界 48.5 Hz: 与 BPF_DRIFT 上界共享, 落在两个峰之间的谷 (~48.5 Hz),
+    #   而不是压在漂移峰右翼; 该位置也与 σ 分配的自然分割点
+    #   (node_if_DRIFT + node_if_LINE)/2 ≈ 48.45 Hz 一致。
     #   拆开后不再与漂移宽峰共用一个 σ_i, 锚容差因此可以收紧到 ±1.5 Hz。
     #   w_range: [0.65, 0.95] — 最信任, 极锐
-    FreqRegion('BPF_LINE',  48.0, 53.0,  'BLADE_PASS',     0.80,  1.5, 0.90, 0.65, 0.95,
+    FreqRegion('BPF_LINE',  48.5, 53.0,  'BLADE_PASS',     0.80,  1.0, 0.90, 0.65, 0.95,
                f_anchor=F_BPF_ANCHOR, anchor_tol=1.5),
     # 2xBPF: 二倍叶片通过频率, 90-105 Hz
-    #   预期窄带 (2 Hz), 极高持续性
+    #   预期窄带, 极高持续性
     #   实测: 带内能量峰 = 100.00 Hz (全部带负荷工况), 逐样本 f=100.10 Hz 标准差 0.000,
-    #        空转时该分量消失 (存在度 0.10 vs 带负荷 0.32-0.34) → 确证为 2×BPF
+    #        空转时该分量消失 (过渡带口径 presence_e 0.074 vs 带负荷 0.238-0.256;
+    #        旧硬矩形口径为 0.097 vs 0.319-0.343) → 确证为 2×BPF
     #   锚容差 ±1.5 Hz (紧): 该线位置由转速唯一确定, 不应漂移
     #   w_range: [0.65, 0.90] — 最信任, 极锐
-    FreqRegion('2xBPF',    90.0, 105.0, 'BLADE_HARMONIC',  0.90,  2.0, 0.95, 0.65, 0.90,
+    #   ⚠ bw_expected 4.5 直接取自 probe 的带内 IF 标准差 (五类 5.26/4.81/4.17/
+    #     4.04/4.33 的均值 4.52): 该值被空转样本抬高 (空转此带无分量, 带内 IF 是
+    #     纯噪声游走)。若只按"分量本身有多宽"标定, 应取更小的 ~2.0。取实测均值的
+    #     理由是标定方法可复现 (论文口径统一); 代价是 53-90 Hz 空带内的参与因子
+    #     由 ridge_floor(0.15) 抬到 ~0.39, 属可接受的松弛。
+    FreqRegion('2xBPF',    90.0, 105.0, 'BLADE_HARMONIC',  0.90,  4.5, 0.95, 0.65, 0.90,
                f_anchor=F_2XBPF_ANCHOR, anchor_tol=1.5),
 ]
 
@@ -126,6 +150,126 @@ N_PHYSICS_NODES = len(PUMP_TURBINE_REGIONS)
 # "软"分量类型: 频率由流动不稳定性决定, 不该被鼓励集中/锐化.
 # RE_2D 熵对这类频段不惩罚 (保留展宽); 硬挤压类 (BLADE_PASS/BLADE_HARMONIC) 才罚.
 SOFT_F_TYPES = ('HYDRAULIC', 'BLADE_DRIFT')
+
+
+# ═══════════════════════════════════════════════════════════════
+# 区域频带权重 (单一真源) — 半开区间 + 共享内部边的单位分解过渡带
+# ═══════════════════════════════════════════════════════════════
+#
+# 全仓库曾有 7 份各自独立的 `(freqs >= f_min) & (freqs <= f_max)` 副本
+# (sast_nodes 的提取器/质心, sast_losses 的 Rényi/存在度, ONNX 导出侧),
+# 任何边界改动都要手工同步 7 处。现收敛到本函数。
+SOFT_SPLIT_HZ = 0.5   # 共享内部边的过渡带半宽 (Hz); 0 = 退化为纯硬边界
+
+
+def _clamp01(x, is_torch: bool):
+    return x.clamp(0.0, 1.0) if is_torch else np.clip(x, 0.0, 1.0)
+
+
+def _raised_cosine(x):
+    """升余弦过渡核; 入参需已 clamp 到 [0,1]. 0→0, 1→1, C1 连续。"""
+    if isinstance(x, torch.Tensor):
+        return 0.5 * (1.0 - torch.cos(x * math.pi))
+    return 0.5 * (1.0 - np.cos(x * math.pi))
+
+
+def _w_ge(freqs, v):
+    """左闭阶跃 (numpy / torch 通用)。"""
+    if isinstance(freqs, torch.Tensor):
+        return (freqs >= v).to(freqs.dtype)
+    return (freqs >= v).astype(freqs.dtype)
+
+
+def _w_lt(freqs, v):
+    """右开阶跃 (numpy / torch 通用)。"""
+    if isinstance(freqs, torch.Tensor):
+        return (freqs < v).to(freqs.dtype)
+    return (freqs < v).astype(freqs.dtype)
+
+
+def region_weights(freqs, regions: Optional[List[FreqRegion]] = None,
+                   soft_split_hz: float = SOFT_SPLIT_HZ):
+    """
+    区域频带权重 w_n(f) ∈ [0, 1], 形状 [N_phys, F]。支持 numpy 与 torch,
+    返回类型与 freqs 一致。
+
+    规则:
+      1. 区间语义统一为左闭右开 [f_min, f_max)。旧实现两端皆闭, 使 48.0 Hz
+         同时落入 BPF_DRIFT 与 BPF_LINE (双计)。
+      2. 若 regions[i].f_max == regions[i+1].f_min (共享内部边 b), 则两侧在
+         [b-h, b+h] (h = soft_split_hz) 上用互补升余弦过渡:
+             w_upper(f) = raised_cosine((f - (b-h)) / 2h)
+             w_lower(f) = 1 - w_upper(f)
+         故 w_lower + w_upper ≡ 1 于整个过渡带 —— **单位分解**, 带能量既不
+         重复也不丢失, Σ_n E_n = E_total 成立 (compute_V_obs 的比例运算依赖
+         此性质; 若两侧各自独立软窗则需额外重归一化)。
+      3. 间隙侧边界 (18/42、53/90) 无相邻区域, 保持硬 0/1。
+      4. 外缘不加过渡带的理由: 抽水/中负荷真实漂移峰实测达 E峰f = 47.583~
+         47.708 Hz, 若在 BPF_DRIFT 上沿加对称软窗会削掉真实信号。**漂移翼瓣
+         泄漏是单向的** (σ_drift ∈ [1.75, 2.75] bin 即 std 0.875-1.375 Hz,
+         单个 46.9 Hz 源在 σ=2.75 时 18.0% 能量越过 48 Hz; 而 σ_line ∈
+         [0.625, 1.375] bin 几乎不左漏), 故软化只加在这条内部共享边上。
+
+    Args:
+        freqs: [F] 频率轴 (Hz)
+        regions: FreqRegion 列表 (默认 PUMP_TURBINE_REGIONS)
+        soft_split_hz: 共享内部边的过渡带半宽; 0 → 全部硬边界
+
+    Returns:
+        [N_phys, F] 权重
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    is_t = isinstance(freqs, torch.Tensor)
+    f = freqs if is_t else np.asarray(freqs)
+
+    # 共享内部边的位置取自**规范表** PUMP_TURBINE_REGIONS, 而非本次传入的
+    # regions —— 否则只传单个区域的调用方 (如 Rényi 熵逐区域遍历) 会因
+    # range(N-1) 为空而丢掉过渡带, 行为随调用方式漂移。
+    canon_split = set()
+    if soft_split_hz > 0:
+        for i in range(len(PUMP_TURBINE_REGIONS) - 1):
+            a, b = PUMP_TURBINE_REGIONS[i], PUMP_TURBINE_REGIONS[i + 1]
+            if abs(a.f_max - b.f_min) < 1e-9:
+                canon_split.add(round(b.f_min, 6))
+
+    soft_hi = [soft_split_hz if round(r.f_max, 6) in canon_split else 0.0
+               for r in regions]
+    soft_lo = [soft_split_hz if round(r.f_min, 6) in canon_split else 0.0
+               for r in regions]
+
+    ws = []
+    for n, r in enumerate(regions):
+        # ── 下界 ──
+        if soft_lo[n] > 0:
+            h = soft_lo[n]
+            t = (f - (r.f_min - h)) / (2.0 * h)          # 在 [b-h, b+h] 上 0→1
+            u_lo = _raised_cosine(_clamp01(t, is_t))
+        else:
+            u_lo = _w_ge(f, r.f_min)
+        # ── 上界 ──
+        if soft_hi[n] > 0:
+            h = soft_hi[n]
+            t = (f - (r.f_max - h)) / (2.0 * h)          # 在 [b-h, b+h] 上 0→1
+            u_hi = 1.0 - _raised_cosine(_clamp01(t, is_t))
+        else:
+            u_hi = _w_lt(f, r.f_max)
+
+        ws.append(u_lo * u_hi)
+
+    if is_t:
+        return torch.stack(ws, dim=0)
+    return np.stack(ws, axis=0)
+
+
+def region_masks(freqs, regions: Optional[List[FreqRegion]] = None,
+                 soft_split_hz: float = SOFT_SPLIT_HZ):
+    """布尔掩码 [N_phys, F] = region_weights(...) > 0。
+
+    仅供**必须**用布尔索引的调用方 (如 Rényi 熵的频轴切片)。需要"权重"
+    语义 (求和/质心/存在度) 时应直接用 region_weights, 否则会丢掉过渡带。
+    """
+    return region_weights(freqs, regions, soft_split_hz) > 0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -147,8 +291,8 @@ def band_centroid_if(tfr: torch.Tensor,
     """
     逐节点逐帧的带内能量质心频率 [B, N_phys, T] (对 tfr 可微).
 
-      E(f, t) = |tfr(f, t)|²
-      f_cent  = Σ_{f∈band} E·f / Σ_{f∈band} E
+      E(f, t) = w_n(f) · |tfr(f, t)|²          (w_n 见 region_weights)
+      f_cent  = Σ_f E·f / Σ_f E
 
     与 IF_obs 的区别: 这是"能量所在处", 不是"频带几何中心"——
     即使带宽 16 Hz, 只要能量集中在 2-3 Hz, 质心就落在 2-3 Hz。
@@ -169,16 +313,20 @@ def band_centroid_if(tfr: torch.Tensor,
     dev = mag.device
     out = torch.zeros(B, len(regions), T, device=dev, dtype=dtype)
 
+    # 区域权重 [N_phys, F]: 半开区间 + 共享内部边的单位分解过渡带。
+    # 旧实现用两端皆闭的硬矩形, 导致 (a) 48.0 Hz 被 BPF_DRIFT/BPF_LINE 双计,
+    # (b) 漂移峰右翼整体计入 BPF_LINE —— 空转因此出现 E峰f = 48.000 Hz 的
+    # 劈裂伪峰。加权后 48.0 Hz 完全归 BPF_DRIFT, 过渡带 [48.0, 49.0] 内按
+    # 升余弦互补分配。
+    w_all = region_weights(freqs, regions).to(dtype=dtype, device=dev)  # [N, F]
+    e_full = mag.pow(2)                                          # [B, F, T]
+    f_ax_full = freqs.to(dtype=dtype, device=dev).view(1, F, 1)   # [1, F, 1]
+
     for n, r in enumerate(regions):
-        m = (freqs >= r.f_min) & (freqs <= r.f_max)
-        Fn = int(m.sum().item())
-        if Fn == 0:
-            out[:, n, :] = (r.f_min + r.f_max) / 2.0
-            continue
-        e = mag[:, m, :].pow(2)                                  # [B, Fn, T]
+        w = w_all[n].view(1, F, 1)                               # [1, F, 1]
+        e = e_full * w                                           # [B, F, T]
         tot = e.sum(dim=1)                                       # [B, T]
-        f_ax = freqs[m].to(dtype=dtype, device=dev).view(1, -1, 1)
-        cent = (e * f_ax).sum(dim=1) / tot.clamp(min=eps)        # [B, T]
+        cent = (e * f_ax_full).sum(dim=1) / tot.clamp(min=eps)   # [B, T]
         # 带内完全无能量 -> 质心无意义, 退化为频带中心
         cent = torch.where(tot > eps, cent,
                            torch.full_like(cent, (r.f_min + r.f_max) / 2.0))
@@ -282,13 +430,16 @@ class MSSTNodeExtractor:
         energy = np.zeros((self.N_nodes, T), dtype=np.float64)
         bandwidth = np.zeros((self.N_nodes, T), dtype=np.float64)
 
+        # 区域权重: 统一真源 (半开区间 + 共享内部边单位分解过渡带)。
+        # 旧实现用两端皆闭的硬矩形 → 48.0 Hz 双计 + 漂移峰右翼计入 BPF_LINE。
+        w_all = region_weights(freqs, self.regions)                  # [N, F] float64
+
         for n_idx, region in enumerate(self.regions):
-            # 频率区域掩码
-            freq_mask = (freqs >= region.f_min) & (freqs <= region.f_max)
+            w_f = w_all[n_idx]                                       # [F]
 
             for t in range(T):
-                # 该区域内且 omega_final 有效的 bin
-                region_valid = freq_mask & valid_mask[:, t]
+                # 该区域内 (权重 > 0) 且 omega_final 有效的 bin
+                region_valid = (w_f > 0.0) & valid_mask[:, t]
                 if not region_valid.any():
                     # 无有效 IF → 使用区域中心频率作为 fallback
                     if_hz[n_idx, t] = (region.f_min + region.f_max) / 2.0
@@ -297,14 +448,15 @@ class MSSTNodeExtractor:
                     continue
 
                 if_vals = if_map[region_valid, t]
-                w_vals = stft_energy[region_valid, t]
+                # 加权能量: 过渡带内的 bin 按 w<1 打折 (与 band_centroid_if 一致)
+                w_vals = stft_energy[region_valid, t] * w_f[region_valid]
                 w_tot = float(w_vals.sum())
                 if w_tot > 0:
                     # A2/B1: 能量加权均值 (取代无权重中位数)
                     if_hz[n_idx, t] = float((w_vals * if_vals).sum() / w_tot)
                 else:
                     if_hz[n_idx, t] = float(np.mean(if_vals))
-                energy[n_idx, t] = np.log1p(stft_energy[region_valid, t].sum())
+                energy[n_idx, t] = np.log1p(w_vals.sum())
                 # 带宽: IF 标准差, 钳制到合理范围
                 if len(if_vals) >= 2:
                     bw = np.std(if_vals)
@@ -387,12 +539,18 @@ class MSSTNodeExtractor:
             energy_b = torch.zeros(self.N_nodes, T, device=device, dtype=torch.float32)
             bw_b = torch.zeros(self.N_nodes, T, device=device, dtype=torch.float32)
 
+            # 区域权重 [N_phys, F] — 统一真源 (半开区间 + 共享内部边单位分解过渡带)
+            w_all = region_weights(freqs, self.regions)              # [N, F]
+
             for n_idx, region in enumerate(self.regions):
-                freq_mask = (freqs >= region.f_min) & (freqs <= region.f_max)  # [F]
+                w_f = w_all[n_idx]                                       # [F]
+                freq_mask = w_f > 0.0                                    # [F] 区域支撑
                 # ── Narrow to region bins only (F_region ≪ F, ~30 bins) ──
                 region_if = if_map[freq_mask, :]         # [F_r, T]
                 region_valid = valid_mask[freq_mask, :]   # [F_r, T]
-                region_energy_map = stft_energy[freq_mask, :]  # [F_r, T]
+                # 加权能量: 过渡带内的 bin 按 w<1 打折 (取代两端皆闭的硬矩形)
+                region_energy_map = (stft_energy[freq_mask, :] *
+                                     w_f[freq_mask].unsqueeze(1))  # [F_r, T]
                 F_r, T = region_if.shape
                 counts = region_valid.sum(dim=0)           # [T]
 

@@ -52,19 +52,88 @@ from models.sast_graph import (
 
 
 # ═══════════════════════════════════════════════════════════════
-# 0. Static Prototypes (from EDA on 5_dataset.npz)
+# 0. Static Prototypes (5 × 6, 由 scripts/analysis/build_static_prototypes.py 重算)
 # ═══════════════════════════════════════════════════════════════
-
+# B4 拆节点 (4 物理节点) 后按 compute_v_obs 的同一条计算路径重算, 由构造保证
+# 与在线特征同一归一化。旧 5×4 表 (3 节点时期 EDA) 有三处问题, 均已修正:
+#   1. 前三列之和 0.273/0.911/0.620/0.819/0.806, 而在线的 E_total = Σ 带能量
+#      使前三列恒和为 1.0 —— 余弦相似度对"R 块 vs log 比值列"的相对权重敏感,
+#      该不一致会系统性扭曲 alpha。
+#   2. 旧代码 E_lin = exp(log1p(x)) = 1 + x (应为 expm1), 每个节点被加 +1 地板。
+#   3. E_bpf = E_DRIFT + E_LINE 的重新合并抹掉了 B4 拆分最有判别力的特征。
+# 列序 = [R_LF, R_DRIFT, R_LINE, R_2x, log10(E_DRIFT/E_LINE), log10((E_DRIFT+E_LINE)/E_2x)]
+# 计算口径: train 划分 (val_split=0.15, seed=42 -> N=6575, 已排除验证集),
+#   class 0 全量 196 样本, 其余各类抽 400; 逐列取中位数后把 R 块重新归一化到 1。
 STATIC_PROTOTYPES = torch.tensor([
-    [0.037636, 0.208980, 0.026644, 0.986240],  # Class 0: No-load
-    [0.068068, 0.832580, 0.010149, 1.987957],  # Class 1: Low load
-    [0.046170, 0.269881, 0.303809, 0.001379],  # Class 2: Mid load
-    [0.013093, 0.153476, 0.652464, -0.651019], # Class 3: High load
-    [0.021357, 0.685910, 0.099116, 0.850605],  # Class 4: Pumping
+    [0.138863, 0.671624, 0.112759, 0.076755,  0.738565,  1.014024],  # Class 0: 空转
+    [0.078291, 0.414625, 0.494852, 0.012232, -0.080094,  1.868020],  # Class 1: 低负荷
+    [0.098077, 0.209527, 0.118380, 0.574016,  0.181772, -0.205221],  # Class 2: 中负荷
+    [0.016501, 0.093141, 0.037490, 0.852869,  0.389718, -0.778678],  # Class 3: 高负荷
+    [0.049762, 0.455254, 0.345705, 0.149280,  0.118111,  0.746714],  # Class 4: 抽水
 ], dtype=torch.float64)
 
 N_PROTOTYPES = STATIC_PROTOTYPES.shape[0]  # 5
-PROTOTYPE_DIM = STATIC_PROTOTYPES.shape[1]  # 4
+PROTOTYPE_DIM = STATIC_PROTOTYPES.shape[1]  # 6
+
+
+# ═══════════════════════════════════════════════════════════════
+# 0b. 在线工况特征向量 V_obs (模块级纯函数)
+# ═══════════════════════════════════════════════════════════════
+# 做成模块级函数, 是为了让 scripts/analysis/build_static_prototypes.py 能在
+# **不实例化模型**的前提下复用同一条计算路径 —— 否则该脚本需要
+# StaticPrototypeMatcher, 而后者又要 STATIC_PROTOTYPES 的形状, 形成循环依赖。
+# StaticPrototypeMatcher.compute_V_obs 只是本函数的薄委托。
+def compute_v_obs(node_energy: torch.Tensor) -> torch.Tensor:
+    """
+    从节点对数能量算 6 维工况特征向量 V_obs。
+
+    V_obs = [ R_LF, R_DRIFT, R_LINE, R_2x,
+              log10(E_DRIFT / E_LINE),            # 漂移/线 判别子
+              log10((E_DRIFT + E_LINE) / E_2x) ]  # 谐波比值 (保留旧语义)
+
+    注意 (与 node_energy 的换算):
+      node_energy = log1p(band_energy), 故精确逆运算是 **expm1**。
+      旧实现用 torch.exp(...), 实际得到 1 + band_energy —— 每个节点都被加了
+      +1 地板。对强带可忽略, 对弱带会把能量占比系统性地抬向 1/3 (旧原型
+      类 1 的 BPF 族占比 0.0101 即受此影响)。此处改用 expm1。
+
+    注意 (归一化一致性):
+      旧冻结原型前三列之和为 0.273/0.911/0.620/0.819/0.806, 而本函数的
+      E_total = Σ 带能量 使前三列恒和为 1.0 —— 离线 EDA 与在线代码用了不同
+      归一化。余弦相似度**不是**对"前三列整体 vs log 比值列"相对权重不变的,
+      故旧 alpha 被系统性扭曲。现已按 4 节点重算原型, 由构造与本节一致。
+
+    Args:
+        node_energy: [B, N_phys, T] 节点对数能量 (= log1p(带能量))
+
+    Returns:
+        [B, T, 6]
+    """
+    eps = 1e-12
+    # node_energy = log1p(band_energy) -> band_energy = expm1(node_energy)
+    E_lin = torch.expm1(node_energy.clamp(max=20.0))  # [B, N, T] ≥ 0
+
+    E_lf = E_lin[:, NODE_LOW_FREQ - 1, :]
+    E_drift = E_lin[:, NODE_BPF_DRIFT - 1, :]
+    E_line = E_lin[:, NODE_BPF_LINE - 1, :]
+    E_2x = E_lin[:, NODE_2XBPF - 1, :]
+    E_total = (E_lf + E_drift + E_line + E_2x).clamp(min=eps)
+
+    R_LF = E_lf / E_total                        # [B, T]
+    R_DRIFT = E_drift / E_total                  # [B, T]
+    R_LINE = E_line / E_total                    # [B, T]
+    R_2xBPF = E_2x / E_total                     # [B, T]
+
+    # 漂移/线 判别子 —— B4 拆节点带来的最有判别力的特征。旧实现为对齐
+    # 3 节点时期的原型把二者合并回 "BPF 族", 恰好把它抹掉了。
+    log_drift_line = torch.log10(
+        E_drift.clamp(min=eps) / E_line.clamp(min=eps))
+    # 谐波比值: 编码 BPF_LINE → 2xBPF 的整数倍频关系 (r_nom = 2.0)
+    log_harm = torch.log10(
+        (E_drift + E_line).clamp(min=eps) / E_2x.clamp(min=eps))
+
+    return torch.stack(
+        [R_LF, R_DRIFT, R_LINE, R_2xBPF, log_drift_line, log_harm], dim=-1)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -89,14 +158,16 @@ class StaticPrototypeMatcher(nn.Module):
         self.d_cond = d_cond
         self.temperature = temperature
 
-        # Frozen prototypes from EDA: [5, 4]
+        # Frozen prototypes (4 节点重算, 见 compute_v_obs): [5, 6]
         self.register_buffer('prototypes', STATIC_PROTOTYPES.clone())
 
         # Learnable prototype interpretation embeddings: [5, d_cond]
         # 模型学习"像原型 k"如何转化为挤压策略
         self.P_embed = nn.Parameter(torch.randn(N_PROTOTYPES, d_cond) * 0.02)
 
-        # V_obs 投影: 4 -> d_cond (对齐到 prototype 空间)
+        # V_obs 投影: PROTOTYPE_DIM (6) -> d_cond (对齐到 prototype 空间)
+        # 注: 本模块在 forward 中**未被调用** —— alpha 直接来自 cosine,
+        # 故 obs_proj 是 dead code (其参数量随 PROTOTYPE_DIM 变化, 但不影响前向)
         self.obs_proj = nn.Sequential(
             nn.Linear(PROTOTYPE_DIM, d_cond),
             nn.LayerNorm(d_cond),
@@ -106,8 +177,9 @@ class StaticPrototypeMatcher(nn.Module):
     def forward(self, V_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            V_obs: [B, T, 4]  每帧实时能量比例向量
-                   [R_LF, R_BPF, R_2xBPF, log10(E_BPF/E_2xBPF)]
+            V_obs: [B, T, 6]  每帧实时工况特征向量
+                   [R_LF, R_DRIFT, R_LINE, R_2x,
+                    log10(E_DRIFT/E_LINE), log10((E_DRIFT+E_LINE)/E_2x)]
 
         Returns:
             cond_ctx: [B, T, d_cond]  工况上下文嵌入
@@ -117,9 +189,9 @@ class StaticPrototypeMatcher(nn.Module):
         device = V_obs.device
 
         # 余弦相似度
-        proto = self.prototypes.to(device).to(V_obs.dtype)        # [5, 4]
-        proto_norm = F.normalize(proto, dim=-1)                    # [5, 4]
-        obs_norm = F.normalize(V_obs, dim=-1)                      # [B, T, 4]
+        proto = self.prototypes.to(device).to(V_obs.dtype)        # [5, 6]
+        proto_norm = F.normalize(proto, dim=-1)                    # [5, 6]
+        obs_norm = F.normalize(V_obs, dim=-1)                      # [B, T, 6]
 
         sim = torch.matmul(obs_norm, proto_norm.T)                 # [B, T, 5]
         alpha = F.softmax(sim / self.temperature, dim=-1)          # [B, T, 5]
@@ -132,42 +204,12 @@ class StaticPrototypeMatcher(nn.Module):
 
     def compute_V_obs(self, node_energy: torch.Tensor,
                        freqs: torch.Tensor) -> torch.Tensor:
+        """薄委托到模块级 compute_v_obs (见其 docstring)。
+
+        freqs 形参保留仅为兼容既有调用方 (sast.py Step 3 / ONNX 导出)。
         """
-        从节点能量 + 频率轴实时计算 V_obs (4 维能量比例向量).
-
-        Args:
-            node_energy: [B, N_phys, T]  节点对数能量
-            freqs:       [F] 频率轴 (Hz)
-
-        Returns:
-            V_obs: [B, T, 4]  [R_LF, R_BPF, R_2xBPF, log10(E_BPF/E_2xBPF)]
-        """
-        B, N, T = node_energy.shape
-        device = node_energy.device
-
-        # node_energy 已经是对数能量, 转回线性用于比例计算
-        E_lin = torch.exp(node_energy.clamp(max=20.0))  # [B, N, T]
-
-        # B4 拆节点: 冻结原型 (STATIC_PROTOTYPES) 是按"3 节点能量划分"离线统计的
-        # (E_total = E_LF + E_BPF + E_2xBPF), 语义为 BPF 族整体。拆节点后必须把
-        # BPF_DRIFT + BPF_LINE 合并回"BPF 族", 否则 V_obs 的语义与原型不匹配。
-        # ⚠ 若日后重做 EDA 并按 4 节点重建原型, 这里应改为直接取 4 个节点能量。
-        E_bpf = E_lin[:, NODE_BPF_DRIFT - 1, :] + E_lin[:, NODE_BPF_LINE - 1, :]
-        E_2x = E_lin[:, NODE_2XBPF - 1, :]
-        E_lf = E_lin[:, NODE_LOW_FREQ - 1, :]
-        E_total = (E_lf + E_bpf + E_2x).clamp(min=1e-12)
-
-        R_LF = E_lf / E_total                        # [B, T]
-        R_BPF = E_bpf / E_total                      # [B, T]
-        R_2xBPF = E_2x / E_total                     # [B, T]
-
-        eps = 1e-12
-        log_ratio = torch.log10(
-            E_bpf.clamp(min=eps) / E_2x.clamp(min=eps)
-        )  # [B, T]
-
-        V_obs = torch.stack([R_LF, R_BPF, R_2xBPF, log_ratio], dim=-1)  # [B, T, 4]
-        return V_obs
+        del freqs
+        return compute_v_obs(node_energy)
 
 
 # ═══════════════════════════════════════════════════════════════

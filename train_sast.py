@@ -408,6 +408,11 @@ def main():
 
             # Additional diagnostics
             losses_dict['gate_mean'] = results['gate_edge'].mean().item()
+            # 逐节点 w_i (batch 时间均值) —— 让"w_i 何时爬到区间边界"变得可见
+            with torch.no_grad():
+                _wn = results['w_i'].mean(dim=(0, 2))          # [N_phys]
+                for _i, _r in enumerate(PUMP_TURBINE_REGIONS):
+                    losses_dict[f'w_i_{_r.name}'] = _wn[_i].item()
             losses_dict['C_prior_mean'] = model.get_C_prior().mean().item()
 
             # ── Backward ──
@@ -450,6 +455,10 @@ def main():
               f"wλ(p/a/r)={epoch_losses.get('w_physics', 0):.1f}/"
               f"{epoch_losses.get('w_anchor', 0):.1f}/"
               f"{epoch_losses.get('w_ratio', 0):.1f}")
+        print("                w_i: " + '  '.join(
+            f"{_r.name}={epoch_losses.get(f'w_i_{_r.name}', 0):.3f}"
+            f"[{_r.w_range_low},{_r.w_range_high}]"
+            for _r in PUMP_TURBINE_REGIONS))
         for _r in PUMP_TURBINE_REGIONS:
             _ih = epoch_losses.get(f'if_hat_{_r.name}', 0.0)
             _pr = epoch_losses.get(f'presence_{_r.name}', 0.0)

@@ -272,6 +272,20 @@ def region_masks(freqs, regions: Optional[List[FreqRegion]] = None,
     return region_weights(freqs, regions, soft_split_hz) > 0
 
 
+def physics_band_mask(freqs, regions: Optional[List[FreqRegion]] = None):
+    """[F] bool — 4 个物理频带的**并集**支撑 (带外为 False)。
+
+    用途: 把 FreqEncoder 的输入限制在物理带内。带外 (F=1000 时占 92%) 仍携带
+    可观的工况信息 —— 实测带外 916 个 bin 的 1-NN 工况分类精度 **0.800**
+    (chance 0.200), 而带内 84 个 bin 是 0.950。编码器据此可以把 SupCon 刷到 0
+    而不依赖 GAT 的挤压, 即"旁路": 实测训练后 sc 塌到 0.000、Val acc 饱和在 1.000。
+    见 docs §16.4.3。
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    return region_weights(freqs, regions).sum(dim=0) > 0.0
+
+
 # ═══════════════════════════════════════════════════════════════
 # 可微节点频率 (A2) — 作用在**增强 TFR** 上, 与观测 IF 分工不同
 # ═══════════════════════════════════════════════════════════════

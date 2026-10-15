@@ -28,7 +28,8 @@ import math
 from typing import Dict, Tuple, Optional, List
 
 from models.sast_nodes import (FreqRegion, PUMP_TURBINE_REGIONS, N_PHYSICS_NODES,
-                               SOFT_F_TYPES, band_centroid_if, region_weights)
+                               SOFT_F_TYPES, band_centroid_if, region_weights,
+                               physics_band_mask)
 from models.sast_graph import PHYSICS_EDGES, N_EDGES, EdgeType
 
 
@@ -682,6 +683,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      presence_frac: float = 0.1,
                      w_low_min: float = 0.05,
                      freq_constraints_active: bool = False,
+                     freq_encoder_masked: bool = True,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     SAST v4 总损失 (SupCon 自监督).
@@ -739,7 +741,13 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         regions = PUMP_TURBINE_REGIONS
 
     # ── 各分量 ──
-    z_freq = freq_encoder(tfr_enhanced)
+    # 屏蔽带外 bin: 否则编码器可靠 105-500 Hz 的底噪区分工况, 把 SupCon 刷到 0
+    # 而梯度不流向 GAT (实测带外 1-NN 精度 0.800 vs chance 0.200)。见 docs §16.4.3。
+    _fe_in = tfr_enhanced
+    if freq_encoder_masked:
+        _fe_in = tfr_enhanced * physics_band_mask(freqs).to(
+            tfr_enhanced.dtype).view(1, -1, 1)
+    z_freq = freq_encoder(_fe_in)
     l_supcon = supcon_loss(z_freq, y_true, temperature=supcon_temperature)
     l_entropy = renyi_2d_loss(tfr_enhanced, freqs)
     if A_ij is not None:

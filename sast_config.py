@@ -102,11 +102,13 @@ class SastConfig:
     # n_sqz_max 现为软门控的 M (最大轮数): r = clamp(w_i*M, 0, M),
     # g_m = clamp(r - (m-1), 0, 1)。取代旧的整数 n_sqz_per_bin 掩码
     # (那条路径训练不启用、round() 不可微、且 clamp(1,..) 使 0 轮不可达)。
-    # M=3: 各节点 w_range 映射后 BPF_LINE≈2.6-3.8 轮 / LOW_FREQ≈0.4-1.8 轮。
+    # M 由 3 降为 2: 实测 (docs §16.4.4) R=1->2 有实质收益 (BPF_LINE Rényi
+    # 7.1199->7.0178), 而 R=2->3->4 完全进入平台期 (7.0178/7.0122/7.0128)。
+    # 取 M=2 既在拐点上, 又把单步重排 192ms 降到 128ms (省 33%)。
     # 实测代价 (B=10,F=1000,T=2000): 重排本体 M=1 71ms -> M=3 192ms (+109ms);
     # 端到端 46s -> 51s per epoch (=+11%, 与 MSST 等环节重叠)。
     # ⚠ 整模型显存实测已占 6.5-7.5 GB / 8 GB, 加大 M 或 batch 前需重估。
-    n_sqz_max: int = 3
+    n_sqz_max: int = 2
     # 门控形状: 'clamp' (推荐, 无参且能真正到 0 轮) | 'sigmoid'
     gate_mode: str = 'clamp'
     # 是否施加 ridge 空间参与因子。**默认 False** —— 见 docs §16.4.2 / §16.4.1。
@@ -118,6 +120,11 @@ class SastConfig:
     #   Val acc 两组都是 1.000 (已饱和, 无损失)。ridge 与架构不匹配, 不是参数问题。
     # 保留该开关是为了论文里的消融可复现; 设为 True 可复现旧行为。
     train_ridge: bool = False
+    # 是否把 FreqEncoder 的输入限制在 4 个物理带内。默认 True。
+    # WHY: 带外占 92% 的 bin 且携带工况信息 (带外 1-NN 0.800 vs chance 0.200),
+    #   编码器可据此把 SupCon 刷到 0 而不依赖 GAT —— 实测 sc 塌到 0.000、
+    #   Val acc 饱和在 1.000。屏蔽后梯度才必须经过物理节点的重排。
+    freq_encoder_masked: bool = True
     # 消融: 断开门控路径 / 断开 sigma 路径 (回答门控是否只是 w_range 的重参数化)
     gate_detach: bool = False
     sigma_detach: bool = False

@@ -10,6 +10,17 @@ import torch
 
 from models.sast import SAST
 from models.sast_losses import FreqEncoder
+from models.sast_nodes import physics_band_mask
+
+
+def _masked_tfr(result):
+    """把增强谱限制在 4 个物理带内再做 z_freq 编码 (与训练侧同一处理)。
+
+    与 total_sast_loss 里的掩码同源 (physics_band_mask), 保证验证指标与训练
+    优化的输入分布一致 —— 否则训练时编码器看带内、验证时看全带, 指标会失真。
+    """
+    tfr, freqs = result['tfr_enhanced'], result['freqs']
+    return tfr * physics_band_mask(freqs).to(tfr.dtype).view(1, -1, 1)
 
 
 @torch.no_grad()
@@ -73,7 +84,7 @@ def predict_class(model: SAST, freq_encoder: FreqEncoder, x,
     x = x.to(device)
 
     result = model(x, return_all=True)
-    z = freq_encoder(result['tfr_enhanced'])  # [1, D]
+    z = freq_encoder(_masked_tfr(result))      # [1, D]
     centroids = centroids.to(device)
     sims = torch.matmul(z, centroids.T)[0]    # [n_classes]
     pred = int(sims.argmax())
@@ -105,7 +116,7 @@ def compute_class_centroids(model: SAST, freq_encoder: FreqEncoder,
         batch_x = torch.from_numpy(X[start:end]).float().to(device)
         batch_y = torch.from_numpy(y[start:end]).long().to(device)
         result = model(batch_x, return_all=True)
-        z = freq_encoder(result['tfr_enhanced'])  # [B, D]
+        z = freq_encoder(_masked_tfr(result))     # [B, D]
         if z_sum is None:
             z_sum = torch.zeros(n_classes, z.shape[1], device=device)
         for c in range(n_classes):
@@ -144,7 +155,7 @@ def evaluate_accuracy(model: SAST, freq_encoder: FreqEncoder,
         batch_x = torch.from_numpy(X[start:end]).float().to(device)
         batch_y = y[start:end]
         result = model(batch_x, return_all=True)
-        z = freq_encoder(result['tfr_enhanced'])       # [B, D]
+        z = freq_encoder(_masked_tfr(result))          # [B, D]
         sims = torch.matmul(z, centroids.T)            # [B, n_classes]
         preds = sims.argmax(dim=-1).cpu().numpy()
         for i, true_label in enumerate(batch_y):

@@ -123,7 +123,7 @@ Examples:
                    help='分量缺席时 w_range/balance 下界松弛到该值')
 
     # ── New module settings ──
-    p.add_argument('--n_sqz_max', type=int, default=3,
+    p.add_argument('--n_sqz_max', type=int, default=2,
                    help='软门控最大轮数 M (r=clamp(w_i*M,0,M), '
                         'g_m=clamp(r-(m-1),0,1)); 训练推理同一路径')
     p.add_argument('--gate_mode', type=str, default='clamp',
@@ -134,6 +134,9 @@ Examples:
                         '20 epoch 全量实测: 关掉后 hard Rényi 7.721 vs 7.853、'
                         'hard 带内 std 0.659 vs 0.873, 两个轴都更好, Val acc 同'
                         '为 1.000。设 1 可复现旧行为 (docs §16.4.2)')
+    p.add_argument('--freq_encoder_masked', type=int, default=1, choices=[0, 1],
+                   help='FreqEncoder 只看 4 个物理带 (默认 1)。带外占 92%% 的 bin '
+                        '且携带工况信息, 不屏蔽则编码器可绕开 GAT 刷 SupCon')
     p.add_argument('--gate_detach', type=int, default=0, choices=[0, 1],
                    help='消融: 断开门控路径 (只剩 sigma 路径)')
     p.add_argument('--sigma_detach', type=int, default=0, choices=[0, 1],
@@ -179,6 +182,7 @@ Examples:
         n_sqz_max=args.n_sqz_max,
         gate_mode=args.gate_mode,
         train_ridge=bool(args.train_ridge),
+        freq_encoder_masked=bool(args.freq_encoder_masked),
         gate_detach=bool(args.gate_detach),
         sigma_detach=bool(args.sigma_detach),
         resume=args.resume,
@@ -393,6 +397,7 @@ def main():
                 presence_frac=config.presence_frac,
                 w_low_min=config.w_low_min,
                 freq_constraints_active=config.freq_constraints_active,
+                freq_encoder_masked=config.freq_encoder_masked,
             )
 
             # Additional diagnostics
@@ -505,6 +510,7 @@ def main():
                     presence_frac=config.presence_frac,
                     w_low_min=config.w_low_min,
                     freq_constraints_active=config.freq_constraints_active,
+                    freq_encoder_masked=config.freq_encoder_masked,
                 )
                 # Attach losses to results for title context
                 viz_results['_losses'] = viz_losses

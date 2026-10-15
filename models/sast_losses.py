@@ -180,6 +180,61 @@ def renyi_2d_loss(tfr: torch.Tensor,
     return loss / max(1, n_squeeze)
 
 
+def _h2_band(tfr: torch.Tensor, freqs: torch.Tensor, region: FreqRegion,
+             alpha: int = 2, eps: float = 1e-8) -> torch.Tensor:
+    """单个频带的 2D Rényi 熵 (标量)。口径与 renyi_2d_loss 完全一致。"""
+    w_f = region_weights(freqs, [region])[0]
+    m = w_f > 0.0
+    t = (tfr[:, m, :] * w_f[m].view(1, -1, 1)).clamp(min=eps)
+    p = t / t.sum(dim=(1, 2), keepdim=True).clamp(min=eps)
+    return (torch.log((p ** alpha).sum(dim=(1, 2)).clamp(min=eps))
+            / (1.0 - alpha)).mean()
+
+
+def soft_entropy_hinge(tfr_enhanced: torch.Tensor, tfr_raw: torch.Tensor,
+                       freqs: torch.Tensor,
+                       regions: Optional[List[FreqRegion]] = None,
+                       delta_H: float = 0.55) -> torch.Tensor:
+    """软带的**相对熵降护栏** —— 只允许增强谱比原始谱少 delta_H nats 的 Rényi-2D 熵。
+
+    WHY 用相对熵降而不是绝对带宽 bw_target:
+      bw_target (E_raw 加权的 omega_0 带内 std) 受**框宽偏差**支配 —— 实测
+      raw std 几乎精确等于 B_n/sqrt(12) (均匀分布签名), 且对"中心频率跨帧游走型"
+      的软分量 (BPF_DRIFT) 在原理上测不到 (单帧内它是窄的)。而本 hinge 用**同一
+      频带、同一掩码**下 H2(E_raw) 与 H2(E_enh) 的**差**: 框宽把两个熵同时推向
+      log(F_n), 在差值里抵消。实测底噪幅度跨 500 倍, 熵降变化 < 0.6% —— 共模
+      抵消是数值事实, 故**固定 delta_H 成立, 无需逐样本自适应**。
+
+    WHY 需要它: `lowfreq_sharpness_loss` 只作用于 regions[0] (LOW_FREQ), 故
+      **BPF_DRIFT 在"别挤"方向没有任何约束**, 只受 w_range 上界限制 —— 实测它
+      恰好顶死在 w_range_high=0.50。本项补上这个缺口。
+
+    标定 (合成对照, 白噪经高斯谱包络 + 宽带底噪, 同带同噪声扫描):
+      σ_int=0.50 Hz (FWHM 1.18) -> 1.176 nats
+      σ_int=1.00 Hz (FWHM 2.35) -> 0.547   <- BPF_DRIFT 的 FWHM 2-3 Hz 落此处
+      σ_int=1.50 Hz (FWHM 3.53) -> 0.229
+    取 delta_H = 0.55 (区间 0.36-0.79 对应 σ_int 0.85-1.27 Hz)。
+    实测当前模型 BPF_DRIFT 的熵降为 1.2561 -> 本 hinge 会 bind。
+
+    Args:
+        tfr_enhanced: [B, F, T] 增强谱幅值
+        tfr_raw:      [B, F, T] 原始 STFT 幅值 (同一口径, 用于建立基准)
+        delta_H:      允许的熵降 (nats)
+    """
+    if regions is None:
+        regions = PUMP_TURBINE_REGIONS
+    loss = torch.zeros((), device=tfr_enhanced.device)
+    n = 0
+    for region in regions:
+        if region.f_type not in SOFT_F_TYPES:
+            continue                      # 硬带仍由 renyi_2d_loss 最小化熵
+        h_raw = _h2_band(tfr_raw, freqs, region).detach()      # 单侧: 不推 E_raw
+        h_enh = _h2_band(tfr_enhanced, freqs, region)
+        loss = loss + torch.relu((h_raw - delta_H) - h_enh)
+        n += 1
+    return loss / max(1, n)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 4. L_physics - 比值偏差物理一致性
 # ═══════════════════════════════════════════════════════════════
@@ -682,6 +737,8 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      regions: Optional[List[FreqRegion]] = None,
                      presence_frac: float = 0.1,
                      w_low_min: float = 0.05,
+                     lambda_soft_ent: float = 0.5,
+                     delta_H: float = 0.55,
                      freq_constraints_active: bool = False,
                      freq_encoder_masked: bool = True,
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -750,6 +807,9 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     z_freq = freq_encoder(_fe_in)
     l_supcon = supcon_loss(z_freq, y_true, temperature=supcon_temperature)
     l_entropy = renyi_2d_loss(tfr_enhanced, freqs)
+    # 软带的相对熵降护栏 (硬带仍走上面的最小化熵)
+    l_soft_ent = soft_entropy_hinge(tfr_enhanced, tfr_raw, freqs,
+                                    regions, delta_H=delta_H)
     if A_ij is not None:
         l_physics = physics_consistency_loss(
             A_ij, edge_feats, edge_src, edge_dst
@@ -791,7 +851,8 @@ def total_sast_loss(tfr_raw: torch.Tensor,
              lambda_var * l_var +
              lambda_consistency * l_consistency +
              lambda_lowfreq * l_lowfreq +
-             lambda_range * l_range)
+             lambda_range * l_range +
+             lambda_soft_ent * l_soft_ent)
 
     # ── 方案 A: 频率约束 (伪物理约束) 是否参与反向图 ──
     # 三项照旧在下方诊断中计算。降级时只把它们的加权贡献从 total 里摘掉,
@@ -810,6 +871,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'total': total.item(),
         'supcon': l_supcon.item(),
         'entropy_2d': l_entropy.item(),
+        'soft_ent': l_soft_ent.item(),
         'physics': l_physics.item(),
         'balance': l_balance.item(),
         'w_var': l_var.item(),

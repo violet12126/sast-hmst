@@ -73,6 +73,14 @@ class SastConfig:
     #   时频质量改由 evaluate_tf_quality 观测。
     lambda_supcon: float = 0.2
     lambda_entropy: float = 0.1
+    # ── 软带相对熵降护栏 (L_soft_ent) ──
+    # 只允许增强谱比原始谱少 delta_H nats 的 Rényi-2D 熵; 补上 BPF_DRIFT 在
+    # "别挤"方向无约束的缺口 (lowfreq_sharpness_loss 只覆盖 LOW_FREQ)。
+    # delta_H 由合成对照标定: BPF_DRIFT 的 FWHM 2-3 Hz -> σ_int≈1.0 Hz -> 0.55 nats
+    # (区间 0.36-0.79 对应 σ_int 0.85-1.27)。实测底噪跨 500 倍熵降变化 <0.6%,
+    # 即共模抵消成立, 固定 delta_H 可用。
+    lambda_soft_ent: float = 0.5
+    delta_H: float = 0.55
     lambda_physics: float = 0.5
     lambda_balance: float = 0.5
     lambda_var: float = 0.5

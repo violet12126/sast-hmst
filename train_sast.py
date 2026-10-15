@@ -102,6 +102,10 @@ Examples:
                    help='SupCon 权重; 已由 1.0 降到 0.2 (不做分类, 仅作 '
                         'cond_ctx 工况区分度的辅助正则, 重心回到时频分布)')
     p.add_argument('--lambda_entropy', type=float, default=0.1)
+    p.add_argument('--lambda_soft_ent', type=float, default=0.5,
+                   help='软带相对熵降护栏的权重; 0 = 关闭 (复现旧行为)')
+    p.add_argument('--delta_H', type=float, default=0.55,
+                   help='软带允许的 Rényi-2D 熵降 (nats), 合成对照标定为 0.55')
     p.add_argument('--lambda_physics', type=float, default=0.5)
     p.add_argument('--lambda_balance', type=float, default=0.5)
     p.add_argument('--lambda_var', type=float, default=0.5)
@@ -385,6 +389,8 @@ def main():
                 results['A_ij'],
                 lambda_supcon=config.lambda_supcon,
                 lambda_entropy=config.lambda_entropy,
+                lambda_soft_ent=config.lambda_soft_ent,
+                delta_H=config.delta_H,
                 lambda_physics=config.lambda_physics,
                 lambda_balance=config.lambda_balance,
                 lambda_var=config.lambda_var,
@@ -502,6 +508,8 @@ def main():
                     viz_full['edge_feats'], viz_full['gate_edge'],
                     viz_full['edge_src'], viz_full['edge_dst'],
                     viz_full['node_if'], viz_full['freqs'], viz_full['A_ij'],
+                    lambda_soft_ent=config.lambda_soft_ent,
+                    delta_H=config.delta_H,
                     lambda_lowfreq=config.lambda_lowfreq,
                     lambda_range=config.lambda_range,
                     lambda_anchor=config.lambda_anchor,

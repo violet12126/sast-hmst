@@ -79,7 +79,10 @@ class SastConfig:
     # delta_H 由合成对照标定: BPF_DRIFT 的 FWHM 2-3 Hz -> σ_int≈1.0 Hz -> 0.55 nats
     # (区间 0.36-0.79 对应 σ_int 0.85-1.27)。实测底噪跨 500 倍熵降变化 <0.6%,
     # 即共模抵消成立, 固定 delta_H 可用。
-    lambda_soft_ent: float = 0.5
+    # ⚠ **默认 0 (关闭)**: §16.14 证明模型在软带的挤压强度本来就是物理正确的
+    #   (松弛后 σ=1.109 Hz, 熵降 0.5605, 与合成标定的 0.55 独立吻合), hinge 无事可管。
+    #   标定保留为诊断工具; 需要消融时设 >0。
+    lambda_soft_ent: float = 0.0
     delta_H: float = 0.55
     lambda_physics: float = 0.5
     lambda_balance: float = 0.5

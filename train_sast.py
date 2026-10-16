@@ -102,7 +102,7 @@ Examples:
                    help='SupCon 权重; 已由 1.0 降到 0.2 (不做分类, 仅作 '
                         'cond_ctx 工况区分度的辅助正则, 重心回到时频分布)')
     p.add_argument('--lambda_entropy', type=float, default=0.1)
-    p.add_argument('--lambda_soft_ent', type=float, default=0.5,
+    p.add_argument('--lambda_soft_ent', type=float, default=0.0,
                    help='软带相对熵降护栏的权重; 0 = 关闭 (复现旧行为)')
     p.add_argument('--delta_H', type=float, default=0.55,
                    help='软带允许的 Rényi-2D 熵降 (nats), 合成对照标定为 0.55')

@@ -46,7 +46,7 @@ from typing import Optional, Dict, List, Tuple
 from models.tfr import msst
 from models.sast_nodes import (
     MSSTNodeExtractor, NodeFeatures, PUMP_TURBINE_REGIONS,
-    N_PHYSICS_NODES, FreqRegion,
+    N_PHYSICS_NODES, FreqRegion, physics_band_mask,
 )
 from models.sast_graph import (
     PHYSICS_EDGES, N_EDGES, N_NODES,
@@ -573,9 +573,17 @@ class EdgeConditionedGAT(nn.Module):
         )
 
     def forward(self, h: torch.Tensor, edge_feats: torch.Tensor,
-                edge_src: torch.Tensor, edge_dst: torch.Tensor
+                edge_src: torch.Tensor, edge_dst: torch.Tensor,
+                w_ref_logit: Optional[torch.Tensor] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Args:
+            h:           [B, N_total, d_h] 含 OP + 物理节点
+            edge_feats:  [B, M, d_e]
+            edge_src/dst: [M]
+            w_ref_logit: [B, N_phys] 先验中心 logit(C_prior), 可选。
+                         给定则采用有界 logit 防饱和 (见下)。
+
         Returns:
             w_i:  [B, N_phys] IF 可信度 (仅物理节点, 不含 OP)
             A_ij: [B, M, H] 注意力权重
@@ -590,7 +598,16 @@ class EdgeConditionedGAT(nn.Module):
 
         # 仅从物理节点输出 w_i
         h_phys = h[:, 1:, :]  # [B, N_phys, d_h] — skip OP
-        w_logits = self.mlp_w(h_phys).squeeze(-1)  # [B, N_phys]
+        logits_mlp = self.mlp_w(h_phys).squeeze(-1)  # [B, N_phys]
+        if w_ref_logit is not None:
+            # 防饱和 + 先验中心: 把数据驱动 logit 叠加到先验中心上, 再用 tanh 把
+            # 总 logit 压进 (-4, 4)。旧实现 w=sigmoid(mlp_w) 会让硬带 logit 冲到
+            # +54/+108 (sigmoid'≈1e-23), w_range/balance 在硬带数值上死亡。
+            # 此处 w_logits ∈ (-4,4) → w_i ∈ (0.018, 0.982), 梯度处处非零;
+            # 初值 w_i ≈ C_prior (先验中心)。
+            w_logits = 4.0 * torch.tanh((logits_mlp + w_ref_logit) / 4.0)
+        else:
+            w_logits = logits_mlp
         w_i = torch.sigmoid(w_logits)
         return w_i, A_ij
 
@@ -955,7 +972,10 @@ class SAST(nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.N_max = N_max
-        self.msst_num = max(msst_num, N_max)
+        # 旧实现取 max(msst_num, N_max): 使 msst_num 配置项事实上无法降到
+        # N_max 以下, 即「把 IF 迭代层数改为 1」这件事被静默吞掉。生产路径只用
+        # omegas[:, -1], 轨迹层数没有理由被 N_max 兜底, 故直接采用 msst_num。
+        self.msst_num = int(msst_num)
         # M = 软门控最大轮数 (取代旧的整数 n_sqz_per_bin)
         self.n_sqz_max = n_sqz_max
         # 'clamp' (推荐) | 'sigmoid'; 见 SparseGaussianReassigner.forward
@@ -1024,15 +1044,19 @@ class SAST(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 training: bool = True,
-                return_all: bool = False) -> Dict[str, torch.Tensor]:
+                return_all: bool = False,
+                w_override: Optional[torch.Tensor] = None
+                ) -> Dict[str, torch.Tensor]:
         """
         Args:
             x:          [B, T] 或 [T] 原始信号
             training:   **已不影响计算路径** (仅为兼容调用方保留)。挤压现在
                         训练与推理走同一条可微软门控递推; 残差只来自
-                        reassigner 的 atomicAdd 非确定性。详见
-                        SparseGaussianReassigner.forward 的说明。
+                        reassigner 的 atomicAdd 非确定性。
             return_all: **已废弃 (no-op)** —— 本方法始终返回完整诊断字典
+            w_override: 诊断/预览用 —— 形状 [B, N_phys, T], 直接替换 GAT 输出的
+                        w_i (绕过池化)。用于"若 w_i 收敛到某个值, 图会是什么样"
+                        的事前检查, 不参与训练。None = 正常路径。
 
         Returns:
             dict with keys:
@@ -1116,7 +1140,7 @@ class SAST(nn.Module):
             from models.sast_graph import compute_edge_features_torch
             edge_feats_t = compute_edge_features_torch(
                 node_if, node_energy, node_persist, node_bw,
-                edges=self.edges, window_size=5, fs=self.fs)  # [B, M, T, 5]
+                edges=self.edges, window_size=101, fs=self.fs)  # [B, M, T, 5]
             r_obs_t = edge_feats_t[..., 0]  # [B, M, T]
         else:
             edge_feats_list = []
@@ -1125,7 +1149,7 @@ class SAST(nn.Module):
                 ef = compute_edge_features(
                     node_if_np[b], node_energy_np[b], node_persist_np[b],
                     node_bw=node_bw_np[b], edges=self.edges,
-                    window_size=5, fs=self.fs,
+                    window_size=101, fs=self.fs,
                 )
                 edge_feats_list.append(ef['edge_feats'])
                 r_obs_list.append(ef['edge_feats'][:, :, 0])
@@ -1159,8 +1183,19 @@ class SAST(nn.Module):
         edge_feats_bt = edge_feats_t.permute(0, 2, 1, 3).reshape(BT, M_edges, 5)
         for i, m in enumerate(CONDITION_EDGE_INDICES):
             edge_feats_bt[:, m, 0] = cond_sim_bt[:, i]
-        w_i_bt, A_ij_bt = self.gat(h_gat_in, edge_feats_bt, self.edge_src, self.edge_dst)
+        # 先验中心 logit(C_prior) —— 喂给 GAT 作有界 logit 的中心 (防饱和)。
+        # C_prior 已被 PPM clamp 到 [0.01, 0.99], 再夹一次防御数值边界。
+        w_ref_logit_bt = torch.logit(C_prior_t.clamp(1e-4, 1.0 - 1e-4))  # [BT, N_phys]
+        w_i_bt, A_ij_bt = self.gat(h_gat_in, edge_feats_bt, self.edge_src,
+                                   self.edge_dst, w_ref_logit=w_ref_logit_bt)
         w_i = w_i_bt.reshape(B, T_msst, N_phys).permute(0, 2, 1)
+        # 时域低通池化 (0.1s, 101 帧): 转轮惯量极大 (旋转周期 ~180ms), w_i(t)
+        # 物理上不可能在 1ms 内方波跳变。无参滑动平均从结构上滤掉高频抖振,
+        # 训练时梯度均匀反传窗口内 101 帧, 杜绝逐帧振荡。
+        w_i = F.avg_pool1d(F.pad(w_i, (50, 50), mode='replicate'),
+                           kernel_size=101, stride=1)
+        if w_override is not None:      # 诊断预览: 覆盖 w_i (见 docstring)
+            w_i = w_override.to(dtype=w_i.dtype, device=w_i.device)
         A_ij = A_ij_bt.reshape(B, T_msst, M_edges, -1).permute(0, 2, 3, 1)
         gate_edge = gate_edge_bt.reshape(B, T_msst, M_edges).permute(0, 2, 1)
         gate_node = gate_node_bt.reshape(B, T_msst, -1).permute(0, 2, 1)  # [B, N_total, T]
@@ -1203,6 +1238,14 @@ class SAST(nn.Module):
             ridge_factor = None
         # w_i [B, N_phys, T] 经最近节点分配到 [B, F, T], 供软门控使用
         w_bin = w_i[B_idx_f, i_star, T_idx_f]                # [B, F, T]
+        # ── 带外 bin 不做挤压 ──
+        # i_star 是「到最近节点 IF 的距离」argmin, 对 18-42 / 53-90 / >105 Hz
+        # 这些**没有任何物理节点覆盖**的 bin 同样会指派一个节点 (通常是 2xBPF,
+        # w≈0.9), 于是底噪被硬挤压成满屏高频假细线。这里用统一真源的区域支撑
+        # 掩码把带外的门控归零: r=0 ⇒ g_m≡0 ⇒ 该 bin 原样保留原始 STFT。
+        # (σ 不用改 —— g=0 时重排根本不动它。)
+        band_support = physics_band_mask(freqs, self.regions)    # [F] bool
+        w_bin = w_bin * band_support.to(w_bin.dtype).view(1, -1, 1)
         if self.gate_detach:          # 消融: 只剩 sigma 路径
             w_bin = w_bin.detach()
         if self.sigma_detach:         # 消融: 只剩门控路径

@@ -108,16 +108,26 @@ PUMP_TURBINE_REGIONS: List[FreqRegion] = [
     #   bw_expected 旧值 12.0 是错的: ridge_decay = exp(-(|f-if|/(2·bw))²/8),
     #   bw=12 使 ±24 Hz 内的 decay 恒 ≈ 0.90, 挤压参与因子在该节点内失效。
     FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.30,  4.5, 0.50, 0.10, 0.45),
-    # BPF_DRIFT: 工况漂移宽峰, 42-48.5 Hz (B4 拆节点)
+    # BPF_DRIFT: 工况漂移**窄带脊线**, 42-48.5 Hz (B4 拆节点)
     #   实测 (probe_node_if.py, 每类 12 样本): 带内能量峰在 46.4-47.7 Hz
     #   (空转 46.417 / 低负荷 47.667 / 中负荷 47.583 / 高负荷 46.625 / 抽水 47.708);
     #   组内 f 标准差 0.611 Hz, 跨工况中位漂移 46.39 (空转) → 47.85 (抽水),
     #   与转速不成整数倍 (46.39 / 5.5550 = 8.35 阶) → 频率由流动不稳定性决定。
-    #   故: 无绝对锚, w_range 下界低 (允许不挤压), 不参与倍频约束。
+    #   故: 无绝对锚, 不参与倍频约束。
     #   ⚠ 旧注释曾把该分量归因于"空转 45.65% 转速 → 22.82 Hz", 该假设已被
     #     实测证伪 (20-26 Hz 窗内为均匀噪声底, 能量占比仅 1.16%; 详见 docs §14.4)。
-    #   w_range: [0.10, 0.50] — 不信任其"线"性, 保留展宽
-    FreqRegion('BPF_DRIFT', 42.0, 48.5,  'BLADE_DRIFT',    0.30,  1.7, 0.60, 0.10, 0.50),
+    #   ⚠⚠ 分类修正 (本轮): 「频率随工况漂移」≠「单帧内是宽带」。
+    #     高分辨率 FFT / 单帧本征展宽实测仅 0.686 Hz, 与 2xBPF (0.650) /
+    #     BPF_LINE (0.584) 同量级 —— 它是**窄带调频脊线**, 而非 LOW_FREQ
+    #     (2.789 Hz) 那种弥散十几个 Hz 的宽带湍流云团。SST/MSST 的本职正是
+    #     把这类时变窄带分量压成清晰脊线, 因此旧设定把它划进 SOFT_F_TYPES
+    #     (低 w_i + 保留未重排 STFT 底座) 在原理上是错的, 直接后果是 40-50 Hz
+    #     糊成粗带, 且 48.5 Hz 交界处两侧背景抽取比例突变 → 垂直梳状毛刺。
+    #     → 本轮改回**脊线压缩带**: C_prior 0.30→0.70, w_range [0.10,0.50]→[0.60,0.85]。
+    #   w_range 的取法: 与 M=2 的软门控配合, w≥0.60 ⇒ r=2w≥1.2 ⇒
+    #     g_1 = clamp(r,0,1) = 1.0, 第 1 轮必然满参与 —— 即 100% 清掉
+    #     42-48.5 Hz 的原始 STFT 模糊底座, 把该分量压成平滑清晰的起伏脊线。
+    FreqRegion('BPF_DRIFT', 42.0, 48.5,  'BLADE_DRIFT',    0.70,  1.7, 0.60, 0.60, 0.85),
     # BPF_LINE: 转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48.5-53 Hz (B4 拆节点)
     #   该线位置由转速唯一确定。与 50 Hz 电网频率仅差 0.005 Hz, 远低于 0.5 Hz
     #   的频率分辨率, 二者数值上不可区分。
@@ -147,9 +157,29 @@ PUMP_TURBINE_REGIONS: List[FreqRegion] = [
 # 节点数量
 N_PHYSICS_NODES = len(PUMP_TURBINE_REGIONS)
 
-# "软"分量类型: 频率由流动不稳定性决定, 不该被鼓励集中/锐化.
-# RE_2D 熵对这类频段不惩罚 (保留展宽); 硬挤压类 (BLADE_PASS/BLADE_HARMONIC) 才罚.
-SOFT_F_TYPES = ('HYDRAULIC', 'BLADE_DRIFT')
+# "软"分量类型: **单帧内**真正弥散的宽带随机分量, 不该被鼓励集中/锐化.
+# RE_2D 熵对这类频段不惩罚 (保留展宽); 其余类型才罚.
+# ⚠ 本轮只保留 HYDRAULIC: LOW_FREQ 的涡带/压力脉动单帧本征展宽 2.789 Hz,
+#   是锁定带 (BPF_LINE 0.584 / 2xBPF 0.650) 的 4-6 倍 —— 硬挤压会把它撕裂成
+#   断续的虚假细丝。BLADE_DRIFT 已裁掉: 它单帧只有 0.686 Hz, 是窄带调频脊线,
+#   本来就该被压缩 (判据见 PUMP_TURBINE_REGIONS 里 BPF_DRIFT 的注释)。
+SOFT_F_TYPES = ('HYDRAULIC',)
+
+
+# ── 节点 IF 估计的鲁棒化参数 (见 MSSTNodeExtractor 的聚合逻辑) ──
+# WHY: 区域 bin 的**频率位置**在带内, 不代表它的**IF 估计值**也在带内。
+#   实测 BPF_LINE [48.5,53) 的 bin 会被 MSST 固定点迭代拖到 40-46 Hz,
+#   使 node_if 在单样本内跑出 32.6-60.0 Hz (带本身只有 4.5 Hz 宽), 并经
+#   corr(w, IF)=+0.72 直接驱动 w_i 摆动 → 时频图抖。故按 IF **落点**再过滤一次。
+# 落点容差: IF 必须落在**本带**内才算本带分量。取 0 的理由: 四个频带
+# [2,18) [42,48.5) [48.5,53) [90,105) 是连续铺满的, "落在哪个带就是哪个带的
+# 分量"本身无歧义 (48.5 Hz 共享边两侧由 region_weights 的升余弦过渡带分摊),
+# 不存在双计或缝隙。实测 (hl=1024/num=1, 五类) 容差 1.0/0.5/0.0 下 BPF_LINE
+# 的 node_if 区间: [47.7,51.7] / [48.0,51.7] / [48.5,51.6] —— 只有 0 能让它
+# 严格不出带。
+IF_LANDING_TOL_HZ = 0.0
+IF_MIN_LANDED_BINS = 2      # 落点 bin 少于此数 → 视为该帧无分量, 走回退
+IF_SNR_FRAC = 0.05          # 带内加权能量 < 本样本中位数×该比例 → 低信噪帧, 走回退
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -450,33 +480,56 @@ class MSSTNodeExtractor:
 
         for n_idx, region in enumerate(self.regions):
             w_f = w_all[n_idx]                                       # [F]
+            # 落点容差 + 带中心 (回退基准)
+            land_lo = region.f_min - IF_LANDING_TOL_HZ
+            land_hi = region.f_max + IF_LANDING_TOL_HZ
+            center = 0.5 * (region.f_min + region.f_max)
+            est = np.full(T, center, dtype=np.float64)   # 逐帧能量加权 IF
+            bw_tmp = np.ones(T, dtype=np.float64)        # 逐帧落点 IF 标准差
+            kept = np.zeros(T, dtype=np.int64)           # 逐帧落点 bin 数
+            band_e = np.zeros(T, dtype=np.float64)       # 逐帧带内能量 (原始, 供 SNR 门控)
 
             for t in range(T):
                 # 该区域内 (权重 > 0) 且 omega_final 有效的 bin
                 region_valid = (w_f > 0.0) & valid_mask[:, t]
                 if not region_valid.any():
-                    # 无有效 IF → 使用区域中心频率作为 fallback
-                    if_hz[n_idx, t] = (region.f_min + region.f_max) / 2.0
-                    energy[n_idx, t] = 0.0
-                    bandwidth[n_idx, t] = (region.f_max - region.f_min) / 2.0
                     continue
-
-                if_vals = if_map[region_valid, t]
+                idx_t = np.flatnonzero(region_valid)
+                if_vals_all = if_map[idx_t, t]
                 # 加权能量: 过渡带内的 bin 按 w<1 打折 (与 band_centroid_if 一致)
-                w_vals = stft_energy[region_valid, t] * w_f[region_valid]
+                w_vals_all = stft_energy[idx_t, t] * w_f[idx_t]
+                band_e[t] = float(w_vals_all.sum())
+                # ── IF 落点过滤: bin 的频率位置在带内 ≠ 它的 IF 估计值也在带内 ──
+                # 实测 BPF_LINE 的 bin 会被 MSST 迭代拖到 40-46 Hz, 若不筛,
+                # node_if 可在单样本内跑出 32-60 Hz (带本身仅 4.5 Hz 宽)。
+                land = (if_vals_all >= land_lo) & (if_vals_all <= land_hi)
+                kept[t] = int(land.sum())
+                if kept[t] == 0:
+                    continue
+                if_vals = if_vals_all[land]
+                w_vals = w_vals_all[land]
                 w_tot = float(w_vals.sum())
                 if w_tot > 0:
                     # A2/B1: 能量加权均值 (取代无权重中位数)
-                    if_hz[n_idx, t] = float((w_vals * if_vals).sum() / w_tot)
+                    est[t] = float((w_vals * if_vals).sum() / w_tot)
+                    if kept[t] >= 2:
+                        var = float((w_vals * (if_vals - est[t]) ** 2).sum() / w_tot)
+                        bw_tmp[t] = min(math.sqrt(max(var, 0.0)), 20.0)
                 else:
-                    if_hz[n_idx, t] = float(np.mean(if_vals))
-                energy[n_idx, t] = np.log1p(w_vals.sum())
-                # 带宽: IF 标准差, 钳制到合理范围
-                if len(if_vals) >= 2:
-                    bw = np.std(if_vals)
-                    bandwidth[n_idx, t] = min(bw, 20.0)  # cap at 20 Hz
-                else:
-                    bandwidth[n_idx, t] = 1.0  # 默认 1 Hz
+                    est[t] = float(if_vals.mean())
+                    if kept[t] >= 2:
+                        bw_tmp[t] = min(float(np.std(if_vals)), 20.0)
+
+            # ── 有效帧判据 + 低信噪回退 ──
+            good = kept >= IF_MIN_LANDED_BINS
+            if good.any():
+                e_ref = float(np.median(band_e[good]))
+                good &= band_e >= IF_SNR_FRAC * e_ref
+            ref = float(np.median(est[good])) if good.any() else center
+            if_hz[n_idx] = np.where(good, est, ref)
+            bandwidth[n_idx] = np.where(good, bw_tmp, 1.0)
+            # 能量特征口径不变 (带内全部支撑 bin, 不按落点裁剪)
+            energy[n_idx] = np.log1p(band_e)
 
         # ── Step 3: Persistence (跨帧能量持续性) ──
         persistence = np.zeros(self.N_nodes, dtype=np.float64)
@@ -566,30 +619,48 @@ class MSSTNodeExtractor:
                 region_energy_map = (stft_energy[freq_mask, :] *
                                      w_f[freq_mask].unsqueeze(1))  # [F_r, T]
                 F_r, T = region_if.shape
-                counts = region_valid.sum(dim=0)           # [T]
+
+                # ── IF 落点过滤 (本轮新增) ──
+                # 区域 bin 的**频率位置**在带内, 不代表其 **IF 估计值**也在带内:
+                # MSST 固定点迭代会把 BPF_LINE 的 bin 拖到 40-46 Hz, 未经筛除时
+                # node_if 在单样本内可跑出 32.6-60.0 Hz (带本身仅 4.5 Hz 宽),
+                # 并经 corr(w, IF)=+0.72 直接驱动 w_i 摆动 → 时频图抖。
+                land_lo = region.f_min - IF_LANDING_TOL_HZ
+                land_hi = region.f_max + IF_LANDING_TOL_HZ
+                center = torch.tensor(0.5 * (region.f_min + region.f_max),
+                                      device=device, dtype=torch.float32)
+                landed = region_valid & (region_if >= land_lo) & (region_if <= land_hi)
+                kept = landed.sum(dim=0)                                 # [T]
+                w_e = region_energy_map * landed.float()                 # [F_r, T]
+                w_sum = w_e.sum(dim=0)                                   # [T]
 
                 # ── Energy-weighted mean IF (A2/B1: 取代无权重中位数) ──
                 # 中位数与能量无关: 宽带里大量噪声 bin 会把 IF 拉向频带几何中心
                 # (实测 LOW_FREQ 偏高 6-12 Hz), 是 r_obs = 2.13 ≠ 2.00 的直接来源。
-                if_sum = (region_if * region_valid.float()).sum(dim=0)   # [T]
-                arith_mean = if_sum / counts.clamp(min=1)                # [T]
-                w_e = region_energy_map * region_valid.float()           # [F_r, T]
-                w_sum = w_e.sum(dim=0)                                   # [T]
-                if_hz_n = (region_if * w_e).sum(dim=0) / w_sum.clamp(min=1e-12)
-                if_hz_n = torch.where(w_sum > 0, if_hz_n, arith_mean)    # 无能量取算术均值
-                if_hz_n[counts == 0] = (region.f_min + region.f_max) / 2.0
-                if_hz_b[n_idx] = if_hz_n
+                est = (region_if * w_e).sum(dim=0) / w_sum.clamp(min=1e-12)
 
-                # ── Energy (vectorized) ──
+                # ── Energy (vectorized) — 口径不变: 带内全部支撑 bin ──
                 region_energy = (region_energy_map * region_valid.float()).sum(dim=0)
                 energy_b[n_idx] = torch.log1p(region_energy)
 
-                # ── Bandwidth / std (vectorized) ──
-                sq_dev = (region_if - arith_mean.unsqueeze(0)) ** 2      # [F_r, T]
-                sq_sum = (sq_dev * region_valid.float()).sum(dim=0)     # [T]
-                bw_n = torch.sqrt(sq_sum / counts.clamp(min=1)).clamp(max=20.0)
-                bw_n[counts < 2] = 1.0
-                bw_b[n_idx] = bw_n
+                # ── 有效帧判据 + 低信噪回退 ──
+                good = (kept >= IF_MIN_LANDED_BINS) & (w_sum > 0)
+                if bool(good.any()):
+                    e_ref = region_energy[good].median()
+                    good = good & (region_energy >= IF_SNR_FRAC * e_ref)
+                if bool(good.any()):
+                    # 回退值 = 有效帧的中位 IF (落点已保证 est ∈ [lo, hi])
+                    ref = est[good].median()
+                else:
+                    ref = center
+                if_hz_b[n_idx] = torch.where(good, est, ref)
+
+                # ── Bandwidth: 落点 bin 的能量加权标准差 ──
+                sq_dev = (region_if - est.unsqueeze(0)) ** 2             # [F_r, T]
+                var = (sq_dev * w_e).sum(dim=0) / w_sum.clamp(min=1e-12)
+                bw_n = torch.sqrt(var.clamp(min=0.0)).clamp(max=20.0)
+                bw_b[n_idx] = torch.where(good, bw_n,
+                                          torch.ones_like(bw_n))
 
             # ── Persistence ──
             persist_b = torch.zeros(self.N_nodes, device=device, dtype=torch.float32)

@@ -121,7 +121,10 @@ def main():
     args = ap.parse_args()
 
     global df_win_global
-    ex = MSSTNodeExtractor(fs=FS, msst_num=4)
+    from sast_config import SastConfig
+    _cfg = SastConfig()
+    ex = MSSTNodeExtractor(fs=FS, msst_num=_cfg.msst_num,
+                           msst_hlength=_cfg.msst_hlength)
     freqs_t = torch.from_numpy(ex(np.zeros(N_SIG)).freqs).float()
     df = float(freqs_t[1] - freqs_t[0])
     df_win_global = df
@@ -185,7 +188,7 @@ def main():
         if not acc[reg.name]:
             continue
         a = np.array(acc[reg.name])
-        soft = reg.f_type in ('HYDRAULIC', 'BLADE_DRIFT')
+        soft = reg.f_type == 'HYDRAULIC'   # 与 SOFT_F_TYPES 一致 (BPF_DRIFT 已移出)
         print(f'  {reg.name:<11s} {"软" if soft else "硬":>4s} {a[:,0].mean():>8.3f} '
               f'{a[:,1].mean():>8.3f} {a[:,2].mean():>8.3f} {a[:,3].mean():>8.3f} '
               f'{a[:,4].mean():>6.0f}')

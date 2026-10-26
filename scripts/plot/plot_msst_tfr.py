@@ -3,9 +3,18 @@
 =================================================================
 布局:
   左上: WSST2 (our morse wavelet)    右上: ssqueezepy WSST
-  左下: MSST (STFT, num=3)           右下: FFT 频谱 + 峰值标注
+  左下: MSST (STFT, 见 MSST_NUM/HLENGTH) 右下: FFT 频谱 + 峰值标注
 
 每个样本单独保存为一张图片。
+
+⚠ 口径统一 (本轮): MSST 的窗长与迭代层数**直接读 SastConfig**, 不再在本
+  脚本里写死。旧版这里是 hlength=320 / num=1, 而标题写的是 "num=3", 且
+  SAST 推理内部用的是 hlength=512 / num=4 —— 三处各说各话, 同一信号画出来
+  相关只有 0.33-0.58, 被误读成"推理出的 MSST 不对"。现在两边同源:
+  hl=1024, num=1 (标准 SST 的一阶 IF, 不做固定点迭代)。
+  另: 本脚本是**线性色阶** (vmax=0.5xmax, 0-500 Hz); sast_viz.plot_tfr 同时
+  给线性与 dB 两种口径, 便于区分"算法差异"与"显示差异"。
+
 用法: python plot_msst_tfr.py
       python plot_msst_tfr.py --cls 3          # 仅绘制指定类别
       python plot_msst_tfr.py --cls 3 --max-samples 5  # 限制样本数
@@ -21,6 +30,7 @@ from scipy.signal import find_peaks
 import ssqueezepy as ssq
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from models.tfr import wsst2, msst, compute_renyi
+from sast_config import SastConfig
 
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.size'] = 7
@@ -31,7 +41,10 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 FS = 1000
 TOTAL = 2.0
 FMAX = 500
-HLENGTH = 320
+# ── 与 SAST 推理侧共用同一口径 (唯一真源: SastConfig) ──
+_CFG = SastConfig()
+HLENGTH = _CFG.msst_hlength if _CFG.msst_hlength is not None else min(2000, 512)
+MSST_NUM = _CFG.msst_num
 
 CLASS_NAMES = {
     0: 'Class 0: No-load',
@@ -90,7 +103,7 @@ def plot_one_sample(x, fs, idx, cls, save_path):
     re_ssq = compute_renyi(mag_ssq[mask_ssq, :])
 
     # ── 3. MSST (our) ──
-    r_msst = msst(x, fs, hlength=HLENGTH, num=1)
+    r_msst = msst(x, fs, hlength=HLENGTH, num=MSST_NUM)
     f_ms = r_msst['freqs']
     mag_ms = r_msst['MSST']
     mask_ms = f_ms <= FMAX
@@ -114,7 +127,8 @@ def plot_one_sample(x, fs, idx, cls, save_path):
     tfr_panels = [
         (axes[0, 0], f'WSST2 (our, morse)\nR={re_w2:.2f}', mag_w2, f_w2, mask_w2, dom_w2),
         (axes[0, 1], f'ssqueezepy WSST\nR={re_ssq:.2f}', mag_ssq, f_ssq, mask_ssq, dom_w2),
-        (axes[1, 0], f'MSST (STFT, num=3)\nR={re_ms:.2f}', mag_ms, f_ms, mask_ms, dom_ms),
+        (axes[1, 0], f'MSST (STFT, hl={HLENGTH}, num={MSST_NUM})\nR={re_ms:.2f}',
+         mag_ms, f_ms, mask_ms, dom_ms),
     ]
 
     for ax, title, mag, f_ax, mask, dom_freqs in tfr_panels:

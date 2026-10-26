@@ -27,21 +27,54 @@ plt.rcParams['font.size'] = 8
 _TFR_DB_RANGE = 25.0
 
 
-def _plot_stft_panel(ax, tfr, t_axis, freqs, freq_max, title, add_colorbar=False):
-    """Plot a single STFT/TFR panel. dB scale with a fixed dynamic range:
-    shows real components (incl. the low-frequency baseline) while clipping
-    the deep background noise floor."""
-    db = 10 * np.log10(np.maximum(tfr, 1e-6))
-    vmax_db = db.max()
-    vmin = vmax_db - _TFR_DB_RANGE
-    im = ax.pcolormesh(t_axis, freqs, db, shading='gouraud', cmap='jet',
-                       vmin=vmin, vmax=vmax_db)
+def _node_names_for(n: int):
+    """结果里的 n 个节点槽位 -> 显示名。
+
+    NODE_NAMES 第 0 项是 OP (原型控制节点), 物理节点只有后 4 个。旧判据
+    `N <= 3` 是 3 节点时代的产物; B4 拆成 4 个物理节点后 N=4 落进 else 分支,
+    把含 OP 的 5 元素表整体套到 4 节点数据上 -> 图例、FFT 标注、汇总表全部
+    **错位一位** (标着 "OP" 的那行其实是 LOW_FREQ, 标着 "BPF_LINE" 的那行
+    其实是 2xBPF)。这里按"槽位数 == 表长才用全表, 否则跳过 OP"判定。
+    """
+    if n == len(NODE_NAMES):
+        return list(NODE_NAMES)
+    if n <= len(NODE_NAMES) - 1:
+        return list(NODE_NAMES[1:])          # skip OP
+    return [f'N{i}' for i in range(n)]
+
+
+def _plot_stft_panel(ax, tfr, t_axis, freqs, freq_max, title, add_colorbar=False,
+                     scale='db'):
+    """Plot a single STFT/TFR panel.
+
+    scale='db':     峰值下 _TFR_DB_RANGE dB 动态范围 (本文件一直用的口径)
+    scale='linear': 0.5x 峰值的线性色阶 (= hmst_figures/msst_comparison 与
+                    scripts/plot/plot_msst_tfr.py 的口径)
+
+    两种口径并列显示, 才能在"同一份数据为什么看着不像"上做直接对照 ——
+    线性色阶会把弱分量压成背景, dB 色阶会把背景噪声抬成满屏细线。
+    """
+    f_mask = np.asarray(freqs) <= freq_max
+    if scale == 'linear':
+        data = tfr[f_mask, :]
+        vmax = float(data.max()) * 0.5
+        im = ax.pcolormesh(t_axis, np.asarray(freqs)[f_mask], data,
+                           shading='gouraud', cmap='jet',
+                           vmin=0.0, vmax=max(vmax, 1e-12))
+        cb_label = '|TFR|'
+    else:
+        db = 10 * np.log10(np.maximum(tfr[f_mask, :], 1e-6))
+        vmax_db = float(db.max())
+        im = ax.pcolormesh(t_axis, np.asarray(freqs)[f_mask], db,
+                           shading='gouraud', cmap='jet',
+                           vmin=vmax_db - _TFR_DB_RANGE, vmax=vmax_db)
+        cb_label = 'dB'
     ax.set_ylim(0, freq_max)
     ax.set_xlabel('Time [s]')
     ax.set_ylabel('Frequency [Hz]')
     ax.set_title(title)
     if add_colorbar:
-        plt.colorbar(im, ax=ax, label='dB')
+        plt.colorbar(im, ax=ax, label=cb_label)
     return im
 
 
@@ -65,7 +98,7 @@ def _plot_w_i_panel(ax, w_i, t_axis, colors, node_names):
     ax.set_xlabel('Time [s]')
     ax.set_ylabel('w_i')
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title('(d) IF Trust w_i(t)\nw_i->1: Trust & squeeze  |  w_i->0: Conservative')
+    ax.set_title('(e) IF Trust w_i(t)\nw_i->1: Trust & squeeze  |  w_i->0: Conservative')
     ax.legend(fontsize=6, loc='upper right')
     ax.grid(alpha=0.3)
 
@@ -92,16 +125,11 @@ def _plot_attention_panel(ax, A_ij):
     plt.colorbar(im, ax=ax, label='A_ij')
 
 
-def _plot_enhanced_tfr_panel(ax, tfr_enhanced, t_axis, freqs, freq_max):
-    """Plot SAST TFR. dB scale with a fixed dynamic range; no node IF overlays."""
-    db_enh = 10 * np.log10(np.maximum(tfr_enhanced, 1e-6))
-    vmax_db = db_enh.max()
-    vmin = vmax_db - _TFR_DB_RANGE
-    ax.pcolormesh(t_axis, freqs, db_enh, shading='gouraud', cmap='jet',
-                  vmin=vmin, vmax=vmax_db)
-    ax.set_ylim(0, freq_max)
-    ax.set_xlabel('Time [s]')
-    ax.set_title('(b) SAST Enhanced TFR')
+def _plot_enhanced_tfr_panel(ax, tfr_enhanced, t_axis, freqs, freq_max,
+                            scale='db', title='(b) SAST Enhanced TFR'):
+    """Plot SAST TFR; no node IF overlays. scale 语义同 _plot_stft_panel。"""
+    _plot_stft_panel(ax, tfr_enhanced, t_axis, freqs, freq_max, title,
+                     scale=scale)
 
 
 def _plot_fft_panel(ax, signal, fs, freq_max, node_if, w_i, colors, node_names):
@@ -145,7 +173,7 @@ def _plot_fft_panel(ax, signal, fs, freq_max, node_if, w_i, colors, node_names):
     ax.set_ylim(0, 1.05)
     ax.set_xlabel('Frequency [Hz]')
     ax.set_ylabel('Norm. Magnitude')
-    ax.set_title('(d) FFT Spectrum + Node IF\nDominant peaks (red) vs GAT-tracked IF (colored)')
+    ax.set_title('(f) FFT Spectrum + Node IF\nDominant peaks (red) vs GAT-tracked IF (colored)')
     ax.grid(True, alpha=0.2)
     ax.legend(fontsize=6)
 
@@ -157,7 +185,11 @@ def plot_tfr(results: Dict[str, np.ndarray],
              fs: float = 1000.0,
              title: Optional[str] = None):
     """
-    4-panel plot (2x2): Raw MSST | SAST TFR + Node IF | w_i(t) | FFT Spectrum
+    6-panel plot (2x3):
+      行 1 (线性色阶): Raw MSST | SAST Enhanced TFR | w_i(t)
+      行 2 (dB 色阶):  Raw MSST | SAST Enhanced TFR | FFT Spectrum
+    同一列上下两格是**同一份数据**的两种色阶 —— 用于回答"两张图看着不像,
+    是算法不同还是显示不同"。
     """
     tfr_raw = results.get('tfr_msst', results['tfr_raw'])
     tfr_enhanced = results['tfr_enhanced']
@@ -168,21 +200,29 @@ def plot_tfr(results: Dict[str, np.ndarray],
 
     N = w_i.shape[0]
     colors = plt.cm.tab10(np.linspace(0, 1, max(N, 3)))
-    if N <= 3:
-        node_names = NODE_NAMES[1:]  # skip OP
-    else:
-        node_names = NODE_NAMES
+    node_names = _node_names_for(N)
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # 2x3 网格: 左两列是「原始 vs 增强」, 上下两行是「线性 vs dB」——
+    # 同一格纵向对照才能看出色阶对"像不像"的贡献。
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 
     _plot_stft_panel(axes[0, 0], tfr_raw, t_axis, freqs, freq_max,
-                     '(a) Raw MSST (Hard Squeeze)\nStandard synchrosqueeze, no w_i gating')
-    _plot_enhanced_tfr_panel(axes[0, 1], tfr_enhanced, t_axis, freqs, freq_max)
-    _plot_w_i_panel(axes[1, 0], w_i, t_axis, colors, node_names)
+                     '(a) Raw MSST — linear (vmax=0.5xmax)', scale='linear')
+    _plot_enhanced_tfr_panel(axes[0, 1], tfr_enhanced, t_axis, freqs, freq_max,
+                             scale='linear',
+                             title='(b) SAST Enhanced TFR — linear')
+    _plot_w_i_panel(axes[0, 2], w_i, t_axis, colors, node_names)
+    _plot_stft_panel(axes[1, 0], tfr_raw, t_axis, freqs, freq_max,
+                     '(c) Raw MSST — dB (%g dB range)' % _TFR_DB_RANGE,
+                     scale='db')
+    _plot_enhanced_tfr_panel(axes[1, 1], tfr_enhanced, t_axis, freqs, freq_max,
+                             scale='db',
+                             title='(d) SAST Enhanced TFR — dB')
     if signal is not None:
-        _plot_fft_panel(axes[1, 1], signal, fs, freq_max, node_if, w_i, colors, node_names)
+        _plot_fft_panel(axes[1, 2], signal, fs, freq_max, node_if, w_i,
+                        colors, node_names)
     else:
-        axes[1, 1].set_visible(False)
+        axes[1, 2].set_visible(False)
 
     suptitle = title or 'SAST: Structure-Aware Synchrosqueezing\nPhysics Graph + Ratio-Gated PPM -> Adaptive Squeeze'
     plt.suptitle(suptitle, fontsize=13, fontweight='bold')
@@ -213,10 +253,7 @@ def plot_full_diagnostics(results: Dict[str, np.ndarray],
     N = w_i.shape[0]
     M_edges = gate_edge.shape[0]
     colors = plt.cm.tab10(np.linspace(0, 1, max(N, 3)))
-    if N <= 3:
-        node_names = NODE_NAMES[1:]
-    else:
-        node_names = NODE_NAMES
+    node_names = _node_names_for(N)
 
     fig, axes = plt.subplots(2, 3, figsize=(22, 14))
 
@@ -252,10 +289,7 @@ def print_inference_summary(results: Dict[str, np.ndarray],
     gate_node = results.get('gate_node')
 
     N = w_i.shape[0]
-    if N <= 3:
-        node_names = NODE_NAMES[1:]
-    else:
-        node_names = NODE_NAMES
+    node_names = _node_names_for(N)
 
     print(f"\n{'='*70}")
     header = "SAST Inference Summary"

@@ -192,7 +192,8 @@ def evaluate_tf_quality(model: SAST,
       band_spread_hz 带内能量加权频率标准差 (Hz, 越小越窄)
 
     另给 hard / soft 分组均值, 便于看「该挤的挤了、该留的留了」这一分工是否成立
-    (hard = BLADE_PASS/BLADE_HARMONIC, soft = HYDRAULIC/BLADE_DRIFT, 见 SOFT_F_TYPES)。
+    (hard = BLADE_PASS/BLADE_HARMONIC/BLADE_DRIFT, soft = HYDRAULIC, 见 SOFT_F_TYPES)。
+    ⚠ BPF_DRIFT 本轮已由软带改为脊线压缩带 (单帧本征展宽 0.686 Hz), 故归入 hard。
 
     Args:
         X:          [N, T] 验证信号

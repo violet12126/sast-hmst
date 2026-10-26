@@ -136,12 +136,18 @@ def renyi_2d_loss(tfr: torch.Tensor,
                    freqs: torch.Tensor,
                    regions: Optional[List[FreqRegion]] = None,
                    alpha: int = 2,
-                   eps: float = 1e-8) -> torch.Tensor:
+                   eps: float = 1e-8,
+                   presence: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Per-region 选择性 Renyi 2D 熵.
 
-    BLADE_PASS/BLADE_HARMONIC 频段 (BPF_LINE, 2xBPF): 最小化熵 (鼓励集中, 该硬挤)
-    SOFT_F_TYPES 频段 (LOW_FREQ, BPF_DRIFT): 不惩罚 (保留展宽, 该软挤)
+    BLADE_PASS/BLADE_HARMONIC/BLADE_DRIFT 频段 (BPF_LINE, 2xBPF, BPF_DRIFT):
+      最小化熵 (鼓励集中, 该压成脊线)
+    SOFT_F_TYPES 频段 (仅 LOW_FREQ/HYDRAULIC): 不惩罚 (保留展宽, 该软挤)
+
+    ⚠ BPF_DRIFT 本轮由软带改为脊线压缩带 (单帧本征展宽仅 0.686 Hz, 与
+      2xBPF 0.650 / BPF_LINE 0.584 同量级; 而 LOW_FREQ 是 2.789 Hz 的宽带
+      湍流), 因此它现在**参与**本项的最小化熵。
 
     修复 v3 全局熵"鼓励所有能量集中"与选择性挤压的冲突:
     全局 RE_2D 会惩罚 LOW_FREQ 涡带展宽 (本应保留), 破坏选择性.
@@ -161,9 +167,9 @@ def renyi_2d_loss(tfr: torch.Tensor,
     device = tfr.device
     loss = torch.zeros((), device=device)
     n_squeeze = 0
-    for region in regions:
+    for n, region in enumerate(regions):
         if region.f_type in SOFT_F_TYPES:
-            continue  # LOW_FREQ / BPF_DRIFT: 保留展宽, 不惩罚
+            continue  # LOW_FREQ: 保留展宽, 不惩罚
         # 区域支撑用统一真源的布尔掩码; 共享内部边的过渡带内 bin 按 w<1
         # 加权参与 (旧实现为两端皆闭的硬矩形)
         w_f = region_weights(freqs, [region])[0]        # [F]
@@ -174,8 +180,15 @@ def renyi_2d_loss(tfr: torch.Tensor,
         tfr_pos = tfr_r.clamp(min=eps)
         total = tfr_pos.sum(dim=(1, 2), keepdim=True).clamp(min=eps)
         p = tfr_pos / total
-        h = torch.log((p ** alpha).sum(dim=(1, 2)).clamp(min=eps)) / (1.0 - alpha)
-        loss = loss + h.mean()
+        h = torch.log((p ** alpha).sum(dim=(1, 2)).clamp(min=eps)) / (1.0 - alpha)  # [B]
+        if presence is not None:
+            # 分量存在度加权: 缺席时不鼓励挤压, 阻止 RE_2D 在空转把 2xBPF 底噪
+            # 挤成假谱线 (与 w_range/w_center 的 presence 门控同向)。
+            w_p = presence[:, n, :].mean(dim=-1).clamp(min=0.0)   # [B]
+            h = (h * w_p).sum() / w_p.sum().clamp(min=eps)
+        else:
+            h = h.mean()
+        loss = loss + h
         n_squeeze += 1
     return loss / max(1, n_squeeze)
 
@@ -205,9 +218,13 @@ def soft_entropy_hinge(tfr_enhanced: torch.Tensor, tfr_raw: torch.Tensor,
       log(F_n), 在差值里抵消。实测底噪幅度跨 500 倍, 熵降变化 < 0.6% —— 共模
       抵消是数值事实, 故**固定 delta_H 成立, 无需逐样本自适应**。
 
-    WHY 需要它: `lowfreq_sharpness_loss` 只作用于 regions[0] (LOW_FREQ), 故
-      **BPF_DRIFT 在"别挤"方向没有任何约束**, 只受 w_range 上界限制 —— 实测它
-      恰好顶死在 w_range_high=0.50。本项补上这个缺口。
+    ⚠ 适用范围 (本轮收窄): 本项只对 SOFT_F_TYPES 起作用, 而 SOFT_F_TYPES 现在
+      只剩 HYDRAULIC (LOW_FREQ)。原设计的本意是补 **BPF_DRIFT 在"别挤"方向
+      没有任何约束** 的缺口 —— 但那个缺口本身建立在"BPF_DRIFT 是软带"这个已被
+      推翻的分类上 (它单帧只有 0.686 Hz, 是窄带调频脊线, 本来就该压成脊线)。
+      故 BPF_DRIFT 移出软带后, 本项回到 LOW_FREQ: 与 `lowfreq_sharpness_loss`
+      分工 —— 后者罚"绝对锐度", 本项罚"相对原始谱的熵降", 是两种不同的过挤压
+      证据, 互补而非重复。
 
     标定 (合成对照, 白噪经高斯谱包络 + 宽带底噪, 同带同噪声扫描):
       σ_int=0.50 Hz (FWHM 1.18) -> 1.176 nats
@@ -227,7 +244,7 @@ def soft_entropy_hinge(tfr_enhanced: torch.Tensor, tfr_raw: torch.Tensor,
     n = 0
     for region in regions:
         if region.f_type not in SOFT_F_TYPES:
-            continue                      # 硬带仍由 renyi_2d_loss 最小化熵
+            continue      # 硬带 (含 BPF_DRIFT) 仍由 renyi_2d_loss 最小化熵
         h_raw = _h2_band(tfr_raw, freqs, region).detach()      # 单侧: 不推 E_raw
         h_enh = _h2_band(tfr_enhanced, freqs, region)
         loss = loss + torch.relu((h_raw - delta_H) - h_enh)
@@ -303,7 +320,9 @@ def physics_consistency_loss(A_ij: torch.Tensor,
 # 5. L_consistency - 频段内时序一致性
 # ═══════════════════════════════════════════════════════════════
 
-def w_consistency_loss(w_i: torch.Tensor) -> torch.Tensor:
+def w_consistency_loss(w_i: torch.Tensor,
+                       coarse_hop: int = 250,
+                       coarse_weight: float = 2.0) -> torch.Tensor:
     """
     惩罚各物理节点内 w_i 沿时间的方差.
 
@@ -311,14 +330,25 @@ def w_consistency_loss(w_i: torch.Tensor) -> torch.Tensor:
     w_i 在所有时间帧上应该差不多——不同频段可以有不同的 w_i, 但同一频段内部
     不能跳变.
 
-    L_consistency = mean_{nodes} Var_{t} [w_i(n, t)]
+    L_consistency = mean[Var_t w_i] + 20·mean[(Δ_1 w_i)²] + w_c·mean[(Δ_H w_i)²]
+
+    三项各管一个时间尺度 (fs=1000, hop=1 帧 = 1 ms):
+      Δ_1 (1 ms):  逐帧毛刺 —— 实测 |Δw| ≈ 0.009, 已很小
+      Var_t:       整段总方差
+      Δ_250 (250 ms): **样本内慢摆**。实测 ptp 可达 0.86 (BPF_LINE)、0.58
+                    (2xBPF), 时间尺度 0.4-1.0 s —— 结构上的 avg_pool(101)
+                    (0.1 s 低通) 恰好压不住这一档, 故必须在损失层显式约束。
+                    取 250 ms 略大于转轮旋转周期 (~180 ms): 物理上 w_i 不该
+                    在这个尺度上翻覆。
 
     与 w_variance_loss 互补:
       - w_consistency_loss: 缩小节点内时间方差 (管内聚, 防跳变)
       - w_variance_loss:    扩大节点间均值差异 (管分化, 防全同退化)
 
     Args:
-        w_i: [B, N_phys, T] IF 可信度
+        w_i:          [B, N_phys, T] IF 可信度
+        coarse_hop:   粗尺度差分步长 (帧; 1 frame = 1 ms)
+        coarse_weight: 粗尺度项权重
 
     Returns:
         scalar loss (越低 → 各频段内 w_i 越一致)
@@ -327,7 +357,14 @@ def w_consistency_loss(w_i: torch.Tensor) -> torch.Tensor:
     if T < 2:
         return torch.tensor(0.0, device=w_i.device)
     per_node_var = w_i.var(dim=2)    # [B, N_phys] 每节点沿时间的方差
-    return per_node_var.mean()
+    # 一阶时序差分 (Total Variation): 直接惩罚相邻帧跳变幅度, 从损失层根治方波毛刺
+    diff1 = w_i[:, :, 1:] - w_i[:, :, :-1]   # [B, N_phys, T-1]
+    loss = per_node_var.mean() + 20.0 * (diff1 ** 2).mean()
+    # ── 粗尺度 (250 ms) 慢摆 ──
+    if coarse_hop > 0 and T > coarse_hop:
+        diff_c = w_i[:, :, coarse_hop:] - w_i[:, :, :-coarse_hop]
+        loss = loss + coarse_weight * (diff_c ** 2).mean()
+    return loss
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -402,7 +439,9 @@ def w_range_loss(w_i: torch.Tensor,
       - consistency: 缩小节点内时间方差 (平滑, 但快速跳变也能低方差)
       - range:       硬约束每个时间帧在物理合理范围内 (防跳变)
 
-    L_range = mean[ clamp(w_low_eff - w_i, 0) + clamp(w_i - w_high, 0) ]
+    L_range = mean[ clamp(w_low_eff - w_i, 0)² + clamp(w_i - w_high, 0)² ]
+    (平方 hinge: 平底 hinge 在边界处梯度从 0 突跳到 1, 会在界上来回"打铃";
+     平方后在边界处梯度连续衰减到 0, 越界幅度越大惩罚越重。)
 
     分量存在度门控 (presence):
       w_range_low 隐含假设"该分量恒存在"。2xBPF 在空转工况分量消失
@@ -428,8 +467,42 @@ def w_range_loss(w_i: torch.Tensor,
         w_low_exp = w_low_min + presence.to(w_i.dtype) * (w_low_base - w_low_min)
     else:
         w_low_exp = w_low.view(1, -1, 1).to(w_i.device)
-    l = torch.clamp(w_low_exp - w_i, min=0.0) + torch.clamp(w_i - w_high_exp, min=0.0)
+    l = (torch.clamp(w_low_exp - w_i, min=0.0) ** 2
+         + torch.clamp(w_i - w_high_exp, min=0.0) ** 2)
     return l.mean()
+
+
+def w_center_loss(w_i: torch.Tensor,
+                  w_center: torch.Tensor,
+                  presence: Optional[torch.Tensor] = None,
+                  w_center_absent: float = 0.05) -> torch.Tensor:
+    """
+    先验中心二次惩罚 —— 拉 w_i 回逐节点先验中心 C_prior.
+
+    WHY: 有界 logit (models/sast.GAT) 后, w_i 不再被 sigmoid 饱和钉在 1.0; 但
+    w_range/balance 的平底 hinge 在 [w_low, w_high] 内梯度为 0, RE_2D 的溢出
+    串扰可以把软带 w 一路顶到 w_range_high (实测 BPF_DRIFT 顶死 0.50)。二次项
+    提供连续回拉力, 使平衡点落在中心附近的小偏离处而非墙上 —— 与 L_soft_ent 同向。
+
+    presence 门控 (与 w_range 的 presence 机制一致): 分量缺席时中心下沉到
+    w_center_absent, 避免把 2xBPF 在空转强行拉回 0.90 高挤。
+
+    Args:
+        w_i:             [B, N_phys, T]
+        w_center:        [N_phys] 逐节点先验中心 (= 各 region 的 C_prior)
+        presence:        [B, N_phys, T] 可选, 分量存在度 (0=缺席, 1=显著)
+        w_center_absent: 存在度为 0 时的中心
+
+    Returns:
+        scalar = mean((w_i - c_eff)^2)
+    """
+    if presence is not None:
+        e_mean = presence.mean(dim=-1)          # [B, N_phys]
+        c = w_center_absent + (w_center - w_center_absent) * e_mean  # [B, N_phys]
+        c_exp = c.unsqueeze(-1)                  # [B, N_phys, 1]
+    else:
+        c_exp = w_center.view(1, -1, 1).to(w_i.device)  # [1, N_phys, 1]
+    return ((w_i - c_exp) ** 2).mean()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -558,7 +631,7 @@ def node_presence(tfr_mag: torch.Tensor,
         regions = PUMP_TURBINE_REGIONS
     if torch.is_complex(tfr_mag):
         tfr_mag = tfr_mag.abs()
-    B, F, T = tfr_mag.shape
+    B, _Fbins, T = tfr_mag.shape
     dtype = tfr_mag.dtype
     e = torch.zeros(B, len(regions), T, device=tfr_mag.device, dtype=dtype)
 
@@ -572,6 +645,11 @@ def node_presence(tfr_mag: torch.Tensor,
         w_in = w_in[m]                                   # [Fn]
         # 过渡带内的 bin 按 w<1 加权 (旧实现为两端皆闭的硬矩形)
         band = (tfr_mag[:, m, :] * w_in.view(1, -1, 1)).clamp(min=0.0)  # [B, Fn, T]
+        # 先沿时间轴平滑 0.2s (201 帧), 滤掉瞬时干涉暗斑与短命噪声团, 再算频域
+        # top-k 集中度。定频锁定线 (高负荷 2xBPF) 沿时间平均后峰仍尖 (presence→1);
+        # 随机游走的噪声斑块 (空转 2xBPF) 被抹成平坦直线 (c≈p → presence→0)。
+        band = F.avg_pool1d(F.pad(band, (100, 100), mode='replicate'),
+                            kernel_size=201, stride=1)
         kk = min(max(1, int(math.ceil(frac * Fn))), Fn)
         tot = band.sum(dim=1)                            # [B, T]
         top = band.topk(kk, dim=1).values.sum(dim=1)     # [B, T]
@@ -730,6 +808,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
                      lambda_consistency: float = 0.3,
                      lambda_lowfreq: float = 0.05,
                      lambda_range: float = 0.3,
+                     lambda_w_center: float = 0.05,
                      lambda_anchor: float = 0.2,
                      lambda_ratio: float = 0.2,
                      ratio_tol: float = 0.06,
@@ -780,6 +859,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         lambda_consistency: w_i 频段内时序一致性权重 (默认 0.3)
         lambda_lowfreq: 低频锐化 loss 权重 (默认 0.05)
         lambda_range:   w_i per-node 逐帧范围约束权重 (默认 0.3)
+        lambda_w_center: 先验中心二次惩罚权重 (默认 0.05)
         lambda_anchor:  绝对频率锚权重 (默认 0.2)
         lambda_ratio:   谐波比值一致性权重 (默认 0.2); 作用在可微 if_hat 上
         ratio_tol:      比值允许的相对偏差 (flat-bottom 半宽, 默认 6%)
@@ -806,7 +886,10 @@ def total_sast_loss(tfr_raw: torch.Tensor,
             tfr_enhanced.dtype).view(1, -1, 1)
     z_freq = freq_encoder(_fe_in)
     l_supcon = supcon_loss(z_freq, y_true, temperature=supcon_temperature)
-    l_entropy = renyi_2d_loss(tfr_enhanced, freqs)
+    # ── 分量存在度 (由原始谱决定, 门控 RE_2D 与下面三项) ──
+    presence = node_presence(tfr_raw, freqs, regions, frac=presence_frac)
+    # RE_2D 按 presence 加权: 缺席时不挤压, 阻止空转 2xBPF 底噪被挤成假谱线
+    l_entropy = renyi_2d_loss(tfr_enhanced, freqs, regions, presence=presence)
     # 软带的相对熵降护栏 (硬带仍走上面的最小化熵)
     l_soft_ent = soft_entropy_hinge(tfr_enhanced, tfr_raw, freqs,
                                     regions, delta_H=delta_H)
@@ -817,14 +900,14 @@ def total_sast_loss(tfr_raw: torch.Tensor,
     else:
         l_physics = torch.tensor(0.0, device=w_i.device)
 
-    # ── 分量存在度 (由原始谱决定, 门控下面三项) ──
-    presence = node_presence(tfr_raw, freqs, regions, frac=presence_frac)
-
     # ── per-node 逐帧范围约束 (下界按存在度松弛) ──
     w_low = torch.tensor([r.w_range_low for r in regions],
                           device=w_i.device, dtype=torch.float32)
     w_high = torch.tensor([r.w_range_high for r in regions],
                            device=w_i.device, dtype=torch.float32)
+    # 先验中心 (C_prior) —— 二次惩罚的锚, 与有界 logit 里的 w_ref 同一来源
+    w_center = torch.tensor([r.C_prior for r in regions],
+                            device=w_i.device, dtype=torch.float32)
     # B4 拆节点后各节点角色差异大 (BPF_LINE 该硬挤 / BPF_DRIFT 该留宽),
     # balance 与 range 共用同一套 per-node 边界, 不再用全局 [0.3, 0.9]。
     l_balance = balance_loss(w_i, w_min=w_low, w_max=w_high,
@@ -837,6 +920,8 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         f_low=r_low.f_min, f_high=r_low.f_max)
     l_range = w_range_loss(w_i, w_low, w_high,
                            presence=presence, w_low_min=w_low_min)
+    l_w_center = w_center_loss(w_i, w_center, presence=presence,
+                               w_center_absent=w_low_min)
     # ── 可微节点频率 (A2): 约束的落点, 经 w_i→σ_i→重排对参数可微 ──
     if_hat = band_centroid_if(tfr_enhanced, freqs, regions)
     # ── 绝对频率锚: 打破比值约束的尺度不变性 ──
@@ -852,6 +937,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
              lambda_consistency * l_consistency +
              lambda_lowfreq * l_lowfreq +
              lambda_range * l_range +
+             lambda_w_center * l_w_center +
              lambda_soft_ent * l_soft_ent)
 
     # ── 方案 A: 频率约束 (伪物理约束) 是否参与反向图 ──
@@ -878,6 +964,7 @@ def total_sast_loss(tfr_raw: torch.Tensor,
         'w_consistency': l_consistency.item(),
         'lowfreq_sharp': l_lowfreq.item(),
         'w_range': l_range.item(),
+        'w_center': l_w_center.item(),
         'anchor': l_anchor.item(),
         'ratio': l_ratio.item(),
         # 生效乘数 (方案 A 下为 0.0) —— 让日志自证哪几项真正参与训练

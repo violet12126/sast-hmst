@@ -29,10 +29,30 @@ class SastConfig:
     # K_eff=min(ceil(6σ),K) 只在 σ>1.5 时被新 K=9 截断)。
     # 附带修掉 deploy 侧 sigma soft-cap 不一致: 导出用 delta = sigma_max - sigma_min,
     # sigma_max=3.0 时 = 2.5, 与训练侧 min(sigma_max, soft_cap)-sigma_min 相同。
-    # 代价: σ=3 时核被截到 ±3σ, 丢 0.27% 高斯质量 (重归一化); 只影响 LOW_FREQ /
-    # BPF_DRIFT 两个**软带** (hard 带 σ=0.5 -> K_eff=3, 远低于 9), 硬带不受影响。
+    # 代价: σ=3 时核被截到 ±3σ, 丢 0.27% 高斯质量 (重归一化)。**现只影响
+    # LOW_FREQ**: 它是唯一的软带, w∈[0.10,0.45] -> σ∈[1.875,2.75] > 1.5 会被截。
+    # 硬带 σ = 0.5 + (1-w)*2.5; BPF_DRIFT 现为硬带 w∈[0.60,0.85] -> σ∈[0.875,1.5],
+    # K_eff=ceil(6σ) 最大正好 9 = K, 不触发截断; BPF_LINE/2xBPF 的 σ≤0.875 更不受影响。
     sigma_max: float = 3.0
-    msst_num: int = 4
+    # ── MSST 迭代次数 (IF 固定点 lookup 层数) ──
+    # 4 -> 1: 4 次迭代会把 BPF_LINE 带内 bin 的 IF 从 49.6-50.2 Hz 一路拖到
+    # 45.8-48.3 Hz (掉进 BPF_DRIFT 的 46-48 Hz 主瓣), 迭代越深越偏 —— 即
+    # 「IF 精化」在本数据上对锁频线是**有害**的 (实测 iter0 中心 47.1-49.1 vs
+    # iter3 45.8-48.3, 五类全中; 带内落点越界比例 5.5%/14% → 10%/25%)。
+    # num=1 即用 STFT 的一阶 IF 估计 (标准 SST 口径), 与基线 MSST 图一致。
+    msst_num: int = 1
+    # ── MSST 窗长 (样本点) ──
+    # 512 -> 1024。46.9 Hz 漂移分量与 50 Hz 锁频线只差 3.1 Hz, 而 512 窗的
+    # 主瓣半宽约 2 Hz —— 两者在 [48.5,53) 里根本分不开, 该带 bin 的 IF 被
+    # 漂移峰右翼拽低。实测 (class0, hl/num=1, node_if 众数):
+    #   hl= 320 → 47.95 Hz (961/2000 帧钉在 48 Hz 附近, 即被拽到底)
+    #   hl= 512 → 48.88 Hz
+    #   hl=1024 → 49.54 Hz, 全帧落在 [48.53, 51.33], 越界 0%
+    # 代价: 有效时间分辨率 0.32 s → 1.02 s (信号长 2 s)。取 1024 是因为
+    # "46.9 Hz 起伏线 与 50 Hz 直线能不能分开"是硬判据, 时间分辨率是软的。
+    # 显式给出该字段后, scripts/plot/plot_msst_tfr.py 直接读它 —— 基线与推理
+    # 不再是两套窗长 (旧版一边 320 一边 512, 同一信号相关只有 0.58)。
+    msst_hlength: Optional[int] = 1024
     d_cond: int = 32
     f_type_embed_dim: int = 16
     ppn_temperature: float = 0.08
@@ -74,22 +94,41 @@ class SastConfig:
     lambda_supcon: float = 0.2
     lambda_entropy: float = 0.1
     # ── 软带相对熵降护栏 (L_soft_ent) ──
-    # 只允许增强谱比原始谱少 delta_H nats 的 Rényi-2D 熵; 补上 BPF_DRIFT 在
-    # "别挤"方向无约束的缺口 (lowfreq_sharpness_loss 只覆盖 LOW_FREQ)。
-    # delta_H 由合成对照标定: BPF_DRIFT 的 FWHM 2-3 Hz -> σ_int≈1.0 Hz -> 0.55 nats
+    # 只允许增强谱比原始谱少 delta_H nats 的 Rényi-2D 熵。**作用域随
+    # SOFT_F_TYPES 收窄**: 现在只有 LOW_FREQ/HYDRAULIC 一条软带 —— BPF_DRIFT
+    # 已被重新判为窄带调频脊线 (单帧本征宽度 0.686 Hz, 与 BPF_LINE 0.584 /
+    # 2xBPF 0.650 同量级) 归入硬带, 不再受本项保护。
+    # delta_H 由合成对照标定: 软带 FWHM 2-3 Hz -> σ_int≈1.0 Hz -> 0.55 nats
     # (区间 0.36-0.79 对应 σ_int 0.85-1.27)。实测底噪跨 500 倍熵降变化 <0.6%,
     # 即共模抵消成立, 固定 delta_H 可用。
-    # ⚠ **默认 0 (关闭)**: §16.14 证明模型在软带的挤压强度本来就是物理正确的
-    #   (松弛后 σ=1.109 Hz, 熵降 0.5605, 与合成标定的 0.55 独立吻合), hinge 无事可管。
-    #   标定保留为诊断工具; 需要消融时设 >0。
-    lambda_soft_ent: float = 0.0
+    # 保留 0.5: LOW_FREQ 是真正的宽带湍流云团 (2.789 Hz, 6 倍于锁频带), 需要
+    # 一个显式的"别挤"回拉力, 与 lambda_w_center 二次项同向。
+    lambda_soft_ent: float = 0.5
     delta_H: float = 0.55
     lambda_physics: float = 0.5
     lambda_balance: float = 0.5
     lambda_var: float = 0.5
-    lambda_consistency: float = 0.3
+    # ── w_i 逐帧平稳性 (0.3 -> 1.0) ──
+    # 实测 (results/w_curve/, e15 ckpt): 帧级 |Δw| 只有 0.009 (无毛刺), 但
+    # **样本内极差** ptp 可达 BPF_LINE 0.86 / 2xBPF 0.58, 时间尺度 0.4-1.0 s
+    # —— 0.1 s 的 avg_pool 结构低通压不住这个尺度。故把权重提回 1.0, 并在
+    # w_consistency_loss 里加 250 ms 粗尺度差分项 (见 sast_losses)。
+    lambda_consistency: float = 1.0
     lambda_lowfreq: float = 0.05
-    lambda_range: float = 0.3
+    # ── w_range 逐帧范围 (0.3 -> 1.0) + 平方 hinge ──
+    # 平底 hinge 在界内梯度为 0、界外梯度恒定, 会在边界上来回"打铃"; 平方 hinge
+    # 在边界处梯度连续衰减到 0, 配合 λ=1.0 把越过 w_range 的帧按越界幅度平方惩罚。
+    lambda_range: float = 1.0
+    # ── 先验中心二次惩罚 (L_w_center) ──
+    # 拉 w_i 回逐节点先验中心 C_prior: mean((w_i - c_n)^2)。配合有界 logit 后,
+    # w_range/balance 的平底 hinge 在范围内梯度为 0, RE_2D 的溢出串扰可把软带 w
+    # 一路顶到 w_range_high (实测 BPF_DRIFT 顶死 0.50)。二次项提供连续回拉力,
+    # 使平衡点落在中心附近的小偏离处而非墙上。
+    # 与 w_range 的 presence 机制一致: 分量缺席时中心下沉到 w_low_min, 避免把
+    # 2xBPF 在空转强行拉回 0.90 (配合 renyi_2d_loss 的 presence 加权)。
+    # 权重较小: 只需盖过 RE_2D 串扰 (实测 ~1e-6 量级), 不盖过 supcon/RE_2D 的
+    # 真信号, 保留 BPF_DRIFT 的跨类/跨样本方差。
+    lambda_w_center: float = 0.05
     lambda_anchor: float = 0.2      # 绝对频率锚 (BPF_LINE 49.995±1.5, 2xBPF 99.990±1.5)
     lambda_ratio: float = 0.2       # 谐波比值一致性 (作用在可微 if_hat 上, A2)
     ratio_tol: float = 0.06         # 比值允许的相对偏差 (flat-bottom 半宽)

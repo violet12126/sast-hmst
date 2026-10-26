@@ -70,8 +70,12 @@ Examples:
     p.add_argument('--sigma_max', type=float, default=3.0,
                    help='最大核宽 (bin)。= sigma_soft_cap; 也决定重排半径 '
                         'K=ceil(3*sigma_max)。15.0 是历史遗留, 实际 σ 上限只有 3.0')
-    p.add_argument('--msst_num', type=int, default=4,
-                   help='MSST 迭代次数 (=N_max=4)')
+    p.add_argument('--msst_num', type=int, default=1,
+                   help='MSST IF 迭代次数。默认 1 (标准 SST 一阶 IF): 实测 4 次'
+                        '固定点迭代会把 BPF_LINE 的 IF 从 ~50 Hz 拖到 45.8-48.3 Hz')
+    p.add_argument('--msst_hlength', type=int, default=1024,
+                   help='MSST 窗长 (样本点)。与基线绘图共用; 1024 才能把 '
+                        '46.9 Hz 漂移分量与 50 Hz 锁频线分开')
     p.add_argument('--d_cond', type=int, default=32)
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--ppn_temperature', type=float, default=0.08)
@@ -102,19 +106,25 @@ Examples:
                    help='SupCon 权重; 已由 1.0 降到 0.2 (不做分类, 仅作 '
                         'cond_ctx 工况区分度的辅助正则, 重心回到时频分布)')
     p.add_argument('--lambda_entropy', type=float, default=0.1)
-    p.add_argument('--lambda_soft_ent', type=float, default=0.0,
-                   help='软带相对熵降护栏的权重; 0 = 关闭 (复现旧行为)')
+    p.add_argument('--lambda_soft_ent', type=float, default=0.5,
+                   help='软带相对熵降护栏的权重。只作用于 SOFT_F_TYPES, 现仅 '
+                        'LOW_FREQ/HYDRAULIC (BPF_DRIFT 已归硬带); 0 = 关闭')
     p.add_argument('--delta_H', type=float, default=0.55,
                    help='软带允许的 Rényi-2D 熵降 (nats), 合成对照标定为 0.55')
     p.add_argument('--lambda_physics', type=float, default=0.5)
     p.add_argument('--lambda_balance', type=float, default=0.5)
     p.add_argument('--lambda_var', type=float, default=0.5)
-    p.add_argument('--lambda_consistency', type=float, default=0.3,
-                   help='w_i 频段内时序一致性 loss 权重 (越高各帧越一致, 防跳变)')
+    p.add_argument('--lambda_consistency', type=float, default=1.0,
+                   help='w_i 频段内时序一致性 loss 权重 (越高各帧越一致, 防跳变)。'
+                        '1.0 含 250 ms 粗尺度差分项: 帧级 |Δw| 本就只有 0.009, '
+                        '但 0.4-1.0 s 尺度的样本内极差可达 BPF_LINE 0.86')
     p.add_argument('--lambda_lowfreq', type=float, default=0.05,
                    help='低频锐化 loss 权重 (0=禁用)')
-    p.add_argument('--lambda_range', type=float, default=0.3,
-                   help='w_i per-node 逐帧范围约束 loss 权重')
+    p.add_argument('--lambda_range', type=float, default=1.0,
+                   help='w_i per-node 逐帧范围约束 loss 权重 (平方 hinge: 边界处梯度'
+                        '连续衰减到 0, 不会在 w_range 上打铃)')
+    p.add_argument('--lambda_w_center', type=float, default=0.05,
+                   help='w_i 先验中心二次惩罚权重 (拉回 C_prior, 防被 RE_2D 顶穿范围墙)')
     p.add_argument('--lambda_anchor', type=float, default=0.2,
                    help='绝对频率锚 loss 权重 (BPF_LINE 49.995±1.5Hz, 2xBPF 99.990±1.5Hz)')
     p.add_argument('--lambda_ratio', type=float, default=0.2,
@@ -159,7 +169,8 @@ Examples:
         fs=args.fs, max_len=args.max_len,
         d_h=args.d_h, n_heads=args.n_heads, n_layers=args.n_layers,
         sigma_min=args.sigma_min, sigma_max=args.sigma_max,
-        msst_num=args.msst_num, d_cond=args.d_cond,
+        msst_num=args.msst_num, msst_hlength=args.msst_hlength,
+        d_cond=args.d_cond,
         ppn_temperature=args.ppn_temperature,
         prototype_temperature=args.prototype_temperature,
         dropout=args.dropout,
@@ -175,6 +186,9 @@ Examples:
         lambda_consistency=args.lambda_consistency,
         lambda_lowfreq=args.lambda_lowfreq,
         lambda_range=args.lambda_range,
+        lambda_w_center=args.lambda_w_center,
+        lambda_soft_ent=args.lambda_soft_ent,
+        delta_H=args.delta_H,
         lambda_anchor=args.lambda_anchor,
         lambda_ratio=args.lambda_ratio,
         ratio_tol=args.ratio_tol,
@@ -307,6 +321,7 @@ def main():
           f"{'' if config.freq_constraints_active else ' (诊断, 见下)'}"
           f"  λ_b={config.lambda_balance}")
     print(f"  λ_var={config.lambda_var}  λ_c={config.lambda_consistency}  λ_lf={config.lambda_lowfreq}  λ_r={config.lambda_range}")
+    print(f"  λ_wc={config.lambda_w_center}  λ_soft_ent={config.lambda_soft_ent}  δ_H={config.delta_H}")
     print(f"  presence_frac={config.presence_frac}  w_low_min={config.w_low_min}")
     tag = ('【消融: 参与反向传播】' if config.freq_constraints_active
            else '【方案 A: 已降级为诊断, 不参与反向传播】')
@@ -397,6 +412,7 @@ def main():
                 lambda_consistency=config.lambda_consistency,
                 lambda_lowfreq=config.lambda_lowfreq,
                 lambda_range=config.lambda_range,
+                lambda_w_center=config.lambda_w_center,
                 lambda_anchor=config.lambda_anchor,
                 lambda_ratio=config.lambda_ratio,
                 ratio_tol=config.ratio_tol,
@@ -521,6 +537,7 @@ def main():
                     delta_H=config.delta_H,
                     lambda_lowfreq=config.lambda_lowfreq,
                     lambda_range=config.lambda_range,
+                    lambda_w_center=config.lambda_w_center,
                     lambda_anchor=config.lambda_anchor,
                     lambda_ratio=config.lambda_ratio,
                     ratio_tol=config.ratio_tol,

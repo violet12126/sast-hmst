@@ -24,6 +24,7 @@ def create_model(config: SastConfig, device: torch.device) -> SAST:
         sigma_min=config.sigma_min,
         sigma_max=config.sigma_max,
         msst_num=config.msst_num,
+        msst_hlength=config.msst_hlength,
         d_cond=config.d_cond,
         f_type_embed_dim=config.f_type_embed_dim,
         ppn_temperature=config.ppn_temperature,

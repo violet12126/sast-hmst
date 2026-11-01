@@ -51,6 +51,25 @@ from sast_viz import plot_tfr, plot_full_diagnostics, print_inference_summary
 from models.sast_graph import get_graph_summary
 
 
+def compute_compare_tfr(signal, which: str = 'wsst1'):
+    """
+    计算 plot_tfr 的 (b) 对照面板 (目前支持一阶 WSST, 走 scripts/plot/tfr_common
+    的 canonical 参数, 与 compare_tfr_quality.py 的 WSST1 完全一致)。
+
+    对照面板只是排版需要, 计算失败时返回 None —— 主图退化为两列, 不中断。
+    """
+    if which in (None, 'none'):
+        return None
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / 'scripts' / 'plot'))
+        from tfr_common import method_wsst1
+        r = method_wsst1(np.asarray(signal, dtype=np.float64).ravel())
+        return dict(label=f'(b) {which.upper()} — linear', **r)
+    except Exception as e:                      # noqa: BLE001
+        print(f'[warn] 对照方法 {which} 计算失败, (b) 面板留空: {e}')
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════
 # High-level convenience API
 # ═══════════════════════════════════════════════════════════════
@@ -111,6 +130,8 @@ Examples:
                    help='tfr=3-panel | full=6-panel | predict=classify | eval=accuracy | batch=export features')
     p.add_argument('--device', default='cuda')
     p.add_argument('--freq-max', type=float, default=200)
+    p.add_argument('--compare', choices=['wsst1', 'none'], default='wsst1',
+                   help='tfr 模式下 (b) 面板的对照方法 (默认一阶 WSST; none=不画)')
     p.add_argument('--eval-split', type=float, default=0.15,
                    help='Validation split for eval mode')
     p.add_argument('--seed', type=int, default=42,
@@ -251,7 +272,8 @@ def main():
     else:
         out_path = out_path or f'sast_tfr_class{class_label}_s{sample_idx}.png'
         plot_tfr(results, out_path, freq_max=args.freq_max,
-                 signal=signal, fs=fs)
+                 signal=signal, fs=fs,
+                 compare_tfr=compute_compare_tfr(signal, args.compare))
 
     # Summary table
     C_prior = meta['C_prior']

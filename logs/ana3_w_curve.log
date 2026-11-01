@@ -1,0 +1,76 @@
+Loaded SAST checkpoint: sast_checkpoints/3node_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.17832729 0.9091346  0.9092123 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (4):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF (physical)
+  [3] 2xBPF (physical)
+
+Edges (10):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF                     w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF                     w=0.15  [DRIFT]
+           BPF → LOW_FREQ                w=0.15  [DRIFT]
+           BPF → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+           BPF → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF                     w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - 3 physical nodes: LOW_FREQ / BPF / 2xBPF (B4 的 BPF 拆分已撤回)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> blade-pass modulation), non-harmonic
+  - HARMONIC edge: BPF → 2×BPF (r=2.0), sole deterministic relationship;
+    r_obs 在合并带上是带内能量加权 IF 的比值, class 2 读到 ≈2.2 (诊断口径)
+  - No self-loops; no classifier-based condition prediction
+checkpoint: sast_checkpoints/3node_e15/sast_v3_e015.pt
+device: cuda  fs=1000 Hz  per_class=8
+  class 0 (No-load): n=8  S=3  T=2000
+  class 1 (Low load): n=8  S=3  T=2000
+  class 2 (Mid load): n=8  S=3  T=2000
+  class 3 (High load): n=8  S=3  T=2000
+  class 4 (Pumping): n=8  S=3  T=2000
+
+======================================================================================================
+w_i(t) 时序稳定性 (指标先在样本内沿时间算, 再跨样本平均/取最坏)
+======================================================================================================
+class      node         mean  std_t  ptp_t  max|dw| max|d50|  jump%  step%   out%  floor%      w_range
+------------------------------------------------------------------------------------------------------
+No-load    LOW_FREQ    0.049 0.0007 0.0026   0.0000   0.0013   0.0%   0.0%  70.6%   95.8%   [0.05,0.35]
+No-load    BPF         0.980 0.0017 0.0076   0.0001   0.0033   0.0%   0.0%   1.9%    0.0%   [0.80,0.98]
+No-load    2xBPF       0.973 0.0026 0.0106   0.0001   0.0046   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+Low load   LOW_FREQ    0.107 0.0003 0.0013   0.0000   0.0005   0.0%   0.0%   0.0%    0.0%   [0.05,0.35]
+Low load   BPF         0.980 0.0000 0.0001   0.0000   0.0000   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+Low load   2xBPF       0.980 0.0000 0.0001   0.0000   0.0001   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+Mid load   LOW_FREQ    0.102 0.0008 0.0033   0.0001   0.0057   0.0%   0.0%   0.0%    0.0%   [0.05,0.35]
+Mid load   BPF         0.980 0.0007 0.0036   0.0001   0.0070   0.0%   0.0%   1.7%    0.0%   [0.80,0.98]
+Mid load   2xBPF       0.980 0.0001 0.0003   0.0000   0.0006   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+High load  LOW_FREQ    0.108 0.0009 0.0035   0.0000   0.0015   0.0%   0.0%   0.0%    0.0%   [0.05,0.35]
+High load  BPF         0.979 0.0017 0.0069   0.0001   0.0031   0.0%   0.0%   5.2%    0.0%   [0.80,0.98]
+High load  2xBPF       0.980 0.0000 0.0001   0.0000   0.0000   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+Pumping    LOW_FREQ    0.103 0.0010 0.0040   0.0001   0.0039   0.0%   0.0%   0.0%    0.0%   [0.05,0.35]
+Pumping    BPF         0.980 0.0003 0.0010   0.0001   0.0032   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+Pumping    2xBPF       0.980 0.0001 0.0003   0.0000   0.0004   0.0%   0.0%   0.0%    0.0%   [0.80,0.98]
+
+---------------------------------------------------------------------------------
+ALL        node         mean  std_t  ptp_t  max|dw| max|d50|  jump%  step%   out%
+---------------------------------------------------------------------------------
+ALL        LOW_FREQ    0.094 0.0010 0.0040   0.0001   0.0057   0.0%   0.0%  70.6%
+ALL        BPF         0.980 0.0017 0.0076   0.0001   0.0070   0.0%   0.0%   5.2%
+ALL        2xBPF       0.979 0.0026 0.0106   0.0001   0.0046   0.0%   0.0%   0.0%
+
+CSV -> results\w_curve_3node\w_curve_stats.csv
+CSV -> results\w_curve_3node\w_curve_per_sample.csv
+  plot -> results\w_curve_3node\w_curve_class0.png
+  plot -> results\w_curve_3node\w_curve_class1.png
+  plot -> results\w_curve_3node\w_curve_class2.png
+  plot -> results\w_curve_3node\w_curve_class3.png
+  plot -> results\w_curve_3node\w_curve_class4.png
+  plot -> results\w_curve_3node\w_curve_contact.png

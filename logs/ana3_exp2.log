@@ -1,0 +1,81 @@
+val: 1160 样本 | 类分布 [38, 324, 116, 615, 67] (空转=38)
+节点顺序: ['LOW_FREQ', 'BPF', '2xBPF']
+策略: ['B1', 'B2', 'B3', 'B4', 'B5a', 'B5b', 'Proposed']
+  10/1160
+  210/1160
+  410/1160
+  610/1160
+  810/1160
+  1010/1160
+
+====================================================================================
+实验 2 消融读数 (N=1160)
+====================================================================================
+
+[1] 软带包络保真度 cos (越高越保真):
+    B1        LOW_FREQ=0.6556
+    B2        LOW_FREQ=0.5112
+    B3        LOW_FREQ=0.9958
+    B4        LOW_FREQ=0.9991
+    B5a       LOW_FREQ=0.9997
+    B5b       LOW_FREQ=0.9973
+    Proposed  LOW_FREQ=0.9990
+
+[1b] 软带 top-1 bin 占比 (撕裂度, 越低越好):
+    B1        LOW_FREQ=0.2219
+    B2        LOW_FREQ=0.3160
+    B3        LOW_FREQ=0.0792
+    B4        LOW_FREQ=0.0796
+    B5a       LOW_FREQ=0.0801
+    B5b       LOW_FREQ=0.0791
+    Proposed  LOW_FREQ=0.0796
+
+[1c] 硬带 Rényi-2D 熵 / 带内 std Hz (越低越聚焦):
+    B1        BPF=9.400/2.643  2xBPF=8.261/1.959  | mean=8.831/2.301
+    B2        BPF=8.972/2.566  2xBPF=8.030/1.897  | mean=8.501/2.231
+    B3        BPF=9.349/2.593  2xBPF=8.439/1.923  | mean=8.894/2.258
+    B4        BPF=10.415/2.890  2xBPF=9.925/2.263  | mean=10.170/2.577
+    B5a       BPF=9.308/2.594  2xBPF=8.150/1.908  | mean=8.729/2.251
+    B5b       BPF=9.030/2.574  2xBPF=8.072/1.903  | mean=8.551/2.238
+    Proposed  BPF=8.995/2.570  2xBPF=8.043/1.900  | mean=8.519/2.235
+
+[2a] 软带 Fisher (全谱形状 / 统计矩):
+    B1        0.4496 / 1.1918
+    B2        0.3650 / 1.1201
+    B3        0.6864 / 0.7543
+    B4        0.6936 / 0.7550
+    B5a       0.6919 / 0.7521
+    B5b       0.6796 / 0.7437
+    Proposed  0.6962 / 0.7620
+
+[2b] 软带 1-NN (统计矩):
+    B1        0.8405
+    B2        0.8233
+    B3        0.8655
+    B4        0.8793
+    B5a       0.8750
+    B5b       0.8664
+    Proposed  0.8750
+
+[3] 空转 2xBPF PMR (越低越好, n=38):
+    B1        4.0463
+    B2        5.4240
+    B3        4.4266
+    B4        1.7323
+    B5a       5.2893
+    B5b       5.2807
+    Proposed  5.3273
+
+[表 5-1] w_i 统计:
+    B1        (无 w, 等效硬挤)
+    B2        Δw(BPF)=0.000 hard_mean=1.000  LOW_FREQ=1.000 BPF=1.000 2xBPF=1.000
+    B3        Δw(BPF)=0.000 hard_mean=0.900  LOW_FREQ=0.200 BPF=0.900 2xBPF=0.900
+    B4        Δw(BPF)=0.079 hard_mean=0.277  LOW_FREQ=0.095 BPF=0.201 2xBPF=0.354
+    B5a       Δw(BPF)=0.250 hard_mean=0.922  LOW_FREQ=0.061 BPF=0.899 2xBPF=0.944
+    B5b       Δw(BPF)=0.008 hard_mean=0.961  LOW_FREQ=0.164 BPF=0.962 2xBPF=0.961
+    Proposed  Δw(BPF)=0.001 hard_mean=0.980  LOW_FREQ=0.106 BPF=0.980 2xBPF=0.980
+
+已存: D:\aifile\SAST\results\exp2\exp2_3node_e15.json
+已出图: D:\aifile\SAST\results\exp2\exp2_3node_e15_class3_id0.png
+已出图: D:\aifile\SAST\results\exp2\exp2_3node_e15_class0_id30.png
+完成.

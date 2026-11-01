@@ -1,0 +1,98 @@
+﻿Device: cuda
+Loaded SAST checkpoint: sast_checkpoints/merged_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.25846788 0.71532613 0.80733806 0.9027318 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (5):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF_DRIFT (physical)
+  [3] BPF_LINE (physical)
+  [4] 2xBPF (physical)
+
+Edges (11):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF_DRIFT               w=0.60  [CONDITION]
+            OP → BPF_LINE                w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF_DRIFT               w=0.15  [DRIFT]
+     BPF_DRIFT → LOW_FREQ                w=0.15  [DRIFT]
+      BPF_LINE → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+     BPF_DRIFT → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF_DRIFT               w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> BPF_DRIFT modulation), non-harmonic
+  - HARMONIC edge: BPF_LINE → 2×BPF (r=2.0), sole deterministic relationship
+  - No self-loops; no classifier-based condition prediction
+Sample: class=1, idx=4876, T=2000
+Running SAST inference...
+[Plot] Saved: infer_out_merged/class1_full.png
+
+======================================================================
+SAST Inference Summary - Class 1, Sample #4876
+======================================================================
+Node              IF(Hz) C_prior     w_i    gate  Interpretation
+----------------------------------------------------------------------
+  LOW_FREQ             9.4   0.258   0.119   0.886  Matched prior, low w_i
+  BPF_DRIFT           45.9   0.715   0.865   0.918  TRUSTED - aggressive squeeze
+  BPF_LINE            49.7   0.807   0.949   0.971  TRUSTED - aggressive squeeze
+  2xBPF               99.4   0.903   0.971   0.898  TRUSTED - aggressive squeeze
+
+  w_i spread (max-min across nodes): 0.852
+  -> SAST is actively differentiating frequency components
+Device: cuda
+Loaded SAST checkpoint: sast_checkpoints/merged_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.25846788 0.71532613 0.80733806 0.9027318 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (5):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF_DRIFT (physical)
+  [3] BPF_LINE (physical)
+  [4] 2xBPF (physical)
+
+Edges (11):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF_DRIFT               w=0.60  [CONDITION]
+            OP → BPF_LINE                w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF_DRIFT               w=0.15  [DRIFT]
+     BPF_DRIFT → LOW_FREQ                w=0.15  [DRIFT]
+      BPF_LINE → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+     BPF_DRIFT → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF_DRIFT               w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> BPF_DRIFT modulation), non-harmonic
+  - HARMONIC edge: BPF_LINE → 2×BPF (r=2.0), sole deterministic relationship
+  - No self-loops; no classifier-based condition prediction
+Sample: class=1, idx=4876, T=2000
+Running SAST inference...
+[Plot] Saved: infer_out_merged/class1_tfr.png
+
+======================================================================
+SAST Inference Summary - Class 1, Sample #4876
+======================================================================
+Node              IF(Hz) C_prior     w_i    gate  Interpretation
+----------------------------------------------------------------------
+  LOW_FREQ             9.4   0.258   0.119   0.886  Matched prior, low w_i
+  BPF_DRIFT           45.9   0.715   0.865   0.918  TRUSTED - aggressive squeeze
+  BPF_LINE            49.7   0.807   0.949   0.971  TRUSTED - aggressive squeeze
+  2xBPF               99.4   0.903   0.971   0.898  TRUSTED - aggressive squeeze
+
+  w_i spread (max-min across nodes): 0.852
+  -> SAST is actively differentiating frequency components

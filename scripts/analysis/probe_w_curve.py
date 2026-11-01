@@ -1,9 +1,8 @@
 """
 w_i(t) 时序体检 —— 重训后逐物理节点看挤压宽度是否"钉在小范围里"
 ==================================================================
-判据来自 models/sast_nodes.PUMP_TURBINE_REGIONS[].w_range_*:
-    LOW_FREQ  [0.10, 0.45]   BPF_DRIFT [0.60, 0.85]
-    BPF_LINE  [0.65, 0.95]   2xBPF     [0.65, 0.90]
+判据来自 models/sast_nodes.PUMP_TURBINE_REGIONS[].w_range_* (3 节点, 单一真源):
+    LOW_FREQ [0.05, 0.35]   BPF [0.80, 0.98]   2xBPF [0.80, 0.98]
 下界在分量缺席时由 presence 门控松弛到 w_low_min = 0.05 (见 w_range_loss)。
 
 本脚本不训练、不改模型, 只跑推理 + 统计 + 画图。
@@ -17,15 +16,18 @@ w_i(t) 时序体检 —— 重训后逐物理节点看挤压宽度是否"钉在�
   max_dw50  |w(t+50ms)-w(t)| 最大值     —— 2 s 图上肉眼可见的"台阶"高度
   jump_rate |Δw|       > 0.02 的帧占比  —— 毛刺口径
   step_rate |Δ_50ms w| > 0.05 的帧占比  —— 台阶口径
-  out_rate  w ∉ [w_low, w_high] 的帧占比
+  out_rate  w ∉ [w_low−ε, w_high+ε] 的帧占比 (ε=RANGE_TOL)。**必须留容差**:
+            w_range_loss 的二次铰链最优解就落在边界上, 收敛后 w_i 会精确停在
+            w_high (如 0.98000…1), 严格 `>` 会把它记成"越界"并报出 100%,
+            掩盖真正逃出带外的样本
   below_floor  w < 0.05+eps 的帧占比 (靠 presence 松弛活着)
   peak_at / trough_at  w 取到最大/最小的相对时刻 (0→1) —— 判定是否窗口边缘效应
 
 输出 (默认 results/w_curve/):
   w_curve_stats.csv          逐 (class, node) 汇总
   w_curve_per_sample.csv     逐样本原始指标 (可复查极值来自哪个样本)
-  w_curve_class{c}.png       每类一张: 4 节点子图, 抽样样本曲线 + 类均值
-  w_curve_contact.png        5 类 × 4 节点 均值曲线网格
+  w_curve_class{c}.png       每类一张: 逐节点子图, 抽样样本曲线 + 类均值
+  w_curve_contact.png        5 类 × 逐节点 均值曲线网格
 
 用法:
   python scripts/analysis/probe_w_curve.py \
@@ -60,6 +62,7 @@ NODE_COLORS = ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e']
 JUMP_TOL = 0.02              # 逐帧"毛刺"阈值
 STEP_TOL = 0.05              # 50 ms 粗尺度"台阶"阈值
 COARSE_HOP = 50              # 50 帧 = 50 ms (fs=1000, hop=1)
+RANGE_TOL = 1e-3             # w_range 越界判定的边界容差 (见 out_rate 说明)
 
 METRIC_KEYS = ('mean', 'std_t', 'ptp_t', 'max_dw', 'p99_dw', 'max_dw50',
                'jump_rate', 'step_rate', 'out_rate', 'below_floor',
@@ -83,7 +86,8 @@ def sample_metrics(w: np.ndarray):
         out['jump_rate'].append(float((dw[n] > JUMP_TOL).mean()))
         out['step_rate'].append(float((dc[n] > STEP_TOL).mean()))
         out['out_rate'].append(
-            float(((ww < W_LOW[n]) | (ww > W_HIGH[n])).mean()))
+            float(((ww < W_LOW[n] - RANGE_TOL)
+                   | (ww > W_HIGH[n] + RANGE_TOL)).mean()))
         out['below_floor'].append(float((ww < ABSENT_FLOOR + 1e-6).mean()))
         out['peak_at'].append(float(ww.argmax() / max(1, T - 1)))
         out['trough_at'].append(float(ww.argmin() / max(1, T - 1)))
@@ -230,9 +234,12 @@ def main():
         ax.grid(alpha=0.25, lw=0.4)
         ax.set_title(title, fontsize=8)
 
-    # 每类一张
+    # 每类一张 (节点数随 PUMP_TURBINE_REGIONS 变化: 现为 3)
+    n_cols = min(3, N_NODE)
+    n_rows = int(np.ceil(N_NODE / n_cols))
     for c in classes:
-        fig, axes = plt.subplots(2, 2, figsize=(11, 5.6), sharex=True, sharey=True)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(11, 2.8 * n_rows),
+                                 sharex=True, sharey=True, squeeze=False)
         axes = axes.ravel()
         w = curves[c]
         rows_c = [r for r in agg_rows if r['class'] == c]
@@ -245,7 +252,7 @@ def main():
             axes[n].legend(fontsize=6, loc='upper right', ncol=3)
         for ax in axes[N_NODE:]:
             ax.axis('off')
-        for ax in axes[2:]:
+        for ax in axes[n_cols * (n_rows - 1):]:
             ax.set_xlabel('time (s)')
         fig.suptitle(f'w_i(t) stability — {CLASS_NAMES[c]} (class {c}), '
                      f'n={w.shape[0]} samples, ckpt={Path(args.checkpoint).stem}',
@@ -256,7 +263,7 @@ def main():
         plt.close(fig)
         print(f'  plot -> {out}')
 
-    # 5 类 × 4 节点 均值曲线网格
+    # 5 类 × 逐节点 均值曲线网格
     fig, axes = plt.subplots(len(classes), N_NODE,
                              figsize=(13, 1.9 * len(classes)),
                              sharex=True, sharey=True)

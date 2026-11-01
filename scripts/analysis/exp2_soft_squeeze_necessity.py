@@ -3,17 +3,17 @@
 7 策略 (表 5-1 / 表 5-2 的消融):
   B1      : tfr_msst           传统单点 Dirac 硬挤压 (模型前向已产出)
   B2      : w ≡ 1.0            全频段统一硬挤 (GAT 输出钩子直接置 1)
-  B3      : w ≡ C_prior        静态物理先验 [0.30,0.30,0.80,0.90] (GAT 钩子)
+  B3      : w ≡ C_prior        静态物理先验 (3 节点: [0.20, 0.90, 0.95]) (GAT 钩子)
   B4      : w = 0.06 + presence·(C_prior-0.06)   单带解析存在度公式
-  B5a     : 去图 + 去 cond_ctx  屏蔽全部 11 条边 (h_new=0) + PPM cond_mod 置零
-  B5b     : 留 cond_ctx 去 7 条物理边  只保留 CONDITION (OP→物理节点) 4 条边
+  B5a     : 去图 + 去 cond_ctx  屏蔽全部 10 条边 (h_new=0) + PPM cond_mod 置零
+  B5b     : 留 cond_ctx 去物理边  只保留 CONDITION (OP→物理节点) 3 条边
   Proposed: SAST 完整异构图
 
 四类指标 (无需分类器):
-  [1]  软带包络保真度: LOW_FREQ+BPF_DRIFT 带内, 与「移动平均去噪后的原始 STFT」
+  [1]  软带包络保真度: 软带 (LOW_FREQ) 内, 与「移动平均去噪后的原始 STFT」
        的 2D 余弦相似度 (越高越保真)
   [1b] 软带撕裂度: 带内 top-1 bin 能量占比 (越高越被挤成细线)
-  [1c] 硬带聚焦: BPF_LINE + 2xBPF 的带内 Rényi-2D 熵 (α=2, 越低越集中)
+  [1c] 硬带聚焦: BPF + 2xBPF 的带内 Rényi-2D 熵 (α=2, 越低越集中)
        + 带内能量加权频率 std (Hz, 越低越窄)  —— 口径与
        sast_inference.evaluate_tf_quality 完全一致
   [2]  软带独立可分性: 软带时间平均谱 (全谱形状) / 统计矩 (宽度隔离)
@@ -50,8 +50,15 @@ from sast_model import create_model
 sys.stdout.reconfigure(encoding='utf-8')
 
 CLASS_NAMES = ['空转', '低负荷', '中负荷', '高负荷', '抽水']
-SOFT_NAMES = ['LOW_FREQ', 'BPF_DRIFT']
-HARD_NAMES = ['BPF_LINE', '2xBPF']
+# 软/硬带分组从单一真源导出 (SOFT_F_TYPES), 不再硬编码节点名。
+# ⚠ 历史可比性: results/exp2/*.json 是 4 节点时期 (软带 LOW_FREQ+BPF_DRIFT,
+#   硬带 BPF_LINE+2xBPF) 的产物。B4 撤回后软带只剩 LOW_FREQ、硬带变成
+#   BPF+2xBPF, 数字**不可与前一批直接对比**, 必须同 tag 重跑后再比。
+from models.sast_nodes import SOFT_F_TYPES as _SOFT_F_TYPES   # noqa: E402
+SOFT_NAMES = [r.name for r in PUMP_TURBINE_REGIONS
+              if r.f_type in _SOFT_F_TYPES]
+HARD_NAMES = [r.name for r in PUMP_TURBINE_REGIONS
+              if r.f_type not in _SOFT_F_TYPES]
 STRATEGIES = ['B1', 'B2', 'B3', 'B4', 'B5a', 'B5b', 'Proposed']
 NODE_NAMES = [r.name for r in PUMP_TURBINE_REGIONS]
 C_PRIOR = torch.tensor([r.C_prior for r in PUMP_TURBINE_REGIONS])
@@ -537,8 +544,9 @@ def main():
                 NODE_NAMES[i]: (round(float(cls_means[c, i]), 4)
                                 if np.isfinite(cls_means[c, i]) else None)
                 for i in range(len(NODE_NAMES))} for c in range(5)},
-            'delta_w_BPF_DRIFT': round(float(np.nanmax(cls_means[:, 1]) -
-                                             np.nanmin(cls_means[:, 1])), 4),
+            'delta_w_BPF': round(float(
+                np.nanmax(cls_means[:, NODE_NAMES.index('BPF')]) -
+                np.nanmin(cls_means[:, NODE_NAMES.index('BPF')])), 4),
             'hard_mean': round(float(np.mean([means[NODE_NAMES.index(b)]
                                               for b in HARD_NAMES])), 4),
         }
@@ -578,7 +586,7 @@ def main():
         if w is None:
             print(f'    {s:<9s} (无 w, 等效硬挤)')
             continue
-        print(f'    {s:<9s} Δw(BPF_DRIFT)={w["delta_w_BPF_DRIFT"]:.3f} '
+        print(f'    {s:<9s} Δw(BPF)={w["delta_w_BPF"]:.3f} '
               f'hard_mean={w["hard_mean"]:.3f}  '
               + ' '.join(f'{k}={v:.3f}' for k, v in w['node_mean'].items()))
 

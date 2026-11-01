@@ -1,0 +1,79 @@
+﻿==============================================================================
+A. IF 估计扫描 — BPF_LINE node_if (带 [48.5, 53.0) Hz)
+==============================================================================
+   hl  num | class  median  min  max  out%
+------------------------------------------------------------------------------
+  320    1 | 0   49.26 48.50 52.44   0.4% | 1   49.50 48.50 53.00   1.6% | 2   49.16 48.50 52.48   0.9% | 3   48.96 48.50 52.63   0.1% | 4   49.19 48.50 51.82   2.1%
+  320    4 | 0   52.50 50.84 53.00   0.2% | 1   49.50 48.50 53.00   2.1% | 2   49.81 48.50 53.00   0.9% | 3   50.63 48.50 53.00   0.8% | 4   49.50 48.50 52.50   2.4%
+  512    1 | 0   49.46 48.50 52.63   2.4% | 1   49.69 48.50 52.78   1.8% | 2   49.22 48.50 53.00   1.4% | 3   49.57 48.50 53.00   0.1% | 4   49.35 48.50 52.67   1.2%
+  512    4 | 0   51.00 49.41 52.50   0.0% | 1   49.68 48.50 53.00   2.9% | 2   50.00 48.50 53.00   0.9% | 3   51.50 49.00 53.00   1.1% | 4   49.00 48.50 52.50   3.4%
+ 1024    1 | 0   49.51 48.80 51.32   0.0% | 1   49.92 48.88 50.70   0.0% | 2   49.34 48.51 51.24   0.0% | 3   49.74 48.50 51.64   0.3% | 4   49.43 48.86 50.44   0.0%
+ 1024    4 | 0   49.48 48.85 52.32   0.0% | 1   50.00 48.50 52.60   1.5% | 2   49.50 48.50 53.00   0.5% | 3   50.50 48.50 53.00   3.2% | 4   49.44 48.50 53.00   4.3%
+Loaded SAST checkpoint: sast_checkpoints/merged_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.25846788 0.71532613 0.80733806 0.9027318 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (5):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF_DRIFT (physical)
+  [3] BPF_LINE (physical)
+  [4] 2xBPF (physical)
+
+Edges (11):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF_DRIFT               w=0.60  [CONDITION]
+            OP → BPF_LINE                w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF_DRIFT               w=0.15  [DRIFT]
+     BPF_DRIFT → LOW_FREQ                w=0.15  [DRIFT]
+      BPF_LINE → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+     BPF_DRIFT → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF_DRIFT               w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> BPF_DRIFT modulation), non-harmonic
+  - HARMONIC edge: BPF_LINE → 2×BPF (r=2.0), sole deterministic relationship
+  - No self-loops; no classifier-based condition prediction
+
+sample: class=2 (Mid load) idx=4 N=2000  hl=1024 num=1
+
+==============================================================================
+B. 单样本前向 (ckpt 的 GAT 权重仍是旧分类下训练的, w 仅供参考)
+==============================================================================
+
+[current ckpt]
+node          IF med   IF min   IF max   w mean   w ptp
+LOW_FREQ        8.32     4.15    12.21    0.115   0.017
+BPF_DRIFT      45.62    43.30    47.06    0.852   0.034
+BPF_LINE       49.34    48.50    51.24    0.954   0.008
+2xBPF          99.49    99.11    99.69    0.977   0.080
+  >105 Hz 与原始 STFT 的最大逐点差: 0.000e+00 (未挤压 ✓)
+  BPF_DRIFT  H2(raw)=9.3680  H2(enh)=8.4757
+  BPF_LINE   H2(raw)=9.1502  H2(enh)=7.4406
+  46.5 Hz 分量: 重心均值=46.16 Hz  std_t=0.594 Hz
+  50 Hz 线   : 重心均值=49.51 Hz  std_t=0.556 Hz
+
+==============================================================================
+C. 预览: w_i -> C_prior {'LOW_FREQ': 0.3, 'BPF_DRIFT': 0.7, 'BPF_LINE': 0.8, '2xBPF': 0.9}
+==============================================================================
+
+[preview w=C_prior]
+node          IF med   IF min   IF max   w mean   w ptp
+LOW_FREQ        8.32     4.15    12.21    0.300   0.000
+BPF_DRIFT      45.62    43.30    47.06    0.700   0.000
+BPF_LINE       49.34    48.50    51.24    0.800   0.000
+2xBPF          99.49    99.11    99.69    0.900   0.000
+  >105 Hz 与原始 STFT 的最大逐点差: 0.000e+00 (未挤压 ✓)
+  BPF_DRIFT  H2(raw)=9.3680  H2(enh)=8.9010
+  BPF_LINE   H2(raw)=9.1502  H2(enh)=8.1563
+  46.5 Hz 分量: 重心均值=46.19 Hz  std_t=0.554 Hz
+  50 Hz 线   : 重心均值=49.56 Hz  std_t=0.467 Hz
+
+plot -> results\msst_check\merged_class2.png

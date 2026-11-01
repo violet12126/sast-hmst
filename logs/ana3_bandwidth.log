@@ -1,0 +1,18 @@
+freqs 1000 bin, df=0.5 Hz;  等半径窗 ±2.5 Hz (约 ±5 bin);   presence > 0.15
+节点框宽: LOW_FREQ 16.0Hz  BPF 13.0Hz  2xBPF 15.0Hz
+(框宽/sqrt(12): LOW_FREQ 4.619  BPF 3.753  2xBPF 4.330)  <- 朴素做法的系统性偏差来源
+
+窗底标定 (合成纯音, 等半径窗内):
+  BPF         intra=0.2196 inter=0.0170 total=0.2203 amp=1.3462 Hz
+  2xBPF       intra=0.2207 inter=0.0104 total=0.2210 amp=1.3462 Hz
+
+真实数据 (20 条):
+
+  node          类型    intra    inter    total      amp     帧数
+  LOW_FREQ       软    0.573    3.730    3.787    1.008   1611
+  BPF            硬    0.474    1.521    1.606    1.343   1447
+  2xBPF          硬    0.269    0.840    0.944    1.321   1692
+
+  判据: total 应满足  LOW_FREQ > max(BPF, 2xBPF)
+  实测排序: LOW_FREQ(3.79) > BPF(1.61) > 2xBPF(0.94)
+  排序恢复 OK

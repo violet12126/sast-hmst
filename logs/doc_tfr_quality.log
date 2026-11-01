@@ -1,0 +1,78 @@
+Loaded SAST checkpoint: sast_checkpoints/3node_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.17832729 0.9091346  0.9092123 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (4):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF (physical)
+  [3] 2xBPF (physical)
+
+Edges (10):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF                     w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF                     w=0.15  [DRIFT]
+           BPF → LOW_FREQ                w=0.15  [DRIFT]
+           BPF → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+           BPF → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF                     w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - 3 physical nodes: LOW_FREQ / BPF / 2xBPF (B4 的 BPF 拆分已撤回)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> blade-pass modulation), non-harmonic
+  - HARMONIC edge: BPF → 2×BPF (r=2.0), sole deterministic relationship;
+    r_obs 在合并带上是带内能量加权 IF 的比值, class 2 读到 ≈2.2 (诊断口径)
+  - No self-loops; no classifier-based condition prediction
+样本: 50 个 (5 类 × 10)
+方法: ['SST1', 'WSST1', 'WSST2', 'MSST1', 'MSST4', 'SAST']
+分区: ['full', 'harm', 'low']
+  SST1   完成 (50 样本)
+  WSST1  完成 (50 样本)
+  WSST2  完成 (50 样本)
+  MSST1  完成 (50 样本)
+  MSST4  完成 (50 样本)
+  SAST   完成 (50 样本)
+
+==================================================================
+全带 (0-500 Hz)   [full]
+method       Rényi (mean±std)     ridge (mean±std)
+----------------------------------------------------
+SST1         12.91 ±0.39         0.521 ±0.170   
+MSST4        13.56 ±0.65         0.694 ±0.059   
+WSST2        13.67 ±0.65         0.699 ±0.030   
+WSST1        14.05 ±0.64         0.678 ±0.047   
+MSST1        14.66 ±0.68         0.456 ±0.075   
+SAST         14.86 ±0.74         0.310 ±0.100   
+
+==================================================================
+谐波带 (BPF+2xBPF, 40-105 Hz)   [harm]
+method       Rényi (mean±std)     ridge (mean±std)
+----------------------------------------------------
+MSST4        11.86 ±0.23         0.914 ±0.037   
+SST1         11.98 ±0.24         0.847 ±0.082   
+WSST2        12.24 ±0.23         0.838 ±0.038   
+WSST1        12.43 ±0.30         0.824 ±0.051   
+SAST         12.85 ±0.41         0.732 ±0.048   
+MSST1        13.00 ±0.51         0.732 ±0.040   
+
+==================================================================
+低频带 (LOW_FREQ, 2-18 Hz)   [low]
+method       Rényi (mean±std)     ridge (mean±std)
+----------------------------------------------------
+MSST4        11.53 ±0.39         0.919 ±0.029   
+SST1         11.68 ±0.25         0.517 ±0.117   
+MSST1        13.35 ±0.36         0.748 ±0.045   
+WSST2        14.35 ±0.20         0.847 ±0.028   
+WSST1        14.49 ±0.27         0.817 ±0.041   
+SAST         14.79 ±0.77         0.290 ±0.092   
+
+结果: results\tfr_quality_3node\tfr_quality.csv
+聚合: results\tfr_quality_3node\tfr_quality_agg.csv
+图表: results\tfr_quality_3node\renyi_comparison.png, results\tfr_quality_3node\renyi_by_region.png

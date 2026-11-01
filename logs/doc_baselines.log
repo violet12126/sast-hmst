@@ -1,0 +1,95 @@
+样本: 50 个 (5 类 × 10)
+  SST1           完成 (50 样本)
+  WSST1          完成 (50 样本)
+  WSST2          完成 (50 样本)
+  MSST1          完成 (50 样本)
+  MSST4          完成 (50 样本)
+  fixed-σ=0.5    完成 (50 样本)
+  fixed-σ=1      完成 (50 样本)
+  fixed-σ=2      完成 (50 样本)
+  fixed-σ=3      完成 (50 样本)
+Loaded SAST checkpoint: sast_checkpoints/3node_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.17832729 0.9091346  0.9092123 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (4):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF (physical)
+  [3] 2xBPF (physical)
+
+Edges (10):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF                     w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF                     w=0.15  [DRIFT]
+           BPF → LOW_FREQ                w=0.15  [DRIFT]
+           BPF → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+           BPF → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF                     w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - 3 physical nodes: LOW_FREQ / BPF / 2xBPF (B4 的 BPF 拆分已撤回)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> blade-pass modulation), non-harmonic
+  - HARMONIC edge: BPF → 2×BPF (r=2.0), sole deterministic relationship;
+    r_obs 在合并带上是带内能量加权 IF 的比值, class 2 读到 ≈2.2 (诊断口径)
+  - No self-loops; no classifier-based condition prediction
+  SAST           完成 (50 样本)
+
+method             Rényi (mean±std)     ridge (mean±std)
+--------------------------------------------------------
+SST1               12.91 ±0.39         0.521 ±0.170   
+MSST4              13.56 ±0.65         0.694 ±0.059   
+WSST2              13.67 ±0.65         0.699 ±0.030   
+fixed-σ=0.5        14.04 ±0.65         0.692 ±0.055   
+WSST1              14.05 ±0.64         0.678 ±0.047   
+MSST1              14.66 ±0.68         0.456 ±0.075   
+SAST               14.86 ±0.74         0.310 ±0.100   
+fixed-σ=1          15.15 ±0.67         0.612 ±0.043   
+fixed-σ=2          16.11 ±0.67         0.397 ±0.027   
+fixed-σ=3          16.68 ±0.67         0.283 ±0.019   
+
+================================================
+可分性 — 全带 (0-500 Hz)   [full]
+tag                silhouette   1-NN acc
+----------------------------------------
+SST1                    0.635      1.000
+WSST1                   0.593      1.000
+WSST2                   0.600      1.000
+MSST1                   0.620      1.000
+MSST4                   0.607      0.980
+SAST                    0.583      1.000
+fixed-σ=0.5             0.609      0.980
+
+================================================
+可分性 — 谐波带 (BPF+2xBPF, 40-105 Hz)   [harm]
+tag                silhouette   1-NN acc
+----------------------------------------
+SST1                    0.574      0.980
+WSST1                   0.583      0.980
+WSST2                   0.597      1.000
+MSST1                   0.603      0.980
+MSST4                   0.596      0.980
+SAST                    0.576      1.000
+fixed-σ=0.5             0.598      0.980
+
+================================================
+可分性 — 低频带 (LOW_FREQ, 2-18 Hz)   [low]
+tag                silhouette   1-NN acc
+----------------------------------------
+SST1                    0.386      0.960
+WSST1                   0.129      0.960
+WSST2                   0.168      0.960
+MSST1                   0.269      0.940
+MSST4                   0.196      0.900
+SAST                    0.570      1.000
+fixed-σ=0.5             0.200      0.920
+
+结果: results\baseline_compare_3node/baseline_quality.csv
+可分性: results\baseline_compare_3node/baseline_separability.csv

@@ -22,17 +22,24 @@ class SastConfig:
     d_h: int = 96
     n_heads: int = 4
     n_layers: int = 2
-    sigma_min: float = 0.5
-    # sigma_max = 3.0 (= sigma_soft_cap). 实际 sigma_i = 0.5 + (1-w_i)*2.5 ∈ [0.5,3.0],
-    # 故 15.0 从未被达到; 而 K = ceil(kernel_radius(3.0)*sigma_max) 被算成 45,
+    # 0.5 -> 0.20: 硬带 (BPF / 2xBPF) 的 w_i 实测钉在 0.95-0.98, 旧映射给出
+    # σ = 0.55-0.63 bin, 而软门控要跑 M=2 轮 —— 每轮重新把 ±3σ 的高斯质量摊开,
+    # 脊线比 Raw MSST 粗一圈、峰值被稀释, 41-50 Hz 段因此反而暗于 100 Hz,
+    # 出现与 Raw 相反的色阶。0.20 下 σ(0.98)=0.256 / σ(0.95)=0.34 bin,
+    # 中心 bin 集中度 >96%。软带 (LOW_FREQ, w≈0.12) 的 σ 几乎不变
+    # (0.20+0.88*2.8=2.66 vs 0.5+0.88*2.5=2.70), 低频仍是平滑软挤压。
+    # ⚠ σ 是 w_i 的线性函数: w=0.90 时 σ=0.48 bin (不是 ≤0.35)。
+    #   「w≥0.90 ⇒ σ≤0.35」需 delta≈1.5, 本映射不满足; 取的是 w_range 顶端落点。
+    sigma_min: float = 0.20
+    # sigma_max = 3.0 (= sigma_soft_cap). 实际 sigma_i = 0.20 + (1-w_i)*2.8 ∈ [0.20,3.0],
+    # 故历史上写的 15.0 从未被达到; 而 K = ceil(kernel_radius(3.0)*sigma_max) 被算成 45,
     # 白跑 5 倍循环 (base kernel 与 Python fallback 用满 ±K; opt kernel 的
     # K_eff=min(ceil(6σ),K) 只在 σ>1.5 时被新 K=9 截断)。
-    # 附带修掉 deploy 侧 sigma soft-cap 不一致: 导出用 delta = sigma_max - sigma_min,
-    # sigma_max=3.0 时 = 2.5, 与训练侧 min(sigma_max, soft_cap)-sigma_min 相同。
+    # 附注: deploy 侧导出曾用 delta = sigma_max - sigma_min 而漏掉 soft_cap,
+    # sigma_max=3.0 时与训练侧 min(sigma_max, soft_cap)-sigma_min 相同 (已登记)。
     # 代价: σ=3 时核被截到 ±3σ, 丢 0.27% 高斯质量 (重归一化)。**现只影响
-    # LOW_FREQ**: 它是唯一的软带, w∈[0.10,0.45] -> σ∈[1.875,2.75] > 1.5 会被截。
-    # 硬带 σ = 0.5 + (1-w)*2.5; BPF_DRIFT 现为硬带 w∈[0.60,0.85] -> σ∈[0.875,1.5],
-    # K_eff=ceil(6σ) 最大正好 9 = K, 不触发截断; BPF_LINE/2xBPF 的 σ≤0.875 更不受影响。
+    # LOW_FREQ**: 它是唯一的软带, w∈[0.05,0.35] -> σ∈[2.02,2.86] > 1.5 会被截。
+    # 硬带 BPF/2xBPF (w∈[0.80,0.98]) 的 σ∈[0.256,0.76], 不触发截断。
     sigma_max: float = 3.0
     # ── MSST 迭代次数 (IF 固定点 lookup 层数) ──
     # 4 -> 1: 4 次迭代会把 BPF_LINE 带内 bin 的 IF 从 49.6-50.2 Hz 一路拖到
@@ -95,9 +102,9 @@ class SastConfig:
     lambda_entropy: float = 0.1
     # ── 软带相对熵降护栏 (L_soft_ent) ──
     # 只允许增强谱比原始谱少 delta_H nats 的 Rényi-2D 熵。**作用域随
-    # SOFT_F_TYPES 收窄**: 现在只有 LOW_FREQ/HYDRAULIC 一条软带 —— BPF_DRIFT
-    # 已被重新判为窄带调频脊线 (单帧本征宽度 0.686 Hz, 与 BPF_LINE 0.584 /
-    # 2xBPF 0.650 同量级) 归入硬带, 不再受本项保护。
+    # SOFT_F_TYPES 收窄**: 现在只有 LOW_FREQ/HYDRAULIC 一条软带 —— 叶片通过族
+    # (BPF, 41 Hz 流动峰 + 50 Hz 锁定线) 被判为窄带调频脊线 (单帧本征宽度
+    # 0.686 / 0.584 Hz, 与 2xBPF 0.650 同量级) 归入硬带, 不受本项保护。
     # delta_H 由合成对照标定: 软带 FWHM 2-3 Hz -> σ_int≈1.0 Hz -> 0.55 nats
     # (区间 0.36-0.79 对应 σ_int 0.85-1.27)。实测底噪跨 500 倍熵降变化 <0.6%,
     # 即共模抵消成立, 固定 delta_H 可用。
@@ -109,7 +116,7 @@ class SastConfig:
     lambda_balance: float = 0.5
     lambda_var: float = 0.5
     # ── w_i 逐帧平稳性 (0.3 -> 1.0) ──
-    # 实测 (results/w_curve/, e15 ckpt): 帧级 |Δw| 只有 0.009 (无毛刺), 但
+    # 实测 (results/w_curve/, 4 节点 e15 ckpt): 帧级 |Δw| 只有 0.009 (无毛刺), 但
     # **样本内极差** ptp 可达 BPF_LINE 0.86 / 2xBPF 0.58, 时间尺度 0.4-1.0 s
     # —— 0.1 s 的 avg_pool 结构低通压不住这个尺度。故把权重提回 1.0, 并在
     # w_consistency_loss 里加 250 ms 粗尺度差分项 (见 sast_losses)。
@@ -122,23 +129,38 @@ class SastConfig:
     # ── 先验中心二次惩罚 (L_w_center) ──
     # 拉 w_i 回逐节点先验中心 C_prior: mean((w_i - c_n)^2)。配合有界 logit 后,
     # w_range/balance 的平底 hinge 在范围内梯度为 0, RE_2D 的溢出串扰可把软带 w
-    # 一路顶到 w_range_high (实测 BPF_DRIFT 顶死 0.50)。二次项提供连续回拉力,
+    # 一路顶到 w_range_high (4 节点期实测 BPF_DRIFT 顶死 0.50)。二次项提供连续回拉力,
     # 使平衡点落在中心附近的小偏离处而非墙上。
     # 与 w_range 的 presence 机制一致: 分量缺席时中心下沉到 w_low_min, 避免把
     # 2xBPF 在空转强行拉回 0.90 (配合 renyi_2d_loss 的 presence 加权)。
     # 权重较小: 只需盖过 RE_2D 串扰 (实测 ~1e-6 量级), 不盖过 supcon/RE_2D 的
     # 真信号, 保留 BPF_DRIFT 的跨类/跨样本方差。
     lambda_w_center: float = 0.05
-    lambda_anchor: float = 0.2      # 绝对频率锚 (BPF_LINE 49.995±1.5, 2xBPF 99.990±1.5)
+    lambda_anchor: float = 0.2      # 绝对频率锚 (仅 2xBPF 99.990±1.5; BPF 无锚, 见 sast_nodes)
     lambda_ratio: float = 0.2       # 谐波比值一致性 (作用在可微 if_hat 上, A2)
     ratio_tol: float = 0.06         # 比值允许的相对偏差 (flat-bottom 半宽)
     presence_frac: float = 0.1      # 分量存在度: 计入"峰"的带内 bin 比例
     w_low_min: float = 0.05         # 分量缺席时 w_range/balance 下界松弛到该值
+    # ── 分量缺席时的"上界收拢" + RE_2D 硬门控 (2026-11-01) ──
+    # 旧实现只放松下界: 空转 2xBPF (presence 0.084) 的 w_3 仍是 0.973, 因为
+    # 0.973 本来就落在 [w_low_eff, 0.98] 里 —— 不松弛也能满足下界。RE_2D 又
+    # 无条件向上推。故引入"缺席度" a ∈ [0,1] (sast_losses.absence_gate):
+    #   · RE_2D 对本样本的推力乘以 (1-a)
+    #   · w_range/balance 的有效**上界** = w_high_absent + (1-a)·(w_range_high - w_high_absent)
+    # a 由**逐节点**门限 FreqRegion.p_absent_lo/hi 二值化得到, 不用全局阈值:
+    # 实测 presence 尺度压缩且节点相关 —— 加载 BPF 只有 0.126-0.156, **低于**
+    # 空转 BPF 的 0.211 (空转带内只剩一条平坦 48 Hz 漂移峰, 集中度反而高), 若
+    # 全局门控会把加载 BPF 的上界压低、打掉硬挤压。故只有 2xBPF 启用
+    # (空转 0.084 vs 加载 0.275-0.345, 两簇清晰分离), BPF/LOW_FREQ 的
+    # p_absent_hi = 0 即不启用 (a ≡ 0, 行为与修改前逐位相同)。
+    w_high_absent: float = 0.20
     # ── 方案 A: 频率约束 (伪物理约束) 降级为诊断 ──
     # False (默认): L_physics / L_anchor / L_ratio 不进入 L_total, 仅写入
     # losses_dict 作诊断。理由见 sast_losses.total_sast_loss 的说明与 docs §14.2:
-    # 重排落点不可学, 这三项只能经 σ 操纵测量窗内的能量质心; 且实测五类
-    # BPF_LINE 质心仅跨 0.74 Hz < ±1.5 Hz 容差, 锚对任何工况都不触发。
+    # 重排落点不可学, 这三项只能经 σ 操纵测量窗内的能量质心; 4 节点期实测五类
+    # 锁定线质心仅跨 0.74 Hz < ±1.5 Hz 容差, 锚对任何工况都不触发。
+    # 3 节点合并后只有 2xBPF 带锚; BPF 带因同时含 41 Hz 非锁频峰而无锚,
+    # L_anchor 在该节点上恒为 0 (本项本就默认关闭)。
     # True 可一键复现消融。
     freq_constraints_active: bool = False
 

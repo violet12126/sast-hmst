@@ -161,15 +161,15 @@ def band_mask(freqs, fmax=FMAX_DEFAULT):
 #   low  : LOW_FREQ 涡带, 不应挤压 -> 应保留带宽
 #
 # ⚠ 边界由 models.sast_nodes.PUMP_TURBINE_REGIONS 导出, 不再硬编码 ——
-#   此前 'harm' 写死 (42,105) 而把 B4 拆开的 BPF_DRIFT / BPF_LINE 又合回去,
-#   'low' 写死 2-25 而上界早已收到 18, 边界一改就会静默过期。
+#   此前 'harm' 写死 (42,105), 'low' 写死 2-25 而上界早已收到 18,
+#   边界一改就会静默过期。B4 的 BPF 拆分撤回后节点名回到 'BPF'。
 from models.sast_nodes import PUMP_TURBINE_REGIONS as _REGIONS  # noqa: E402
 
 _R = {r.name: r for r in _REGIONS}
 REGIONS = {
     'full': (0.0, 500.0),
-    # 谐波带 = BPF_DRIFT ∪ BPF_LINE ∪ 2xBPF 的连续外包络
-    'harm': (_R['BPF_DRIFT'].f_min, _R['2xBPF'].f_max),
+    # 谐波带 = BPF ∪ 2xBPF 的连续外包络 (含 53-90 Hz 空带, 与旧口径一致)
+    'harm': (_R['BPF'].f_min, _R['2xBPF'].f_max),
     'low': (_R['LOW_FREQ'].f_min, _R['LOW_FREQ'].f_max),
 }
 

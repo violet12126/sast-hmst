@@ -88,9 +88,11 @@ F_ROT = N_RATED / 60.0                 # 5.5556 Hz — 电网锁定
 # F_ROT_IDLE (0.4565·F_ROT ≈ 2.536 Hz, "空转 45.65% 转速") 已删除 —— 该假设
 # 被实测证伪, 见文件头 ⚠ 段。
 
-# ── SAST 现有节点 (跟随 models/sast_nodes.PUMP_TURBINE_REGIONS, B4 后 4 节点) ──
-SAST_NODES = [('LOW_FREQ', 2.0, 18.0), ('BPF_DRIFT', 42.0, 48.5),
-              ('BPF_LINE', 48.5, 53.0), ('2xBPF', 90.0, 105.0)]
+# ── SAST 现有节点 ──
+# 从单一真源导出, 不再硬编码: B4 的拆分撤回后是 3 节点 (42/48.5 那条内部边
+# 已不存在), 硬编码副本会静默过期并把普查结论挂在错误的带上。
+from models.sast_nodes import PUMP_TURBINE_REGIONS as _REGIONS  # noqa: E402
+SAST_NODES = [(r.name, r.f_min, r.f_max) for r in _REGIONS]
 
 LOCK_HALF = 4.0          # 逐样本峰锁定搜索半径 (Hz)
 PROM_DB = 6.0            # 类均值谱峰显著性门限

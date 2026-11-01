@@ -23,7 +23,6 @@
 import argparse
 import csv
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -79,14 +78,17 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # 改后: 直接用规范表 + region_weights。--legacy 时还原历史边界以便同机对照。
+    # 直接用规范表 + region_weights。
+    # ⚠ --legacy 已失效: 它依赖 B4 拆分出的 BPF_DRIFT / BPF_LINE 两个节点,
+    #   而该拆分已撤回 (41 Hz 主峰落在原 BPF_DRIFT 左界之外)。历史结果保留在
+    #   results/band_census/ 下, 不再可复现 —— 这里显式报错, 不静默退化成
+    #   "跑新口径却打印历史口径"。
     if args.legacy:
-        regions = [replace(r, f_max=48.0) if r.name == 'BPF_DRIFT'
-                   else replace(r, f_min=48.0) if r.name == 'BPF_LINE' else r
-                   for r in PUMP_TURBINE_REGIONS]
-        print('*** --legacy: 历史口径 (42/48 硬边界 + 两端皆闭 + p=k/F_n) ***\n')
-    else:
-        regions = PUMP_TURBINE_REGIONS
+        raise SystemExit(
+            '--legacy 不可用: 4 节点 (BPF_DRIFT/BPF_LINE) 定义已随 B4 撤回删除。\n'
+            '历史输出见 results/band_census/。若确需复现, 请在'
+            ' PUMP_TURBINE_REGIONS 上临时手工还原 42/48.5 边界后再跑。')
+    regions = PUMP_TURBINE_REGIONS
 
     d = np.load(args.data, allow_pickle=True)
     X, y = d['train_X'], d['train_y'].ravel().astype(np.int64)

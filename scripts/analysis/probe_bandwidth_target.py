@@ -3,8 +3,10 @@
 WHY 需要修正: 朴素做法 (整框内积分 omega_0 的加权 std) 有三个结构性偏差——
 
   [B1] 框宽偏差: 实测 raw std ≈ B_n/sqrt(12)，即主要在测**搜索框宽度**而非信号。
-       LOW_FREQ 16 Hz 框 -> 4.619; BPF_DRIFT 6.5 Hz 框 -> 1.876; BPF_LINE 4.5 -> 1.299。
+       (4 节点期) LOW_FREQ 16 Hz 框 -> 4.619; BPF_DRIFT 6.5 -> 1.876; BPF_LINE 4.5 -> 1.299。
        实测值几乎逐项吻合 (4.345/1.890/1.212)，是均匀分布的签名。
+       ⚠ B4 拆分撤回后 BPF 是整条 [40,53) = 13 Hz, 该框宽偏差比旧两段都大 ——
+         正因如此, 本脚本的等半径修正对现在的 BPF 节点尤其必要。
   [B2] 缺席帧稀释: 空转时 2xBPF 分量消失 (presence 0.074)，整框平底噪 -> 单帧 std 逼近
        B_n/sqrt(12)，把全样本均值抬高。
   [B3] 相位法对阻尼/调幅展宽**原理性失明**: x(t)=exp(-a t)exp(i2pi f0 t) 的相位导数
@@ -21,7 +23,9 @@ WHY 需要修正: 朴素做法 (整框内积分 omega_0 的加权 std) 有三个
   - 同时给出**幅值法** (raw 谱在等半径窗内的加权 std - 窗底)，它对阻尼展宽敏感 (B3)。
 
 判据 (事前写定): 修正后排序应恢复为
-    LOW_FREQ > BPF_DRIFT > BPF_LINE ≈ 2xBPF
+    LOW_FREQ > max(BPF, 2xBPF)
+  —— 3 节点合并后 BPF 一词指整条 [40,53) 带 (41 Hz 流动峰 + 50 Hz 锁定线);
+     旧判据里的 BPF_DRIFT > BPF_LINE 这一中段比较已无对象。
 只读, 不改源码。
 """
 import argparse
@@ -188,18 +192,17 @@ def main():
         if not acc[reg.name]:
             continue
         a = np.array(acc[reg.name])
-        soft = reg.f_type == 'HYDRAULIC'   # 与 SOFT_F_TYPES 一致 (BPF_DRIFT 已移出)
+        soft = reg.f_type == 'HYDRAULIC'   # 与 SOFT_F_TYPES 一致 (BPF 是硬带)
         print(f'  {reg.name:<11s} {"软" if soft else "硬":>4s} {a[:,0].mean():>8.3f} '
               f'{a[:,1].mean():>8.3f} {a[:,2].mean():>8.3f} {a[:,3].mean():>8.3f} '
               f'{a[:,4].mean():>6.0f}')
         order.append((reg.name, a[:,2].mean()))
 
-    print(f'\n  判据: total 应满足  LOW_FREQ > BPF_DRIFT > BPF_LINE ≈ 2xBPF')
+    print(f'\n  判据: total 应满足  LOW_FREQ > max(BPF, 2xBPF)')
     got = ' > '.join(f'{n}({v:.2f})' for n, v in sorted(order, key=lambda z: -z[1]))
     print(f'  实测排序: {got}')
     d_ = dict(order)
-    ok = (d_.get('LOW_FREQ', 0) > d_.get('BPF_DRIFT', 0) >
-          max(d_.get('BPF_LINE', 0), d_.get('2xBPF', 0)))
+    ok = d_.get('LOW_FREQ', 0) > max(d_.get('BPF', 0), d_.get('2xBPF', 0))
     print(f'  {"排序恢复 OK" if ok else "排序仍未恢复"}')
 
 

@@ -6,15 +6,17 @@ SAST: Structure-Aware Synchrosqueezing Transform (v3)
 核心架构:
   Signal -> MSST (num, save_trajectory) -> Node Features + omegas [B,num,F,T]
   -> StaticPrototypeMatcher (soft matching) -> OperatingToken
-  -> PPM (ratio-gated + type-embed) -> GAT (11 edges) -> w_i
+  -> PPM (ratio-gated + type-embed) -> GAT (10 edges) -> w_i
   -> SparseGaussianReassigner(sigma_i, 软门控 g_m) -> TFR_sast
      ↑ 无 per-bin IF 层选择器 (历史上写作 PerBinOrderSelector, 从未实现;
        实测最优 IF 层恒为 omegas[-1], 详见 papers/SAST_讲解文档.md §5.1)
 
-物理图 (异构, 5 图节点 = 4 物理 + 1 OP / 11 边):
-  OP (virtual) --CONDITION--> LOW_FREQ, BPF_DRIFT, BPF_LINE, 2xBPF
-  LOW_FREQ <--DRIFT--> BPF_DRIFT
-  BPF_LINE --HARMONIC(r=2.0)--> 2xBPF
+物理图 (异构, 4 图节点 = 3 物理 + 1 OP / 10 边):
+  OP (virtual) --CONDITION--> LOW_FREQ, BPF, 2xBPF
+  LOW_FREQ <--DRIFT--> BPF
+  BPF --HARMONIC(r=2.0)--> 2xBPF
+  LOW_FREQ <--COMPETITION--> 2xBPF,  BPF <--COMPETITION--> 2xBPF
+  (B4 的 BPF_DRIFT / BPF_LINE 拆分已撤回 —— 41 Hz 主峰落在原左界之外)
 
 GAT 输出 w_i -> 两参数策略 (自适应次数改造后的现状):
   w_i     : IF 可信度 (GAT 直接输出)
@@ -51,7 +53,7 @@ from models.sast_nodes import (
 from models.sast_graph import (
     PHYSICS_EDGES, N_EDGES, N_NODES,
     PHYSICS_NODE_INDICES,
-    NODE_LOW_FREQ, NODE_BPF_DRIFT, NODE_BPF_LINE, NODE_2XBPF,
+    NODE_LOW_FREQ, NODE_BPF, NODE_2XBPF,
     compute_edge_features, get_graph_summary,
     HARMONIC_EDGE_INDICES, CONDITION_EDGE_INDICES, DRIFT_EDGE_INDICES,
     COMPETITION_EDGE_INDICES,
@@ -59,28 +61,29 @@ from models.sast_graph import (
 
 
 # ═══════════════════════════════════════════════════════════════
-# 0. Static Prototypes (5 × 6, 由 scripts/analysis/build_static_prototypes.py 重算)
+# 0. Static Prototypes (5 × 4, 由 scripts/analysis/build_static_prototypes.py 重算)
 # ═══════════════════════════════════════════════════════════════
-# B4 拆节点 (4 物理节点) 后按 compute_v_obs 的同一条计算路径重算, 由构造保证
-# 与在线特征同一归一化。旧 5×4 表 (3 节点时期 EDA) 有三处问题, 均已修正:
-#   1. 前三列之和 0.273/0.911/0.620/0.819/0.806, 而在线的 E_total = Σ 带能量
-#      使前三列恒和为 1.0 —— 余弦相似度对"R 块 vs log 比值列"的相对权重敏感,
-#      该不一致会系统性扭曲 alpha。
-#   2. 旧代码 E_lin = exp(log1p(x)) = 1 + x (应为 expm1), 每个节点被加 +1 地板。
-#   3. E_bpf = E_DRIFT + E_LINE 的重新合并抹掉了 B4 拆分最有判别力的特征。
-# 列序 = [R_LF, R_DRIFT, R_LINE, R_2x, log10(E_DRIFT/E_LINE), log10((E_DRIFT+E_LINE)/E_2x)]
+# 3 节点合并 (B4 撤回) 后按 compute_v_obs 的同一条计算路径重算, 由构造保证
+# 与在线特征同一归一化。与 4 节点期原型相比的差异:
+#   1. 维数 6 -> 4: BPF_DRIFT 与 BPF_LINE 合并为 BPF, 于是
+#      (a) "漂移/线 判别子" log10(E_DRIFT/E_LINE) 不再有意义, 整列删除;
+#      (b) R 块由 4 列收缩为 3 列 (R_LF, R_BPF, R_2x), 且仍恒和为 1.0。
+#   2. 计算口径不变: E_lin = expm1(node_energy) (不是 exp), R 块按 E_total
+#      归一化, 离线与在线同一条函数 (compute_v_obs), 无归一化偏差。
+# 列序 = [R_LF, R_BPF, R_2x, log10(E_BPF / E_2x)]
 # 计算口径: train 划分 (val_split=0.15, seed=42 -> N=6575, 已排除验证集),
 #   class 0 全量 196 样本, 其余各类抽 400; 逐列取中位数后把 R 块重新归一化到 1。
+# ⚠ 该表由脚本重算后粘贴; 若手工改动 compute_v_obs 的维数/语义, 必须重跑脚本。
 STATIC_PROTOTYPES = torch.tensor([
-    [0.138863, 0.671624, 0.112759, 0.076755,  0.738565,  1.014024],  # Class 0: 空转
-    [0.078291, 0.414625, 0.494852, 0.012232, -0.080094,  1.868020],  # Class 1: 低负荷
-    [0.098077, 0.209527, 0.118380, 0.574016,  0.181772, -0.205221],  # Class 2: 中负荷
-    [0.016501, 0.093141, 0.037490, 0.852869,  0.389718, -0.778678],  # Class 3: 高负荷
-    [0.049762, 0.455254, 0.345705, 0.149280,  0.118111,  0.746714],  # Class 4: 抽水
+    [0.259341, 0.674985, 0.065674,  0.994818],  # Class 0: 空转
+    [0.077195, 0.911934, 0.010871,  1.904744],  # Class 1: 低负荷
+    [0.144865, 0.341085, 0.514050, -0.174530],  # Class 2: 中负荷
+    [0.025699, 0.157685, 0.816617, -0.715337],  # Class 3: 高负荷
+    [0.051609, 0.820980, 0.127411,  0.808663],  # Class 4: 抽水
 ], dtype=torch.float64)
 
 N_PROTOTYPES = STATIC_PROTOTYPES.shape[0]  # 5
-PROTOTYPE_DIM = STATIC_PROTOTYPES.shape[1]  # 6
+PROTOTYPE_DIM = STATIC_PROTOTYPES.shape[1]  # 4
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -92,55 +95,48 @@ PROTOTYPE_DIM = STATIC_PROTOTYPES.shape[1]  # 6
 # StaticPrototypeMatcher.compute_V_obs 只是本函数的薄委托。
 def compute_v_obs(node_energy: torch.Tensor) -> torch.Tensor:
     """
-    从节点对数能量算 6 维工况特征向量 V_obs。
+    从节点对数能量算 4 维工况特征向量 V_obs。
 
-    V_obs = [ R_LF, R_DRIFT, R_LINE, R_2x,
-              log10(E_DRIFT / E_LINE),            # 漂移/线 判别子
-              log10((E_DRIFT + E_LINE) / E_2x) ]  # 谐波比值 (保留旧语义)
+    V_obs = [ R_LF, R_BPF, R_2x,
+              log10(E_BPF / E_2x) ]   # 谐波能量比 (r_nom = 2.0 的能量侧对应量)
 
     注意 (与 node_energy 的换算):
       node_energy = log1p(band_energy), 故精确逆运算是 **expm1**。
       旧实现用 torch.exp(...), 实际得到 1 + band_energy —— 每个节点都被加了
-      +1 地板。对强带可忽略, 对弱带会把能量占比系统性地抬向 1/3 (旧原型
-      类 1 的 BPF 族占比 0.0101 即受此影响)。此处改用 expm1。
+      +1 地板。对强带可忽略, 对弱带会把能量占比系统性地抬向 1/3。此处用 expm1。
+
+    注意 (维数随节点数变化):
+      B4 拆节点时本函数是 6 维 (含 log10(E_DRIFT/E_LINE) 的漂移/线判别子);
+      3 节点合并后该判别子失去对象, 整列删除 —— 若将来重新引入节点, 这
+      一列需随之恢复并重跑 scripts/analysis/build_static_prototypes.py。
 
     注意 (归一化一致性):
-      旧冻结原型前三列之和为 0.273/0.911/0.620/0.819/0.806, 而本函数的
-      E_total = Σ 带能量 使前三列恒和为 1.0 —— 离线 EDA 与在线代码用了不同
-      归一化。余弦相似度**不是**对"前三列整体 vs log 比值列"相对权重不变的,
-      故旧 alpha 被系统性扭曲。现已按 4 节点重算原型, 由构造与本节一致。
+      R 块恒和为 1.0 (E_total = Σ 带能量), 冻结原型也必须满足同一约束,
+      否则余弦相似度里的相对权重会被系统性扭曲。原型由脚本按本函数重算。
 
     Args:
         node_energy: [B, N_phys, T] 节点对数能量 (= log1p(带能量))
 
     Returns:
-        [B, T, 6]
+        [B, T, 4]
     """
     eps = 1e-12
     # node_energy = log1p(band_energy) -> band_energy = expm1(node_energy)
     E_lin = torch.expm1(node_energy.clamp(max=20.0))  # [B, N, T] ≥ 0
 
     E_lf = E_lin[:, NODE_LOW_FREQ - 1, :]
-    E_drift = E_lin[:, NODE_BPF_DRIFT - 1, :]
-    E_line = E_lin[:, NODE_BPF_LINE - 1, :]
+    E_bpf = E_lin[:, NODE_BPF - 1, :]
     E_2x = E_lin[:, NODE_2XBPF - 1, :]
-    E_total = (E_lf + E_drift + E_line + E_2x).clamp(min=eps)
+    E_total = (E_lf + E_bpf + E_2x).clamp(min=eps)
 
     R_LF = E_lf / E_total                        # [B, T]
-    R_DRIFT = E_drift / E_total                  # [B, T]
-    R_LINE = E_line / E_total                    # [B, T]
+    R_BPF = E_bpf / E_total                      # [B, T]
     R_2xBPF = E_2x / E_total                     # [B, T]
 
-    # 漂移/线 判别子 —— B4 拆节点带来的最有判别力的特征。旧实现为对齐
-    # 3 节点时期的原型把二者合并回 "BPF 族", 恰好把它抹掉了。
-    log_drift_line = torch.log10(
-        E_drift.clamp(min=eps) / E_line.clamp(min=eps))
-    # 谐波比值: 编码 BPF_LINE → 2xBPF 的整数倍频关系 (r_nom = 2.0)
-    log_harm = torch.log10(
-        (E_drift + E_line).clamp(min=eps) / E_2x.clamp(min=eps))
+    # 谐波能量比: 与 BPF→2xBPF 的 r_nom = 2.0 边同向 (能量侧, 非频率侧)
+    log_harm = torch.log10(E_bpf.clamp(min=eps) / E_2x.clamp(min=eps))
 
-    return torch.stack(
-        [R_LF, R_DRIFT, R_LINE, R_2xBPF, log_drift_line, log_harm], dim=-1)
+    return torch.stack([R_LF, R_BPF, R_2xBPF, log_harm], dim=-1)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -165,14 +161,14 @@ class StaticPrototypeMatcher(nn.Module):
         self.d_cond = d_cond
         self.temperature = temperature
 
-        # Frozen prototypes (4 节点重算, 见 compute_v_obs): [5, 6]
+        # Frozen prototypes (3 节点重算, 见 compute_v_obs): [5, 4]
         self.register_buffer('prototypes', STATIC_PROTOTYPES.clone())
 
         # Learnable prototype interpretation embeddings: [5, d_cond]
         # 模型学习"像原型 k"如何转化为挤压策略
         self.P_embed = nn.Parameter(torch.randn(N_PROTOTYPES, d_cond) * 0.02)
 
-        # V_obs 投影: PROTOTYPE_DIM (6) -> d_cond (对齐到 prototype 空间)
+        # V_obs 投影: PROTOTYPE_DIM (4) -> d_cond (对齐到 prototype 空间)
         # 注: 本模块在 forward 中**未被调用** —— alpha 直接来自 cosine,
         # 故 obs_proj 是 dead code (其参数量随 PROTOTYPE_DIM 变化, 但不影响前向)
         self.obs_proj = nn.Sequential(
@@ -184,9 +180,8 @@ class StaticPrototypeMatcher(nn.Module):
     def forward(self, V_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            V_obs: [B, T, 6]  每帧实时工况特征向量
-                   [R_LF, R_DRIFT, R_LINE, R_2x,
-                    log10(E_DRIFT/E_LINE), log10((E_DRIFT+E_LINE)/E_2x)]
+            V_obs: [B, T, 4]  每帧实时工况特征向量
+                   [R_LF, R_BPF, R_2x, log10(E_BPF/E_2x)]
 
         Returns:
             cond_ctx: [B, T, d_cond]  工况上下文嵌入
@@ -196,9 +191,9 @@ class StaticPrototypeMatcher(nn.Module):
         device = V_obs.device
 
         # 余弦相似度
-        proto = self.prototypes.to(device).to(V_obs.dtype)        # [5, 6]
-        proto_norm = F.normalize(proto, dim=-1)                    # [5, 6]
-        obs_norm = F.normalize(V_obs, dim=-1)                      # [B, T, 6]
+        proto = self.prototypes.to(device).to(V_obs.dtype)        # [5, 4]
+        proto_norm = F.normalize(proto, dim=-1)                    # [5, 4]
+        obs_norm = F.normalize(V_obs, dim=-1)                      # [B, T, 4]
 
         sim = torch.matmul(obs_norm, proto_norm.T)                 # [B, T, 5]
         alpha = F.softmax(sim / self.temperature, dim=-1)          # [B, T, 5]
@@ -822,7 +817,7 @@ class SparseGaussianReassigner(nn.Module):
         kernel_radius: 核半径倍数 (default 3.0 -> 3*sigma)
     """
 
-    def __init__(self, sigma_min: float = 0.5, sigma_max: float = 3.0,
+    def __init__(self, sigma_min: float = 0.20, sigma_max: float = 3.0,
                  n_sigma_levels: int = 20, kernel_radius: float = 3.0,
                  N_max: int = 4):
         super().__init__()
@@ -922,7 +917,7 @@ class SAST(nn.Module):
     数据流:
       Signal -> MSST (num, save_trajectory) -> NodeFeatures + omegas [B,num,F,T]
       -> V_obs from node energy -> StaticPrototypeMatcher -> cond_ctx, alpha
-      -> Per-frame: PPM (OP + phys nodes) -> GAT (11 edges) -> w_i
+      -> Per-frame: PPM (OP + phys nodes) -> GAT (10 edges) -> w_i
       -> sigma_i = sigma_min + (1-w_i)*Delta_sigma      控「挤多宽」
       -> 软门控 g_m = clamp(w_i*M - (m-1), 0, 1)         控「挤几轮」
       -> SparseGaussianReassigner(omegas[-1], sigma_i, g_m) -> TFR_sast
@@ -942,7 +937,10 @@ class SAST(nn.Module):
         d_h:              GAT 隐层维度
         n_heads:          注意力头数
         n_layers:         GAT 层数
-        sigma_min:        最小核宽 (bin)
+        sigma_min:        最小核宽 (bin). 0.5 -> 0.20: 硬带 w_i≈0.95-0.98 时
+                          σ≈0.26-0.33 bin, 中心 bin 集中度 >96%; 旧值 0.5 使
+                          σ≈0.55-0.63 bin, 经 M=2 轮重复涂抹后脊线比 Raw MSST
+                          粗一圈、峰值被稀释 (41-50 Hz 段因此出现色阶反转)。
         sigma_max:        最大核宽 (bin, = sigma_soft_cap)
         N_max:            MSST 最大迭代次数
         msst_num:         MSST 迭代次数 (训练时使用, 应 >= N_max)
@@ -953,7 +951,7 @@ class SAST(nn.Module):
     def __init__(self, fs: int = 1000,
                  freq_regions: Optional[List[FreqRegion]] = None,
                  d_h: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 sigma_min: float = 0.5, sigma_max: float = 3.0,
+                 sigma_min: float = 0.20, sigma_max: float = 3.0,
                  N_max: int = 4, msst_num: int = 4,
                  msst_hlength: Optional[int] = None,
                  d_cond: int = 32,
@@ -1210,6 +1208,14 @@ class SAST(nn.Module):
         # 脊线摊到 ±3σ≈±16 Hz, 峰值稀释 ~27x, 低频基线被"摊没"。
         # 治本收紧: 把"软挤压"的有效核宽上限压到 sigma_soft_cap, 使低频脊线
         # 保持软挤压(不锐化)但不再过度展宽; BPF/2xBPF 的 w_i→1 仍逼近 sigma_min。
+        # 硬带端再收紧 (sigma_min 0.5 -> 0.20): 硬带 w_i 实测钉在 0.95-0.98,
+        # 旧映射给出 σ=0.55-0.63 bin, 而重排要跑 M=2 轮 —— 每轮都把 ±3σ 的高斯
+        # 质量重新摊开, 结果是脊线比 Raw MSST 粗一圈、峰值被稀释; 41-50 Hz 段
+        # 因此反而暗于 100 Hz, 出现与 Raw 相反的色阶。0.20 下 σ(w=0.98)=0.256、
+        # σ(0.95)=0.34 bin, 中心 bin 集中度 >96%, 两轮后仍与硬挤压等高。
+        # 注意 σ 是 w_i 的线性函数, w=0.90 时 σ=0.48 bin (不是 ≤0.35) ——
+        # 「w≥0.90 ⇒ σ≤0.35」只有在 delta≈1.5 时成立; 现取的是 w_range 顶端
+        # (0.95-0.98) 的真实落点。
         sigma_soft_cap = 3.0   # 保守端最大核宽 (bin) ≈ 1.5 Hz
         delta = min(self.sigma_max, sigma_soft_cap) - self.sigma_min
         sigma_i = self.sigma_min + (1.0 - w_i) * delta  # [B, N_phys, T]
@@ -1292,6 +1298,11 @@ class SAST(nn.Module):
             'edge_dst': self.edge_dst,
             'edge_feats': edge_feats_t,
         }
+        if not training:
+            # 只读诊断量: 逐 bin IF (与重排共用 omegas[:, -1]), 供 Q_IF 等评估
+            # 指标使用。只在 eval 下挂到结果上 —— 训练时持有它会把这个
+            # [B,F,T] int32 张量一直拖到 loss 计算之后 (B=10 时 80 MB)。
+            result['omega_if'] = omegas[:, -1]
         # 挤压控制的诊断量。⚠ 只放**小张量**: 全尺寸的 gate [M,B,F,T] 在
         # B=3/T=2000 下是 228 MB, 每次前向都建会把 8 GB 卡顶到边缘 (实测
         # 7477/8188 MiB, 训练近乎停滞)。这里只报节点级"有效轮数" Σ_m g_m,

@@ -1,24 +1,29 @@
 """
-单样本前向检查 —— BPF_LINE 的 node_if 是否被拉回 50 Hz, 时频图是否不再糊
-=======================================================================
+单样本前向检查 —— BPF 带的 node_if 落点、时频图锐度与前向开销
+=============================================================
 本脚本只做推理与统计, 不训练、不改模型参数。
 
-回答两个判据 (本轮改动的验收条件):
-  (1) BPF_LINE 的 node_if 不再跑出 [48.5, 53) 且稳定在 50 Hz 附近
-  (2) 推理图中 46.5 Hz 起伏线与 50 Hz 直线均清晰锐利, 无粗黄带与垂直毛刺
+回答两个判据:
+  (1) BPF 带的 node_if 落在 [40, 53) 内 (合并带后带内实际有 41 Hz 流动峰
+      与 50 Hz 锁定线两条脊线, node_if 是能量加权值, 落在两者之间属正常)
+  (2) 推理图中 41 / 50 Hz 两条脊线均清晰锐利, 无粗黄带与垂直毛刺
+
+⚠ 3 节点合并 (B4 撤回) 后, 原来"BPF_LINE 是否被拉回 50 Hz"这一问已失去
+  对象 —— 带内不再只装锁频线。本脚本保留同名指标 (带内 H2、分段重心),
+  只是把比较对象从"漂移带 vs 线带"改成"合并带 + 每条脊线"。
 
 三段:
   A. IF 估计扫描 (不依赖 checkpoint) —— hl ∈ {320,512,1024} × num ∈ {1,4}
-     对每类各取 1 个样本, 报 BPF_LINE 的 node_if 分布、越界帧比例,
-     以及带内 (48.5,53) 的能量重心 (真实谱位置) 作对照。
-  B. 单样本前向 —— 用现有 checkpoint, 把提取器覆盖成新口径 (num=1, hl=512),
-     报 4 个节点的 node_if / w_i。
+     对每类各取 1 个样本, 报 BPF 的 node_if 分布、越界帧比例。
+  B. 单样本前向 —— 用当前 checkpoint, 报 3 个物理节点的 node_if / w_i。
+     ⚠ checkpoint 必须与 3 节点拓扑同源; 4 节点期的 ckpt 会因原型维度
+       (5x6 vs 5x4) 与边数 (11 vs 10) 不一致而加载失败。
   C. 预览图 —— 三行: 原始 STFT | 当前 ckpt 的 SAST | w 落到 C_prior 后的 SAST。
      第三行是"重训收敛后应该长什么样"的事前预览 (w_override 诊断通道)。
 
 用法:
   python scripts/analysis/check_single_sample.py --class 1
-  python scripts/analysis/check_single_sample.py --class 3 --hl 512 --num 1
+  python scripts/analysis/check_single_sample.py --class 3 --hl 1024 --num 1
 """
 import argparse
 import sys
@@ -47,10 +52,8 @@ FS = 1000
 CUT = 2000
 CLASS_NAMES = ['No-load', 'Low load', 'Mid load', 'High load', 'Pumping']
 NODE_NAMES = [r.name for r in PUMP_TURBINE_REGIONS]
-IDX_LINE = [r.name for r in PUMP_TURBINE_REGIONS].index('BPF_LINE')
-IDX_DRIFT = [r.name for r in PUMP_TURBINE_REGIONS].index('BPF_DRIFT')
-REG_LINE = PUMP_TURBINE_REGIONS[IDX_LINE]
-REG_DRIFT = PUMP_TURBINE_REGIONS[IDX_DRIFT]
+IDX_BPF = [r.name for r in PUMP_TURBINE_REGIONS].index('BPF')
+REG_BPF = PUMP_TURBINE_REGIONS[IDX_BPF]
 
 
 # ── 指标 (与训练侧同口径的简化实现) ──
@@ -83,11 +86,11 @@ def load_sample(path, cls):
 # ── 阶段 A: IF 估计扫描 ──
 def phase_a(X, y, hls, nums, n_per_class=1):
     print('=' * 78)
-    print('A. IF 估计扫描 — BPF_LINE node_if (带 [%.1f, %.1f) Hz)'
-          % (REG_LINE.f_min, REG_LINE.f_max))
+    print('A. IF 估计扫描 — BPF node_if (带 [%.1f, %.1f) Hz)'
+          % (REG_BPF.f_min, REG_BPF.f_max))
     print('=' * 78)
-    lo_tol = REG_LINE.f_min - IF_LANDING_TOL_HZ
-    hi_tol = REG_LINE.f_max + IF_LANDING_TOL_HZ
+    lo_tol = REG_BPF.f_min - IF_LANDING_TOL_HZ
+    hi_tol = REG_BPF.f_max + IF_LANDING_TOL_HZ
     print(f'{"hl":>5s} {"num":>4s} | ' +
           ' | '.join(f'{n:^22s}' for n in ['class  median  min  max  out%']))
     print('-' * 78)
@@ -98,7 +101,7 @@ def phase_a(X, y, hls, nums, n_per_class=1):
             for c in sorted(np.unique(y).tolist()):
                 ci = np.where(y == c)[0][0]
                 nodes = ex(X[ci])
-                v = nodes.if_hz[IDX_LINE]
+                v = nodes.if_hz[IDX_BPF]
                 out = float(((v < lo_tol) | (v > hi_tol)).mean())
                 cells.append(f'{c}  {np.median(v):6.2f} {v.min():5.2f} '
                              f'{v.max():5.2f} {100*out:5.1f}%')
@@ -130,12 +133,13 @@ def summarize(res, label):
         d = np.abs(tfr_enh[out_band] - tfr_raw[out_band]).max()
         print(f'  >{f_top:.0f} Hz 与原始 STFT 的最大逐点差: {d:.3e} '
               f'({"未挤压 ✓" if d < 1e-6 else "仍在挤压 ✗"})')
-    for reg, tag in ((REG_DRIFT, 'BPF_DRIFT'), (REG_LINE, 'BPF_LINE')):
-        print(f'  {tag:<10s} H2(raw)={renyi2d(tfr_raw, freqs, reg.f_min, reg.f_max):.4f}'
+    for reg in PUMP_TURBINE_REGIONS:
+        print(f'  {reg.name:<10s} H2(raw)={renyi2d(tfr_raw, freqs, reg.f_min, reg.f_max):.4f}'
               f'  H2(enh)={renyi2d(tfr_enh, freqs, reg.f_min, reg.f_max):.4f}')
-    # 46.5 Hz 起伏线 vs 50 Hz 直线: 逐帧重心的时间统计
-    for lo, hi, tag in ((45.0, 48.0, '46.5 Hz 分量'),
-                        (49.0, 52.0, '50 Hz 线   ')):
+    # BPF 带内的两条脊线: 41-44 Hz 流动分量 vs 49-52 Hz 锁定线,
+    # 逐帧重心的时间统计 (重心飘动 = 脊线不稳)。
+    for lo, hi, tag in ((40.0, 46.0, '41-44 Hz 流动分量'),
+                        (49.0, 52.0, '50 Hz 锁频线  ')):
         tr = band_centroid(tfr_enh, freqs, lo, hi)
         print(f'  {tag}: 重心均值={tr.mean():.2f} Hz  std_t={tr.std():.3f} Hz')
     return freqs, tfr_raw, tfr_enh
@@ -203,7 +207,7 @@ def main():
 
     # ── C ──
     # 预览: 把 w_i 钉到各节点 C_prior (= w_center_loss 想拉到的平衡点),
-    # 代表"重训收敛后的预期形态"。BPF_DRIFT 现在是脊线压缩带 (C_prior=0.70)。
+    # 代表"重训收敛后的预期形态"。3 节点: 0.20 / 0.90 / 0.95。
     T = res['w_i'].shape[-1]
     w_prev = torch.tensor([r.C_prior for r in PUMP_TURBINE_REGIONS],
                           device=dev, dtype=torch.float32)

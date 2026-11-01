@@ -1,0 +1,249 @@
+Device: cuda
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (5):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF_DRIFT (physical)
+  [3] BPF_LINE (physical)
+  [4] 2xBPF (physical)
+
+Edges (11):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF_DRIFT               w=0.60  [CONDITION]
+            OP → BPF_LINE                w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF_DRIFT               w=0.15  [DRIFT]
+     BPF_DRIFT → LOW_FREQ                w=0.15  [DRIFT]
+      BPF_LINE → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+     BPF_DRIFT → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF_DRIFT               w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> BPF_DRIFT modulation), non-harmonic
+  - HARMONIC edge: BPF_LINE → 2×BPF (r=2.0), sole deterministic relationship
+  - No self-loops; no classifier-based condition prediction
+
+Loading data from 5_dataset.npz...
+  Train: N=6575, T=2000
+  Val:   N=1160
+  Classes: [0 1 2 3 4], counts: [ 196 1786  587 3604  402]
+  Batch: P×K 均衡  P=2 K=5  -> B=10, 657 batch/epoch, 6570/6575 样本/epoch
+
+Creating SAST v3 model (SupCon)...
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, sigma=[0.5, 3.0]
+  MSST num=4
+  F_bins=1000
+  SAST params: 142,597 (trainable: 142,597)
+  Encoder params: 145,088
+
+============================================================
+Training SAST v3 (SupCon) for 15 epochs
+  Batch size: 10 (P×K), LR: 0.001
+  λ_sc=0.2  λ_e=0.1
+  λ_p=0.5 (诊断, 见下)  λ_b=0.5
+  λ_var=0.5  λ_c=0.3  λ_lf=0.05  λ_r=0.3
+  λ_wc=0.05  λ_soft_ent=0.5  δ_H=0.55
+  presence_frac=0.1  w_low_min=0.05
+  λ_anchor=0.2  λ_ratio=0.2  ratio_tol=0.06  【方案 A: 已降级为诊断, 不参与反向传播】
+      理由: 重排落点不可学, 三项只能经 σ 操纵测量窗内能量质心; 且实测五类 BPF_LINE 质心跨 0.74 Hz < ±1.5 Hz 容差。
+  节点 (4 物理节点, B4 拆节点):
+    LOW_FREQ   [2.0,18.0) Hz  HYDRAULIC       w∈[0.1,0.45]  锚 —
+    BPF_DRIFT  [42.0,48.5) Hz  BLADE_DRIFT     w∈[0.1,0.5]  锚 —
+    BPF_LINE   [48.5,53.0) Hz  BLADE_PASS      w∈[0.65,0.95]  锚 49.995±1.5Hz
+    2xBPF      [90.0,105.0) Hz  BLADE_HARMONIC  w∈[0.65,0.9]  锚 99.990±1.5Hz
+  Val split: 15% (KNN accuracy via z_freq centroids)
+============================================================
+
+  [P×K] batch 0 类别直方图: [2, 2, 2, 2, 2]  (共 10 个样本)
+        class 0: 池   196 -> 每 epoch 约   1314 次 (6.70×)
+        class 1: 池  1786 -> 每 epoch 约   1314 次 (0.74×)
+        class 2: 池   587 -> 每 epoch 约   1314 次 (2.24×)
+        class 3: 池  3604 -> 每 epoch 约   1314 次 (0.36×)
+        class 4: 池   402 -> 每 epoch 约   1314 次 (3.27×)
+Epoch   0 (369s): T=1.0037 sc=0.467 ent=8.402 phy=0.3743 bal=0.0092 var=0.0000 wc=0.0063 wr=0.0143 lf=0.8881 w_m=0.461 w_s=0.849 g=0.338
+         [诊断] anc=0.0191 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.084[0.1,0.45]  BPF_DRIFT=0.131[0.1,0.5]  BPF_LINE=0.697[0.65,0.95]  2xBPF=0.932[0.65,0.9]
+                LOW_FREQ   if_hat=  7.802 Hz  presence=0.158  (无锚)
+                BPF_DRIFT  if_hat= 46.104 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.556 Hz  presence=0.043  |锚-if_hat|=0.439
+                2xBPF      if_hat= 99.119 Hz  presence=0.128  |锚-if_hat|=0.871
+        Val acc=0.972 (1127/1160) *
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.196  soft(LOW_FREQ/BPF_DRIFT)=10.039
+                    集中度↑  hard=0.2036  soft=0.1779
+                    带内std  hard=0.790  soft=2.994 Hz
+[Plot] Saved: sast_checkpoints\retrain_e15\sast_v3_epoch000.png
+Epoch   1 (357s): T=0.9327 sc=0.180 ent=8.230 phy=0.3907 bal=0.0117 var=0.0000 wc=0.0106 wr=0.0165 lf=0.8852 w_m=0.471 w_s=0.864 g=0.360
+         [诊断] anc=0.0197 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.076[0.1,0.45]  BPF_DRIFT=0.203[0.1,0.5]  BPF_LINE=0.664[0.65,0.95]  2xBPF=0.940[0.65,0.9]
+                LOW_FREQ   if_hat=  7.778 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.052 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.625 Hz  presence=0.044  |锚-if_hat|=0.370
+                2xBPF      if_hat= 99.123 Hz  presence=0.128  |锚-if_hat|=0.867
+        Val acc=0.947 (1098/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.204  soft(LOW_FREQ/BPF_DRIFT)=10.045
+                    集中度↑  hard=0.2168  soft=0.1757
+                    带内std  hard=0.815  soft=2.961 Hz
+Epoch   2 (356s): T=0.9110 sc=0.130 ent=8.091 phy=0.3977 bal=0.0120 var=0.0000 wc=0.0138 wr=0.0165 lf=0.8850 w_m=0.473 w_s=0.866 g=0.355
+         [诊断] anc=0.0197 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.075[0.1,0.45]  BPF_DRIFT=0.231[0.1,0.5]  BPF_LINE=0.645[0.65,0.95]  2xBPF=0.940[0.65,0.9]
+                LOW_FREQ   if_hat=  7.804 Hz  presence=0.156  (无锚)
+                BPF_DRIFT  if_hat= 46.015 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.674 Hz  presence=0.043  |锚-if_hat|=0.321
+                2xBPF      if_hat= 99.126 Hz  presence=0.128  |锚-if_hat|=0.864
+        Val acc=0.973 (1129/1160) *
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.160  soft(LOW_FREQ/BPF_DRIFT)=10.040
+                    集中度↑  hard=0.2185  soft=0.1760
+                    带内std  hard=0.804  soft=2.963 Hz
+Epoch   3 (356s): T=0.9025 sc=0.105 ent=8.050 phy=0.3998 bal=0.0139 var=0.0000 wc=0.0137 wr=0.0176 lf=0.8833 w_m=0.475 w_s=0.877 g=0.355
+         [诊断] anc=0.0200 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.074[0.1,0.45]  BPF_DRIFT=0.231[0.1,0.5]  BPF_LINE=0.645[0.65,0.95]  2xBPF=0.949[0.65,0.9]
+                LOW_FREQ   if_hat=  7.750 Hz  presence=0.158  (无锚)
+                BPF_DRIFT  if_hat= 46.025 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.668 Hz  presence=0.044  |锚-if_hat|=0.327
+                2xBPF      if_hat= 99.120 Hz  presence=0.128  |锚-if_hat|=0.870
+        Val acc=0.986 (1144/1160) *
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.098  soft(LOW_FREQ/BPF_DRIFT)=10.018
+                    集中度↑  hard=0.2233  soft=0.1758
+                    带内std  hard=0.784  soft=2.941 Hz
+Epoch   4 (363s): T=0.8969 sc=0.082 ent=8.048 phy=0.3985 bal=0.0133 var=0.0000 wc=0.0135 wr=0.0175 lf=0.8832 w_m=0.473 w_s=0.875 g=0.360
+         [诊断] anc=0.0200 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.074[0.1,0.45]  BPF_DRIFT=0.229[0.1,0.5]  BPF_LINE=0.642[0.65,0.95]  2xBPF=0.946[0.65,0.9]
+                LOW_FREQ   if_hat=  7.756 Hz  presence=0.159  (无锚)
+                BPF_DRIFT  if_hat= 46.023 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.667 Hz  presence=0.044  |锚-if_hat|=0.328
+                2xBPF      if_hat= 99.121 Hz  presence=0.128  |锚-if_hat|=0.869
+        Val acc=0.980 (1137/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.180  soft(LOW_FREQ/BPF_DRIFT)=10.034
+                    集中度↑  hard=0.2218  soft=0.1748
+                    带内std  hard=0.822  soft=2.940 Hz
+Epoch   5 (374s): T=0.8945 sc=0.072 ent=8.048 phy=0.3970 bal=0.0123 var=0.0000 wc=0.0138 wr=0.0174 lf=0.8835 w_m=0.473 w_s=0.872 g=0.370
+         [诊断] anc=0.0198 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.072[0.1,0.45]  BPF_DRIFT=0.229[0.1,0.5]  BPF_LINE=0.651[0.65,0.95]  2xBPF=0.942[0.65,0.9]
+                LOW_FREQ   if_hat=  7.764 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.024 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.665 Hz  presence=0.043  |锚-if_hat|=0.330
+                2xBPF      if_hat= 99.118 Hz  presence=0.128  |锚-if_hat|=0.872
+        Val acc=0.980 (1137/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.128  soft(LOW_FREQ/BPF_DRIFT)=10.028
+                    集中度↑  hard=0.2243  soft=0.1750
+                    带内std  hard=0.806  soft=2.935 Hz
+[Plot] Saved: sast_checkpoints\retrain_e15\sast_v3_epoch005.png
+Epoch   6 (411s): T=0.8932 sc=0.071 ent=8.036 phy=0.3978 bal=0.0128 var=0.0000 wc=0.0137 wr=0.0178 lf=0.8828 w_m=0.473 w_s=0.874 g=0.378
+         [诊断] anc=0.0203 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.073[0.1,0.45]  BPF_DRIFT=0.228[0.1,0.5]  BPF_LINE=0.648[0.65,0.95]  2xBPF=0.943[0.65,0.9]
+                LOW_FREQ   if_hat=  7.755 Hz  presence=0.158  (无锚)
+                BPF_DRIFT  if_hat= 46.029 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.668 Hz  presence=0.043  |锚-if_hat|=0.327
+                2xBPF      if_hat= 99.114 Hz  presence=0.128  |锚-if_hat|=0.876
+        Val acc=0.986 (1144/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.090  soft(LOW_FREQ/BPF_DRIFT)=10.021
+                    集中度↑  hard=0.2260  soft=0.1750
+                    带内std  hard=0.784  soft=2.940 Hz
+Epoch   7 (375s): T=0.8909 sc=0.060 ent=8.038 phy=0.3976 bal=0.0124 var=0.0000 wc=0.0140 wr=0.0179 lf=0.8824 w_m=0.473 w_s=0.873 g=0.378
+         [诊断] anc=0.0197 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.072[0.1,0.45]  BPF_DRIFT=0.231[0.1,0.5]  BPF_LINE=0.649[0.65,0.95]  2xBPF=0.941[0.65,0.9]
+                LOW_FREQ   if_hat=  7.762 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.027 Hz  presence=0.071  (无锚)
+                BPF_LINE   if_hat= 49.663 Hz  presence=0.043  |锚-if_hat|=0.332
+                2xBPF      if_hat= 99.126 Hz  presence=0.128  |锚-if_hat|=0.864
+        Val acc=0.985 (1143/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.129  soft(LOW_FREQ/BPF_DRIFT)=10.032
+                    集中度↑  hard=0.2239  soft=0.1749
+                    带内std  hard=0.797  soft=2.946 Hz
+Epoch   8 (369s): T=0.8867 sc=0.043 ent=8.032 phy=0.3978 bal=0.0125 var=0.0000 wc=0.0136 wr=0.0178 lf=0.8826 w_m=0.473 w_s=0.874 g=0.382
+         [诊断] anc=0.0201 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.071[0.1,0.45]  BPF_DRIFT=0.231[0.1,0.5]  BPF_LINE=0.649[0.65,0.95]  2xBPF=0.942[0.65,0.9]
+                LOW_FREQ   if_hat=  7.753 Hz  presence=0.158  (无锚)
+                BPF_DRIFT  if_hat= 46.022 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.662 Hz  presence=0.044  |锚-if_hat|=0.333
+                2xBPF      if_hat= 99.116 Hz  presence=0.128  |锚-if_hat|=0.874
+        Val acc=0.985 (1143/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.128  soft(LOW_FREQ/BPF_DRIFT)=10.031
+                    集中度↑  hard=0.2242  soft=0.1750
+                    带内std  hard=0.800  soft=2.940 Hz
+Epoch   9 (361s): T=0.8859 sc=0.039 ent=8.026 phy=0.3974 bal=0.0128 var=0.0000 wc=0.0137 wr=0.0181 lf=0.8825 w_m=0.474 w_s=0.876 g=0.390
+         [诊断] anc=0.0204 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.071[0.1,0.45]  BPF_DRIFT=0.230[0.1,0.5]  BPF_LINE=0.651[0.65,0.95]  2xBPF=0.943[0.65,0.9]
+                LOW_FREQ   if_hat=  7.754 Hz  presence=0.158  (无锚)
+                BPF_DRIFT  if_hat= 46.027 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.663 Hz  presence=0.043  |锚-if_hat|=0.332
+                2xBPF      if_hat= 99.117 Hz  presence=0.128  |锚-if_hat|=0.873
+        Val acc=0.987 (1145/1160) *
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.101  soft(LOW_FREQ/BPF_DRIFT)=10.023
+                    集中度↑  hard=0.2265  soft=0.1750
+                    带内std  hard=0.789  soft=2.935 Hz
+Epoch  10 (365s): T=0.8889 sc=0.054 ent=8.029 phy=0.3970 bal=0.0129 var=0.0000 wc=0.0135 wr=0.0183 lf=0.8822 w_m=0.474 w_s=0.876 g=0.396
+         [诊断] anc=0.0202 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.070[0.1,0.45]  BPF_DRIFT=0.231[0.1,0.5]  BPF_LINE=0.653[0.65,0.95]  2xBPF=0.943[0.65,0.9]
+                LOW_FREQ   if_hat=  7.752 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.027 Hz  presence=0.071  (无锚)
+                BPF_LINE   if_hat= 49.660 Hz  presence=0.043  |锚-if_hat|=0.335
+                2xBPF      if_hat= 99.113 Hz  presence=0.128  |锚-if_hat|=0.877
+        Val acc=0.985 (1143/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.079  soft(LOW_FREQ/BPF_DRIFT)=10.010
+                    集中度↑  hard=0.2293  soft=0.1747
+                    带内std  hard=0.782  soft=2.932 Hz
+[Plot] Saved: sast_checkpoints\retrain_e15\sast_v3_epoch010.png
+Epoch  11 (360s): T=0.8866 sc=0.047 ent=8.019 phy=0.3993 bal=0.0128 var=0.0000 wc=0.0136 wr=0.0184 lf=0.8820 w_m=0.475 w_s=0.875 g=0.398
+         [诊断] anc=0.0203 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.071[0.1,0.45]  BPF_DRIFT=0.230[0.1,0.5]  BPF_LINE=0.656[0.65,0.95]  2xBPF=0.943[0.65,0.9]
+                LOW_FREQ   if_hat=  7.741 Hz  presence=0.159  (无锚)
+                BPF_DRIFT  if_hat= 46.024 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.660 Hz  presence=0.044  |锚-if_hat|=0.335
+                2xBPF      if_hat= 99.116 Hz  presence=0.128  |锚-if_hat|=0.874
+        Val acc=0.984 (1141/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.124  soft(LOW_FREQ/BPF_DRIFT)=10.034
+                    集中度↑  hard=0.2248  soft=0.1747
+                    带内std  hard=0.799  soft=2.943 Hz
+Epoch  12 (359s): T=0.8838 sc=0.036 ent=8.017 phy=0.3987 bal=0.0127 var=0.0000 wc=0.0137 wr=0.0183 lf=0.8822 w_m=0.475 w_s=0.875 g=0.397
+         [诊断] anc=0.0200 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.071[0.1,0.45]  BPF_DRIFT=0.227[0.1,0.5]  BPF_LINE=0.659[0.65,0.95]  2xBPF=0.942[0.65,0.9]
+                LOW_FREQ   if_hat=  7.760 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.034 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.657 Hz  presence=0.043  |锚-if_hat|=0.338
+                2xBPF      if_hat= 99.115 Hz  presence=0.128  |锚-if_hat|=0.875
+        Val acc=0.981 (1138/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.110  soft(LOW_FREQ/BPF_DRIFT)=10.030
+                    集中度↑  hard=0.2254  soft=0.1745
+                    带内std  hard=0.798  soft=2.942 Hz
+Epoch  13 (358s): T=0.8828 sc=0.035 ent=8.008 phy=0.3992 bal=0.0129 var=0.0000 wc=0.0135 wr=0.0185 lf=0.8815 w_m=0.475 w_s=0.876 g=0.396
+         [诊断] anc=0.0203 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.071[0.1,0.45]  BPF_DRIFT=0.229[0.1,0.5]  BPF_LINE=0.660[0.65,0.95]  2xBPF=0.943[0.65,0.9]
+                LOW_FREQ   if_hat=  7.774 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.044 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.653 Hz  presence=0.044  |锚-if_hat|=0.342
+                2xBPF      if_hat= 99.117 Hz  presence=0.128  |锚-if_hat|=0.873
+        Val acc=0.984 (1141/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.110  soft(LOW_FREQ/BPF_DRIFT)=10.030
+                    集中度↑  hard=0.2253  soft=0.1746
+                    带内std  hard=0.803  soft=2.942 Hz
+Epoch  14 (358s): T=0.8825 sc=0.031 ent=8.014 phy=0.3994 bal=0.0127 var=0.0000 wc=0.0135 wr=0.0185 lf=0.8818 w_m=0.475 w_s=0.876 g=0.397
+         [诊断] anc=0.0200 rat=0.0000  wλ(p/a/r)=0.0/0.0/0.0
+                w_i: LOW_FREQ=0.070[0.1,0.45]  BPF_DRIFT=0.229[0.1,0.5]  BPF_LINE=0.658[0.65,0.95]  2xBPF=0.942[0.65,0.9]
+                LOW_FREQ   if_hat=  7.767 Hz  presence=0.157  (无锚)
+                BPF_DRIFT  if_hat= 46.036 Hz  presence=0.072  (无锚)
+                BPF_LINE   if_hat= 49.652 Hz  presence=0.044  |锚-if_hat|=0.343
+                2xBPF      if_hat= 99.118 Hz  presence=0.128  |锚-if_hat|=0.872
+        Val acc=0.984 (1141/1160)
+        TF quality  Rényi↓  hard(BPF_LINE/2xBPF)=8.106  soft(LOW_FREQ/BPF_DRIFT)=10.028
+                    集中度↑  hard=0.2258  soft=0.1746
+                    带内std  hard=0.799  soft=2.941 Hz
+[Plot] Saved: sast_checkpoints\retrain_e15\sast_v3_epoch014.png
+
+Model saved to sast_checkpoints\retrain_e15\sast_v3_e015.pt
+  Final C_prior: [0.23904628 0.31251058 0.79674804 0.8987708 ]
+  Best val accuracy: 0.987
+
+Final w_i (time-mean per node):
+  LOW_FREQ        0.053 ± 0.003
+  BPF_DRIFT       0.050 ± 0.003
+  BPF_LINE        0.293 ± 0.275
+  2xBPF           0.976 ± 0.024
+  w_i spread: 0.927
+Training complete.

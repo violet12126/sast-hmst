@@ -30,11 +30,12 @@ _TFR_DB_RANGE = 25.0
 def _node_names_for(n: int):
     """结果里的 n 个节点槽位 -> 显示名。
 
-    NODE_NAMES 第 0 项是 OP (原型控制节点), 物理节点只有后 4 个。旧判据
-    `N <= 3` 是 3 节点时代的产物; B4 拆成 4 个物理节点后 N=4 落进 else 分支,
-    把含 OP 的 5 元素表整体套到 4 节点数据上 -> 图例、FFT 标注、汇总表全部
-    **错位一位** (标着 "OP" 的那行其实是 LOW_FREQ, 标着 "BPF_LINE" 的那行
-    其实是 2xBPF)。这里按"槽位数 == 表长才用全表, 否则跳过 OP"判定。
+    NODE_NAMES 第 0 项是 OP (原型控制节点), 物理节点是后 3 个
+    (LOW_FREQ / BPF / 2xBPF; B4 的 BPF_DRIFT/BPF_LINE 拆分已撤回)。判据是
+    "槽位数 == 表长才用全表, 否则跳过 OP": 当前 N=3 < len(NODE_NAMES)=4,
+    走第二支, 取 NODE_NAMES[1:] -> 图例/FFT 标注/汇总表与 w_i 数组逐位对齐。
+    (历史坑: 曾用 `N <= 3` 硬判据, 4 节点时 N=4 落进 else 分支, 把含 OP 的
+    5 元素表整体套到 4 节点数据上, 所有标签错位一位。)
     """
     if n == len(NODE_NAMES):
         return list(NODE_NAMES)
@@ -88,8 +89,8 @@ def _plot_sigma_panel(ax, sigma_sq, t_axis, freqs, freq_max):
     plt.colorbar(im, ax=ax, label='σ_sq')
 
 
-def _plot_w_i_panel(ax, w_i, t_axis, colors, node_names):
-    """Plot w_i(t) per physics node."""
+def _plot_w_i_panel(ax, w_i, t_axis, colors, node_names, label='(e)'):
+    """Plot w_i(t) per physics node. label 为面板字母 (不同版式下位置不同)."""
     N = w_i.shape[0]
     for n in range(N):
         ax.plot(t_axis, w_i[n], color=colors[n], lw=1.2,
@@ -98,7 +99,7 @@ def _plot_w_i_panel(ax, w_i, t_axis, colors, node_names):
     ax.set_xlabel('Time [s]')
     ax.set_ylabel('w_i')
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title('(e) IF Trust w_i(t)\nw_i->1: Trust & squeeze  |  w_i->0: Conservative')
+    ax.set_title(f'{label} IF Trust w_i(t)\nw_i->1: Trust & squeeze  |  w_i->0: Conservative')
     ax.legend(fontsize=6, loc='upper right')
     ax.grid(alpha=0.3)
 
@@ -132,7 +133,8 @@ def _plot_enhanced_tfr_panel(ax, tfr_enhanced, t_axis, freqs, freq_max,
                      scale=scale)
 
 
-def _plot_fft_panel(ax, signal, fs, freq_max, node_if, w_i, colors, node_names):
+def _plot_fft_panel(ax, signal, fs, freq_max, node_if, w_i, colors, node_names,
+                    label='(f)'):
     """Plot FFT spectrum with dominant peaks and node IF markers."""
     N = len(signal)
     fft_freqs = np.fft.rfftfreq(N, 1.0 / fs)
@@ -173,7 +175,8 @@ def _plot_fft_panel(ax, signal, fs, freq_max, node_if, w_i, colors, node_names):
     ax.set_ylim(0, 1.05)
     ax.set_xlabel('Frequency [Hz]')
     ax.set_ylabel('Norm. Magnitude')
-    ax.set_title('(f) FFT Spectrum + Node IF\nDominant peaks (red) vs GAT-tracked IF (colored)')
+    ax.set_title(f'{label} FFT Spectrum + Node IF\n'
+                 'Dominant peaks (red) vs GAT-tracked IF (colored)')
     ax.grid(True, alpha=0.2)
     ax.legend(fontsize=6)
 
@@ -183,13 +186,19 @@ def plot_tfr(results: Dict[str, np.ndarray],
              freq_max: float = 200,
              signal: Optional[np.ndarray] = None,
              fs: float = 1000.0,
-             title: Optional[str] = None):
+             title: Optional[str] = None,
+             compare_tfr: Optional[Dict] = None):
     """
-    6-panel plot (2x3):
-      行 1 (线性色阶): Raw MSST | SAST Enhanced TFR | w_i(t)
-      行 2 (dB 色阶):  Raw MSST | SAST Enhanced TFR | FFT Spectrum
-    同一列上下两格是**同一份数据**的两种色阶 —— 用于回答"两张图看着不像,
-    是算法不同还是显示不同"。
+    TFR 对比图 (2x3):
+      行 1 (全部线性色阶, vmax = 0.5x 各自峰值):
+          (a) Raw MSST | (b) 对照方法 (如 WSST1, 可选) | (c) SAST Enhanced
+      行 2:
+          (d) w_i(t) 三节点 (跨两列) | (e) FFT Spectrum + Node IF
+
+    compare_tfr: {'mag','freqs','t','label'} —— 由调用方算好的对照方法结果。
+        传 None 时 (b) 位置留给 SAST, 布局退化为两列。
+    旧版的 dB 双行面板已移除: 上下两行同数据换色阶只用于排查"看着不像",
+    不属于汇报/论文要展示的对比, 其占位改给真实的方法对照。
     """
     tfr_raw = results.get('tfr_msst', results['tfr_raw'])
     tfr_enhanced = results['tfr_enhanced']
@@ -202,27 +211,32 @@ def plot_tfr(results: Dict[str, np.ndarray],
     colors = plt.cm.tab10(np.linspace(0, 1, max(N, 3)))
     node_names = _node_names_for(N)
 
-    # 2x3 网格: 左两列是「原始 vs 增强」, 上下两行是「线性 vs dB」——
-    # 同一格纵向对照才能看出色阶对"像不像"的贡献。
-    fig, axes = plt.subplots(2, 3, figsize=(22, 12))
+    fig = plt.figure(figsize=(22, 12))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.1, 0.9])
 
-    _plot_stft_panel(axes[0, 0], tfr_raw, t_axis, freqs, freq_max,
-                     '(a) Raw MSST — linear (vmax=0.5xmax)', scale='linear')
-    _plot_enhanced_tfr_panel(axes[0, 1], tfr_enhanced, t_axis, freqs, freq_max,
-                             scale='linear',
-                             title='(b) SAST Enhanced TFR — linear')
-    _plot_w_i_panel(axes[0, 2], w_i, t_axis, colors, node_names)
-    _plot_stft_panel(axes[1, 0], tfr_raw, t_axis, freqs, freq_max,
-                     '(c) Raw MSST — dB (%g dB range)' % _TFR_DB_RANGE,
-                     scale='db')
-    _plot_enhanced_tfr_panel(axes[1, 1], tfr_enhanced, t_axis, freqs, freq_max,
-                             scale='db',
-                             title='(d) SAST Enhanced TFR — dB')
-    if signal is not None:
-        _plot_fft_panel(axes[1, 2], signal, fs, freq_max, node_if, w_i,
-                        colors, node_names)
+    _plot_stft_panel(fig.add_subplot(gs[0, 0]), tfr_raw, t_axis, freqs,
+                     freq_max, '(a) Raw MSST — linear (vmax=0.5xmax)',
+                     scale='linear')
+    if compare_tfr is not None:
+        _plot_stft_panel(fig.add_subplot(gs[0, 1]), compare_tfr['mag'],
+                         compare_tfr['t'], compare_tfr['freqs'], freq_max,
+                         compare_tfr.get('label', '(b) Compare — linear'),
+                         scale='linear')
+        _plot_enhanced_tfr_panel(fig.add_subplot(gs[0, 2]), tfr_enhanced,
+                                 t_axis, freqs, freq_max, scale='linear',
+                                 title='(c) SAST Enhanced TFR — linear')
     else:
-        axes[1, 2].set_visible(False)
+        _plot_enhanced_tfr_panel(fig.add_subplot(gs[0, 1:]), tfr_enhanced,
+                                 t_axis, freqs, freq_max, scale='linear',
+                                 title='(b) SAST Enhanced TFR — linear')
+
+    _plot_w_i_panel(fig.add_subplot(gs[1, :2]), w_i, t_axis, colors,
+                    node_names, label='(d)')
+    if signal is not None:
+        _plot_fft_panel(fig.add_subplot(gs[1, 2]), signal, fs, freq_max,
+                        node_if, w_i, colors, node_names, label='(e)')
+    else:
+        fig.add_subplot(gs[1, 2]).set_visible(False)
 
     suptitle = title or 'SAST: Structure-Aware Synchrosqueezing\nPhysics Graph + Ratio-Gated PPM -> Adaptive Squeeze'
     plt.suptitle(suptitle, fontsize=13, fontweight='bold')

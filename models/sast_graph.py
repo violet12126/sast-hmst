@@ -5,44 +5,42 @@ SAST Physics Graph — 异构物理图 (工况上下文 + 倍频 + 能量耦合)
 设计依据:
   - 实测数据频谱分析 (5 类, 9669 样本, fs=1000 Hz)
   - Colominas & Meignen (2025) 自适应阶数 SST 框架
-  - B4 拆节点: 原单一 BPF 节点 (42-55 Hz) 同时装着"转速锁定线 49.995 Hz"
-    与"工况漂移宽峰 46-49 Hz"两种机制; 一个标量 σ_i 被要求既挤窄线又留宽峰,
-    收敛值只能取折中 → 拆成 BPF_LINE / BPF_DRIFT 两个同质节点。
+  - **B4 的 BPF 拆分已撤回**: 41 Hz 流动峰落在原 BPF_DRIFT 左界之外,
+    且两段 w_i/σ_i 不同在 48.5 Hz 接缝处形成垂直梳状毛刺 (详见 sast_nodes
+    模块 docstring 的"为什么撤回 B4 拆分")。
 
-图结构:
+图结构 (3 个物理节点):
                     ┌─────────────────────┐
                     │   Operating Token    │  ← 虚拟节点 (NODE_OP = 0)
                     │   工况上下文嵌入       │
-                    └──┬────┬────┬────┬───┘
-            CONDITION  │    │    │    │  CONDITION
-            (w=0.6)    │    │    │    │  (w=0.6)
-                       ▼    ▼    ▼    ▼
-              ┌────────┐┌─────────┐┌─────────┐┌────────┐
-              │LOW_FREQ││BPF_DRIFT││BPF_LINE ││ 2×BPF  │
-              │ idx=1  ││  idx=2  ││  idx=3  ││ idx=4  │
-              └───┬────┘└────┬────┘└────┬────┘└───▲────┘
-                  │  DRIFT   │          │         │
-                  │ (w=0.15) │          └─────────┘
-                  └─────────►┘       HARMONIC (r=2.0, w=0.8)
-                [能量耦合: Corr_E, E_ratio, bw_coupling]
+                    └──┬────┬────┬────────┘
+            CONDITION  │    │    │  CONDITION
+            (w=0.6)    │    │    │  (w=0.6)
+                       ▼    ▼    ▼
+                 ┌────────┐┌────────┐┌────────┐
+                 │LOW_FREQ││  BPF   ││ 2×BPF  │
+                 │ idx=1  ││ idx=2  ││ idx=3  │
+                 └───┬────┘└───┬────┘└── ▲ ───┘
+                     │  DRIFT  │         │
+                     │ (w=0.15)├─────────┘
+                     └────────►┘   HARMONIC (r=2.0, w=0.8)
+                   [能量耦合: Corr_E, E_ratio, bw_coupling]
 
-节点 (5 个):
+节点 (4 个):
   [0] OP:        虚拟节点, 来自 StaticPrototypeMatcher 的 soft matching 嵌入
   [1] LOW_FREQ:  流动不稳定性 (涡带/压力脉动), 2-18 Hz
-  [2] BPF_DRIFT: 工况漂移宽峰, 42-48.5 Hz (频率不锁转速)
-  [3] BPF_LINE:  转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48.5-53 Hz
-  [4] 2×BPF:     二倍叶片通过频率 99.990 Hz, 90-105 Hz
+  [2] BPF:       叶片通过族, 40-53 Hz (41 Hz 流动峰 + 49.995 Hz 转速锁定线)
+  [3] 2×BPF:     二倍叶片通过频率 99.990 Hz, 90-105 Hz
 
-边 (11 条有向):
+边 (10 条有向):
   OP → LOW_FREQ  : CONDITION, w=0.6
-  OP → BPF_DRIFT : CONDITION, w=0.6
-  OP → BPF_LINE  : CONDITION, w=0.6
+  OP → BPF       : CONDITION, w=0.6
   OP → 2×BPF     : CONDITION, w=0.6
-  LOW_FREQ → BPF_DRIFT : DRIFT, w=0.15  (涡带能量 <-> 漂移宽峰调制)
-  BPF_DRIFT → LOW_FREQ : DRIFT, w=0.15  (反向: 调制反馈)
-  BPF_LINE → 2×BPF     : HARMONIC, r=2.0, w=0.8  (唯一确定性倍频)
-  LOW_FREQ  <-> 2×BPF  : ENERGY_COMPETITION, w=0.25 (双向)
-  BPF_DRIFT <-> 2×BPF  : ENERGY_COMPETITION, w=0.20 (双向)
+  LOW_FREQ → BPF : DRIFT, w=0.15  (涡带能量 <-> 叶片通过族调制; 非锁频→非锁频)
+  BPF → LOW_FREQ : DRIFT, w=0.15  (反向: 调制反馈)
+  BPF → 2×BPF    : HARMONIC, r=2.0, w=0.8  (唯一确定性倍频)
+  LOW_FREQ <-> 2×BPF : ENERGY_COMPETITION, w=0.25 (双向)
+  BPF      <-> 2×BPF : ENERGY_COMPETITION, w=0.20 (双向)
 """
 
 import numpy as np
@@ -57,7 +55,7 @@ from dataclasses import dataclass
 
 class EdgeType(Enum):
     """物理边类型 — 决定约束强度和特征计算方式。"""
-    INTEGER_HARMONIC = 'INTEGER_HARMONIC'   # 整数倍频 (BPF_LINE → 2×BPF, r=2.0)
+    INTEGER_HARMONIC = 'INTEGER_HARMONIC'   # 整数倍频 (BPF → 2×BPF, r=2.0)
     CONDITION = 'CONDITION'                 # 工况上下文广播 (OP → 频率节点)
     DRIFT = 'DRIFT'                         # 能量耦合 / 调制关系 (非倍频, 正向共变)
     ENERGY_COMPETITION = 'ENERGY_COMPETITION'  # 能量竞争 (此消彼长, 负相关)
@@ -80,15 +78,14 @@ class PhysicsEdge:
 
 NODE_OP = 0          # 虚拟节点: 工况上下文
 NODE_LOW_FREQ = 1
-NODE_BPF_DRIFT = 2   # 工况漂移宽峰 (B4 拆节点)
-NODE_BPF_LINE = 3    # 转速锁定线 1×BPF (B4 拆节点)
-NODE_2XBPF = 4
+NODE_BPF = 2         # 叶片通过族 (41 Hz 流动峰 + 49.995 Hz 锁定线)
+NODE_2XBPF = 3
 
-NODE_NAMES = ['OP', 'LOW_FREQ', 'BPF_DRIFT', 'BPF_LINE', '2xBPF']
+NODE_NAMES = ['OP', 'LOW_FREQ', 'BPF', '2xBPF']
 N_NODES = len(NODE_NAMES)
 
 # 物理节点 (不含 OP)
-PHYSICS_NODE_INDICES = [NODE_LOW_FREQ, NODE_BPF_DRIFT, NODE_BPF_LINE, NODE_2XBPF]
+PHYSICS_NODE_INDICES = [NODE_LOW_FREQ, NODE_BPF, NODE_2XBPF]
 N_PHYSICS_NODES = len(PHYSICS_NODE_INDICES)
 
 
@@ -100,39 +97,44 @@ PHYSICS_EDGES: List[PhysicsEdge] = [
     # ── CONDITION: 工况上下文广播 (OP → 频率节点) ──
     PhysicsEdge(NODE_OP, NODE_LOW_FREQ, EdgeType.CONDITION,
                 0.0, 0.6, 'OP→LOW_FREQ: 工况决定低频强弱'),
-    PhysicsEdge(NODE_OP, NODE_BPF_DRIFT, EdgeType.CONDITION,
-                0.0, 0.6, 'OP→BPF_DRIFT: 工况决定漂移宽峰强弱'),
-    PhysicsEdge(NODE_OP, NODE_BPF_LINE, EdgeType.CONDITION,
-                0.0, 0.6, 'OP→BPF_LINE: 工况决定 1×BPF 主导程度'),
+    PhysicsEdge(NODE_OP, NODE_BPF, EdgeType.CONDITION,
+                0.0, 0.6, 'OP→BPF: 工况决定叶片通过族强弱/主导分量'),
     PhysicsEdge(NODE_OP, NODE_2XBPF, EdgeType.CONDITION,
                 0.0, 0.6, 'OP→2xBPF: 工况决定 RSI 强弱'),
 
-    # ── DRIFT: 能量耦合 / 调制关系 (LOW_FREQ <-> BPF_DRIFT) ──
-    # 涡带增强 -> 流道紊乱 -> 漂移宽峰被调制展宽; 两者能量共变。
-    # 注意: 漂移边只连 LOW_FREQ 与 BPF_DRIFT —— 两者都是"不锁转速"的分量;
-    #       锁转速的 BPF_LINE 不参与漂移耦合 (它的频率由转速决定, 不随流动起伏)。
-    PhysicsEdge(NODE_LOW_FREQ, NODE_BPF_DRIFT, EdgeType.DRIFT,
-                0.0, 0.15, 'LOW_FREQ→BPF_DRIFT: 涡带能量→漂移宽峰调制'),
-    PhysicsEdge(NODE_BPF_DRIFT, NODE_LOW_FREQ, EdgeType.DRIFT,
-                0.0, 0.15, 'BPF_DRIFT→LOW_FREQ: 调制反馈'),
+    # ── DRIFT: 能量耦合 / 调制关系 (LOW_FREQ <-> BPF) ──
+    # 涡带增强 -> 流道紊乱 -> 叶片通过族被调制展宽; 两者能量共变。
+    # 3 节点合并后 BPF 带内同时含 41 Hz 流动峰与 49.995 Hz 锁定线, 但"不锁
+    # 转速"的那部分正是漂移耦合的物理载体; 锁定线部分与漂移边弱相关, 由
+    # 边特征里的运行相关 Corr_E 自行降权 (不是硬编码假设)。
+    PhysicsEdge(NODE_LOW_FREQ, NODE_BPF, EdgeType.DRIFT,
+                0.0, 0.15, 'LOW_FREQ→BPF: 涡带能量→叶片通过族调制'),
+    PhysicsEdge(NODE_BPF, NODE_LOW_FREQ, EdgeType.DRIFT,
+                0.0, 0.15, 'BPF→LOW_FREQ: 调制反馈'),
 
-    # ── HARMONIC: 唯一确定性倍频 (BPF_LINE → 2×BPF, r=2.0) ──
-    # 只有锁转速的 1×BPF 才是 2×BPF 的基频; BPF_DRIFT 不参与。
-    PhysicsEdge(NODE_BPF_LINE, NODE_2XBPF, EdgeType.INTEGER_HARMONIC,
-                2.0, 0.8, '2xBPF = 2×BPF_LINE'),
+    # ── HARMONIC: 唯一确定性倍频 (BPF → 2×BPF, r=2.0) ──
+    # ⚠ 诊断口径注意: 合并后 BPF 的 node_if 是带内能量加权值, 在 class 2 上
+    #   落在 41 Hz 与 50 Hz 两条脊线之间 (实测 ≈44-46 Hz), 故 r_obs = f_2x/f_BPF
+    #   会读到 ≈2.2 而不是 2.0。该边特征只进 GAT 的消息, 不产生硬约束
+    #   (freq_constraints_active=False 时 L_ratio 仅为诊断), 不影响训练。
+    PhysicsEdge(NODE_BPF, NODE_2XBPF, EdgeType.INTEGER_HARMONIC,
+                2.0, 0.8, '2xBPF = 2×BPF'),
 
     # ── ENERGY_COMPETITION: 此消彼长 — 流道能量守恒 ──
-    # 低负荷: 涡带主导 → LOW_FREQ↑, 漂移族↑, 2×BPF↓
-    # 高负荷: 动静干涉主导 → LOW_FREQ↓, 漂移族↓, 2×BPF↑
+    # 低负荷: 涡带主导 → LOW_FREQ↑, 叶片通过族↓
+    # 高负荷: 动静干涉主导 → LOW_FREQ↓, 2×BPF↑
     # 边特征: [-Corr_E, E_ratio_campAB, E_ratio_stability, w_type, p_min]
     PhysicsEdge(NODE_LOW_FREQ, NODE_2XBPF, EdgeType.ENERGY_COMPETITION,
                 0.0, 0.25, 'LOW_FREQ vs 2xBPF: 涡带↔RSI 此消彼长'),
     PhysicsEdge(NODE_2XBPF, NODE_LOW_FREQ, EdgeType.ENERGY_COMPETITION,
                 0.0, 0.25, '2xBPF vs LOW_FREQ: 反向'),
-    PhysicsEdge(NODE_BPF_DRIFT, NODE_2XBPF, EdgeType.ENERGY_COMPETITION,
-                0.0, 0.20, 'BPF_DRIFT vs 2xBPF: 漂移族↔RSI 此消彼长'),
-    PhysicsEdge(NODE_2XBPF, NODE_BPF_DRIFT, EdgeType.ENERGY_COMPETITION,
-                0.0, 0.20, '2xBPF vs BPF_DRIFT: 反向'),
+    # 原 BPF_DRIFT↔2xBPF 的竞争边随节点合并落到 BPF↔2xBPF。与上面的
+    # HARMONIC 边不冲突: HARMONIC 描述"频率比 2:1 的锁相关系",
+    # COMPETITION 描述"两类能量在负荷轴上的此消彼长", 是两种不同的边特征。
+    PhysicsEdge(NODE_BPF, NODE_2XBPF, EdgeType.ENERGY_COMPETITION,
+                0.0, 0.20, 'BPF vs 2xBPF: 叶片通过族↔RSI 此消彼长'),
+    PhysicsEdge(NODE_2XBPF, NODE_BPF, EdgeType.ENERGY_COMPETITION,
+                0.0, 0.20, '2xBPF vs BPF: 反向'),
 ]
 
 N_EDGES = len(PHYSICS_EDGES)
@@ -375,9 +377,11 @@ def get_graph_summary() -> str:
         )
     lines.append("\nDesign notes:")
     lines.append("  - OP: virtual node, soft-matched from 5 static prototypes (EDA)")
+    lines.append("  - 3 physical nodes: LOW_FREQ / BPF / 2xBPF (B4 的 BPF 拆分已撤回)")
     lines.append("  - CONDITION edges: broadcast operating context to frequency nodes")
-    lines.append("  - DRIFT edges: energy coupling (vortex <-> BPF_DRIFT modulation), non-harmonic")
-    lines.append("  - HARMONIC edge: BPF_LINE → 2×BPF (r=2.0), sole deterministic relationship")
+    lines.append("  - DRIFT edges: energy coupling (vortex <-> blade-pass modulation), non-harmonic")
+    lines.append("  - HARMONIC edge: BPF → 2×BPF (r=2.0), sole deterministic relationship;")
+    lines.append("    r_obs 在合并带上是带内能量加权 IF 的比值, class 2 读到 ≈2.2 (诊断口径)")
     lines.append("  - No self-loops; no classifier-based condition prediction")
     return "\n".join(lines)
 
@@ -394,12 +398,12 @@ if __name__ == '__main__':
     T = 100
     N_phys = N_PHYSICS_NODES
     node_if = np.random.randn(N_phys, T) * 5 + np.array([
-        [10.0], [45.0], [50.0], [100.0]
+        [10.0], [45.0], [100.0]
     ])
     node_energy = np.abs(np.random.randn(N_phys, T))
     node_persistence = np.random.rand(N_phys)
     node_bw = np.abs(np.random.randn(N_phys, T)) * 5 + np.array([
-        [10.0], [12.0], [2.0], [2.0]
+        [10.0], [12.0], [2.0]
     ])
     cond_ctx = np.random.randn(32)
 
@@ -414,7 +418,7 @@ if __name__ == '__main__':
     from collections import Counter
     type_counts = Counter(e.edge_type for e in PHYSICS_EDGES)
     print(f"\nEdge type counts: {dict(type_counts)}")
-    print(f"  CONDITION: {type_counts[EdgeType.CONDITION]} (expected 4)")
+    print(f"  CONDITION: {type_counts[EdgeType.CONDITION]} (expected 3)")
     print(f"  DRIFT:     {type_counts[EdgeType.DRIFT]} (expected 2)")
     print(f"  HARMONIC:  {type_counts[EdgeType.INTEGER_HARMONIC]} (expected 1)")
     print(f"  COMPETITION: {type_counts[EdgeType.ENERGY_COMPETITION]} (expected 4)")
@@ -485,7 +489,7 @@ def compute_edge_features_torch(node_if, node_energy, node_persist, node_bw,
     edge_feats = torch.zeros(B, M, T, 5, device=device, dtype=dtype)
 
     for m, e in enumerate(edges):
-        src = e.src - 1   # 0-indexed (OP=0, phys 1..4 -> 0..3)
+        src = e.src - 1   # 0-indexed (OP=0, phys 1..3 -> 0..2)
         dst = e.dst - 1
         f_src = node_if[:, src, :]
         f_dst = node_if[:, dst, :]

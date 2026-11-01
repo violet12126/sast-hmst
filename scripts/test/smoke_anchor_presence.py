@@ -25,15 +25,16 @@ mag[:, (freqs >= 99) & (freqs <= 101), :] += 1.0     # 100 Hz 2xBPF 线
 mag[:, (freqs >= 49.5) & (freqs <= 50.5), :] += 1.0  # 50 Hz 1xBPF 线
 mag[:, (freqs >= 46) & (freqs <= 48), :] += 0.4      # 47 Hz 漂移鼓包
 
+NODE_NAMES = [r.name for r in R]        # ['LOW_FREQ', 'BPF', '2xBPF']
+I_LF, I_BPF, I_2X = (NODE_NAMES.index(n) for n in ('LOW_FREQ', 'BPF', '2xBPF'))
 w_i = torch.full((B, N, T), 0.5, device=dev, requires_grad=True)
-node_if = torch.stack([torch.full((B, T), 10.0, device=dev),
-                       torch.full((B, T), 47.0, device=dev),
-                       torch.full((B, T), 50.0, device=dev),
-                       torch.full((B, T), 100.1, device=dev)])
+node_if = torch.stack([torch.full((B, T), 10.0, device=dev),      # LOW_FREQ
+                       torch.full((B, T), 45.0, device=dev),      # BPF (41/50 之间)
+                       torch.full((B, T), 100.1, device=dev)])    # 2xBPF
 enc = FreqEncoder(n_freq_bins=F).to(dev)
 ef = torch.rand(B, M, T, 5, device=dev)
 ge = torch.rand(B, M, T, device=dev)
-# 边索引直接由图定义导出 (B4 拆节点后 11 条边), 不再硬编码
+# 边索引直接由图定义导出 (3 节点拓扑共 10 条边), 不再硬编码
 es = torch.tensor([e.src for e in PHYSICS_EDGES], device=dev)
 ed = torch.tensor([e.dst for e in PHYSICS_EDGES], device=dev)
 A = torch.rand(B, M, 4, T, device=dev, requires_grad=True)
@@ -70,34 +71,37 @@ print(f'  L_balance 无门控    = {balance_loss(w_low_set).item():.4f}')
 print(f'  L_balance 有门控    = {balance_loss(w_low_set, presence=p_flat).item():.4f}')
 
 # ── 锚越界时必须产生非零梯度 (否则锚形同虚设) ──
+# ⚠ 3 节点合并后**只有 2xBPF 带锚**: BPF 带同时装 41 Hz 非锁频峰与 50 Hz 锁定
+#   线, 能量加权质心必然落在两者之间, 绝对锚会恒被违反 (见 sast_nodes)。
+#   故本检验把 2xBPF 的峰移出锚带 [98.49, 101.49] 看梯度。
 from models.sast_losses import freq_anchor_loss, harmonic_ratio_loss   # noqa: E402
 from models.sast_nodes import band_centroid_if                         # noqa: E402
-print('\n[锚越界检验] 把 BPF_LINE 带内能量峰移到 f0 '
-      '(锚 49.995±1.5 → 容差带 [48.5, 51.5]); 2xBPF 另给锚内参考线:')
-for f0 in (50.0, 51.0, 52.0, 53.0):
+print('\n[锚越界检验] 把 2xBPF 带内能量峰移到 f0 '
+      '(锚 99.990±1.5 → 容差带 [98.49, 101.49]); LOW_FREQ 另给无水力的参考:')
+for f0 in (100.0, 101.0, 103.0, 106.0):
     t = torch.full((2, F, T), 1e-3, device=dev, requires_grad=True)
     with torch.no_grad():
-        t[:, (freqs >= 99) & (freqs <= 101), :] += 1.0        # 2xBPF 锚内线
+        t[:, (freqs >= 2) & (freqs <= 3), :] += 1.0           # LOW_FREQ 有能量
         t[:, (freqs >= f0 - 0.5) & (freqs <= f0 + 0.5), :] += 1.0
     la = freq_anchor_loss(t, freqs, R, presence=None)
     g = torch.autograd.grad(la, t, retain_graph=False)[0]
     cents = band_centroid_if(t.detach(), freqs, R)[0, :, :].mean(dim=-1)
-    print(f'  BPF_LINE 峰={f0:.1f}Hz  BPF_LINE质心={cents[2]:.2f}Hz  '
-          f'2xBPF质心={cents[3]:.2f}Hz  L_anchor={la.item():.4f}Hz  '
+    print(f'  2xBPF 峰={f0:.1f}Hz  2xBPF质心={cents[I_2X]:.2f}Hz  '
+          f'LOW_FREQ质心={cents[I_LF]:.2f}Hz  L_anchor={la.item():.4f}Hz  '
           f'|dL/dt|={g.abs().sum().item():.3e}')
 
 # ── A2: L_ratio 必须对可微 if_hat 产生梯度 (对比 L_physics 的零梯度) ──
-print('\n[A2 比值约束可微性] (f_BPF_LINE, f_2xBPF) 相对偏差超过 6% 时应有非零梯度:')
-for f1, f2 in [(50.0, 100.0), (49.0, 104.0), (48.5, 104.0), (52.0, 95.0)]:
+print('\n[A2 比值约束可微性] (f_BPF, f_2xBPF) 相对偏差超过 6% 时应有非零梯度:')
+for f1, f2 in [(50.0, 100.0), (49.0, 104.0), (43.0, 104.0), (52.0, 95.0)]:
     t = torch.full((2, F, T), 1e-3, device=dev, requires_grad=True)
     with torch.no_grad():
         t[:, (freqs >= f1 - 0.4) & (freqs <= f1 + 0.4), :] += 1.0
         t[:, (freqs >= f2 - 0.4) & (freqs <= f2 + 0.4), :] += 1.0
     ih = band_centroid_if(t, freqs, R)
-    fl, fh = ih[:, 2, :].mean().item(), ih[:, 3, :].mean().item()
+    fl, fh = ih[:, I_BPF, :].mean().item(), ih[:, I_2X, :].mean().item()
     lr = harmonic_ratio_loss(ih, R, presence=None, tol=0.06)
     g = torch.autograd.grad(lr, t, retain_graph=False)[0]
-    print(f'  BPF_LINE={fl:6.2f}Hz  2xBPF={fh:6.2f}Hz  r_obs={fh / fl:.3f}  '
+    print(f'  BPF={fl:6.2f}Hz  2xBPF={fh:6.2f}Hz  r_obs={fh / fl:.3f}  '
           f'L_ratio={lr.item():.4f}  |dL/dt|={g.abs().sum().item():.3e}')
 
 print('\nSmoke test OK')

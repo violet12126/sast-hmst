@@ -18,22 +18,30 @@ SAST Node Feature Extraction — 从 MSST omega_final 直接提取物理节点�
     4. HIGH_HARMONIC (468 Hz): 仅 31-45% 样本出现, 能量 <0.08%, 判定为噪声
     5. LOW_FREQ (11-15 Hz): 水力来源 (涡带/压力脉动), 与 BPF 不成整数倍
 
-  保留节点 (B4 拆节点: 42-55 Hz 原为单一 BLADE_PASS 节点, 同时装着两种机制,
-            一个标量 σ_i 无法既挤窄线又留宽峰 → 拆成两个同质节点):
-    LOW_FREQ:  2-18 Hz    — 流动不稳定性 (涡带/压力脉动); 无绝对锚
-    BPF_DRIFT: 42-48.5 Hz — 工况漂移宽峰; 无绝对锚 (频率由流动不稳定性决定)
-    BPF_LINE:  48.5-53 Hz — 转速锁定线 1×Z_r·f_rot; 绝对锚 49.995 Hz ±1.5
-    2xBPF:     90-105 Hz  — 二倍叶片通过频率, 尖峰, 极度稳定; 绝对锚 99.990 Hz ±1.5
+  保留节点 (3 物理节点; B4 的 4 节点拆分已于本轮撤回, 理由见下):
+    LOW_FREQ:  2-18 Hz   — 流动不稳定性 (涡带/压力脉动); 唯一软带; 无绝对锚
+    BPF:      40-53 Hz   — 叶片通过族: 41 Hz 流动峰 + 49.995 Hz 转速锁定线;
+                           无绝对锚 (带内有非锁频分量, 见 FreqRegion 注释)
+    2xBPF:    90-105 Hz  — 二倍叶片通过频率, 尖峰; 绝对锚 99.990 Hz ±1.5
+
+  为什么撤回 B4 拆分:
+    B4 把 42-55 Hz 拆成 BPF_DRIFT / BPF_LINE, 理由是"一个标量 σ_i 不能既挤
+    窄线又留宽峰"。实测推翻了这个前提 —— 两段各自单帧本征展宽只有 0.686 /
+    0.584 Hz, 都是窄带脊线, 拆分并不解决 σ 的分配问题。真正的后果是:
+      (a) 41 Hz 主峰掉出 BPF_DRIFT 左界 [42, 48.5), 该带内 IF 描述的是
+          46-47 Hz 的次峰, 与 FFT 主峰不符;
+      (b) 两段 w_i / σ_i 不同 (0.85 vs 0.98), 在 48.5 Hz 接缝两侧形成
+          不同的背景抽取比例 → 垂直梳状毛刺;
+      (c) 41-50 Hz 整段被一个偏宽的核摊平, 峰值低于 100 Hz, 造成色阶反转。
+    合并成 [40, 53) 后整段只有一个 w_i/σ_i, 41 Hz 与 50 Hz 落在同一带内,
+    各自按自身 IF 重排 —— 既没有接缝, 也不再有"用 46 Hz 的 IF 代表 41 Hz"。
 
   频带划分 (统一由 region_weights 实现, 全仓库单一真源):
-    区间语义为左闭右开 [f_min, f_max); 共享内部边 (BPF_DRIFT|BPF_LINE 的
-    48.5 Hz) 两侧用互补升余弦过渡带 (±SOFT_SPLIT_HZ) 构成**单位分解**,
-    既消除旧实现"两端皆闭 → 48.0 Hz 被两个区域双计"的问题, 又消除旧边界
-    压在漂移峰右翼造成的**单峰劈裂伪峰** (实测: 空转 BPF_LINE 带内
-    E峰f = 48.000 Hz, 且其 presence_e = 0.317 反常地成为全类最高)。
+    区间语义为左闭右开 [f_min, f_max)。3 节点后三带**互不相邻**
+    ([2,18) [40,53) [90,105)), 不再有共享内部边, 故 SOFT_SPLIT_HZ 的
+    单位分解过渡带在此配置下自动失效 (canon_split 为空), 全部退化为硬边界。
 
-  边: BPF_LINE → 2xBPF (r_nom=2.0, INTEGER_HARMONIC) — 唯一的确定性倍频关系
-      (只有锁转速的 BPF_LINE 才是 2xBPF 的基频; BPF_DRIFT 不参与倍频约束)
+  边: BPF → 2xBPF (r_nom=2.0, INTEGER_HARMONIC) — 唯一的确定性倍频关系
 
 IF 聚合 (A2 可微 node_if):
   if_hz 的观测值由"带内无权重中位数"改为"带内能量加权均值"——
@@ -76,6 +84,9 @@ N_RATED_RPM = 333.3
 Z_RUNNER = 9
 F_ROT_HZ = N_RATED_RPM / 60.0        # 5.5550 Hz
 F_BPF_ANCHOR = Z_RUNNER * F_ROT_HZ   # 49.995 Hz
+# ⚠ 本轮 3 节点合并后 **没有节点使用 F_BPF_ANCHOR**: BPF 带 [40,53) 同时装着
+#   非锁频的 41 Hz 流动峰与锁频的 50 Hz 线, 能量加权 node_if 必然落在两者之间,
+#   绝对锚会恒被违反。保留该常量是因为它是物理基准 (转速公式), 供脚本/测试引用。
 F_2XBPF_ANCHOR = 2.0 * Z_RUNNER * F_ROT_HZ   # 99.990 Hz
 
 
@@ -93,6 +104,21 @@ class FreqRegion:
     w_range_high: float # w_i 逐帧上界 (0-1, 防跳变到过高)
     f_anchor: Optional[float] = None    # 绝对频率锚 (Hz); None = 无绝对参考
     anchor_tol: float = 4.0             # 锚容差 (Hz), flat-bottom 半宽
+    # ── 缺席判定门限 (presence 的两个拐点) ──
+    # 缺席度 a = clamp((p_hi - e)/(p_hi - p_lo), 0, 1):
+    #   e >= p_hi → a = 0 (分量存在, 上界保持 w_range_high)
+    #   e <= p_lo → a = 1 (分量缺席, 上界收拢到 w_high_absent=0.20)
+    # p_hi <= 0 表示**该节点不启用缺席门控** (a≡0, 行为与修改前完全一致)。
+    # ⚠ 门限必须逐节点给, 不能用全局阈值: presence 的尺度是**压缩且节点相关**的,
+    #   实测 (3 节点 e15 ckpt, 5 类) presence 均值
+    #     LOW_FREQ 0.195/0.148/0.176/0.161/0.147
+    #     BPF      0.211/0.156/0.149/0.129/0.126   ← 空转**最高**, 与负荷反相
+    #     2xBPF    0.084/0.275/0.332/0.345/0.311   ← 空转最低, 与负荷同相
+    #   BPF 的 presence 与"是否加载"反相 (空转带内只有一条平坦的 48 Hz 漂移峰,
+    #   集中度反而高; 加载后 41 Hz 流动峰把能量摊开), 若对它门控会把**加载**工况
+    #   的上界压低、打掉硬挤压。故 BPF / LOW_FREQ 一律 p_hi=0 (不启用)。
+    p_absent_lo: float = 0.0            # 缺席端 (e <= lo → a = 1)
+    p_absent_hi: float = 0.0            # 存在端 (e >= hi → a = 0); 0 = 不启用
 
 
 PUMP_TURBINE_REGIONS: List[FreqRegion] = [
@@ -103,55 +129,49 @@ PUMP_TURBINE_REGIONS: List[FreqRegion] = [
     #     - >17 Hz 各工况均为平坦宽带 (PMR 0.8-1.5 dB), 无独立峰
     #   → 上界由 25 Hz 收到 18 Hz: 去掉纯宽带尾部, 避免 IF 中位数被抬到带中
     #   预期宽频, 中低持续性 (涡带仅部分工况显著)
-    #   w_range: [0.10, 0.45] — 保守, 宽核, 不锐化
+    #   w_range: [0.05, 0.35] — 保守, 宽核, 不锐化
     #   无绝对锚: 水力分量频率由流动不稳定性决定, 不锁定转速
     #   bw_expected 旧值 12.0 是错的: ridge_decay = exp(-(|f-if|/(2·bw))²/8),
     #   bw=12 使 ±24 Hz 内的 decay 恒 ≈ 0.90, 挤压参与因子在该节点内失效。
-    FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.30,  4.5, 0.50, 0.10, 0.45),
-    # BPF_DRIFT: 工况漂移**窄带脊线**, 42-48.5 Hz (B4 拆节点)
-    #   实测 (probe_node_if.py, 每类 12 样本): 带内能量峰在 46.4-47.7 Hz
-    #   (空转 46.417 / 低负荷 47.667 / 中负荷 47.583 / 高负荷 46.625 / 抽水 47.708);
-    #   组内 f 标准差 0.611 Hz, 跨工况中位漂移 46.39 (空转) → 47.85 (抽水),
-    #   与转速不成整数倍 (46.39 / 5.5550 = 8.35 阶) → 频率由流动不稳定性决定。
-    #   故: 无绝对锚, 不参与倍频约束。
-    #   ⚠ 旧注释曾把该分量归因于"空转 45.65% 转速 → 22.82 Hz", 该假设已被
-    #     实测证伪 (20-26 Hz 窗内为均匀噪声底, 能量占比仅 1.16%; 详见 docs §14.4)。
-    #   ⚠⚠ 分类修正 (本轮): 「频率随工况漂移」≠「单帧内是宽带」。
-    #     高分辨率 FFT / 单帧本征展宽实测仅 0.686 Hz, 与 2xBPF (0.650) /
-    #     BPF_LINE (0.584) 同量级 —— 它是**窄带调频脊线**, 而非 LOW_FREQ
-    #     (2.789 Hz) 那种弥散十几个 Hz 的宽带湍流云团。SST/MSST 的本职正是
-    #     把这类时变窄带分量压成清晰脊线, 因此旧设定把它划进 SOFT_F_TYPES
-    #     (低 w_i + 保留未重排 STFT 底座) 在原理上是错的, 直接后果是 40-50 Hz
-    #     糊成粗带, 且 48.5 Hz 交界处两侧背景抽取比例突变 → 垂直梳状毛刺。
-    #     → 本轮改回**脊线压缩带**: C_prior 0.30→0.70, w_range [0.10,0.50]→[0.60,0.85]。
-    #   w_range 的取法: 与 M=2 的软门控配合, w≥0.60 ⇒ r=2w≥1.2 ⇒
-    #     g_1 = clamp(r,0,1) = 1.0, 第 1 轮必然满参与 —— 即 100% 清掉
-    #     42-48.5 Hz 的原始 STFT 模糊底座, 把该分量压成平滑清晰的起伏脊线。
-    FreqRegion('BPF_DRIFT', 42.0, 48.5,  'BLADE_DRIFT',    0.70,  1.7, 0.60, 0.60, 0.85),
-    # BPF_LINE: 转速锁定线 1×BPF = Z_r·f_rot = 49.995 Hz, 48.5-53 Hz (B4 拆节点)
-    #   该线位置由转速唯一确定。与 50 Hz 电网频率仅差 0.005 Hz, 远低于 0.5 Hz
-    #   的频率分辨率, 二者数值上不可区分。
-    #   下界 48.5 Hz: 与 BPF_DRIFT 上界共享, 落在两个峰之间的谷 (~48.5 Hz),
-    #   而不是压在漂移峰右翼; 该位置也与 σ 分配的自然分割点
-    #   (node_if_DRIFT + node_if_LINE)/2 ≈ 48.45 Hz 一致。
-    #   拆开后不再与漂移宽峰共用一个 σ_i, 锚容差因此可以收紧到 ±1.5 Hz。
-    #   w_range: [0.65, 0.95] — 最信任, 极锐
-    FreqRegion('BPF_LINE',  48.5, 53.0,  'BLADE_PASS',     0.80,  1.0, 0.90, 0.65, 0.95,
-               f_anchor=F_BPF_ANCHOR, anchor_tol=1.5),
+    FreqRegion('LOW_FREQ',  2.0, 18.0,  'HYDRAULIC',       0.20,  4.5, 0.50, 0.05, 0.35),
+    # BPF: 叶片通过族, 40-53 Hz —— 41 Hz 流动峰 + 49.995 Hz 转速锁定线
+    #   下界 40 Hz 而非 42 Hz: FFT 实测 40-50 Hz 段的主峰在 41.0 Hz (class 2),
+    #   旧边界 42 Hz 把它整个排除在带外 —— 于是 BPF_DRIFT 的 node_if 描述的是
+    #   46-48 Hz 的次峰, 与 FFT 主峰不符, 且主峰所在的 40-42 Hz 得不到挤压。
+    #   上界 53 Hz: 覆盖 49.995 Hz 线 (与 50 Hz 电网频率差 0.005 Hz, 远低于
+    #   0.5 Hz 分辨率, 数值上不可区分)。
+    #   ⚠ 无绝对锚: 该带现在同时装着非锁频的 41 Hz 流动分量与锁频的 50 Hz 线,
+    #     能量加权的 node_if 落在两者之间 (≈43-46 Hz), 单个绝对锚不再有意义。
+    #     倍频关系仍由 BPF→2xBPF 的 r_nom=2.0 边表达 (诊断口径, 见 sast_losses)。
+    #   w_range [0.80, 0.98]: 硬带, 与 M=2 软门控配合 ⇒ r=2w≥1.6 ⇒ g_1=1.0,
+    #     第 1 轮 100% 清掉原始 STFT 底座, 把脊线压成与 Raw MSST 同等锐度。
+    #   bw_expected 3.0: 带内两条脊线 (41 / 50 Hz) 相距 9 Hz, 该值只用于
+    #     ridge_factor 的参与因子 (train_ridge 默认关), 取可比的两脊折中。
+    FreqRegion('BPF',       40.0, 53.0,  'BLADE_PASS',     0.90,  3.0, 0.90, 0.80, 0.98),
     # 2xBPF: 二倍叶片通过频率, 90-105 Hz
     #   预期窄带, 极高持续性
     #   实测: 带内能量峰 = 100.00 Hz (全部带负荷工况), 逐样本 f=100.10 Hz 标准差 0.000,
     #        空转时该分量消失 (过渡带口径 presence_e 0.074 vs 带负荷 0.238-0.256;
     #        旧硬矩形口径为 0.097 vs 0.319-0.343) → 确证为 2×BPF
     #   锚容差 ±1.5 Hz (紧): 该线位置由转速唯一确定, 不应漂移
-    #   w_range: [0.65, 0.90] — 最信任, 极锐
+    #   w_range: [0.80, 0.98] — 最信任, 极锐
     #   ⚠ bw_expected 4.5 直接取自 probe 的带内 IF 标准差 (五类 5.26/4.81/4.17/
     #     4.04/4.33 的均值 4.52): 该值被空转样本抬高 (空转此带无分量, 带内 IF 是
     #     纯噪声游走)。若只按"分量本身有多宽"标定, 应取更小的 ~2.0。取实测均值的
     #     理由是标定方法可复现 (论文口径统一); 代价是 53-90 Hz 空带内的参与因子
     #     由 ridge_floor(0.15) 抬到 ~0.39, 属可接受的松弛。
-    FreqRegion('2xBPF',    90.0, 105.0, 'BLADE_HARMONIC',  0.90,  4.5, 0.95, 0.65, 0.90,
-               f_anchor=F_2XBPF_ANCHOR, anchor_tol=1.5),
+    #   缺席门限 p_lo=0.13 / p_hi=0.17: 按**帧级**分布标定 (probe_absence_frames.py,
+    #     50 样本 × 2000 帧)。空转 2xBPF 逐帧 presence: 均值 0.092, p90 0.144;
+    #     加载 2xBPF: 均值 0.285-0.342, p10 0.199-0.232。候选门限网格的实测代价:
+    #       (lo,hi)      空转 a 均值 / 加载误判帧占比 (类1-4)
+    #       (0.10,0.20)   0.88 / 9% 6% 5% 7%
+    #       (0.13,0.17)   0.91 / 5% 2% 0% 2%     <- 取此
+    #       (0.14,0.19)   0.95 / 8% 5% 4% 6%
+    #     取 (0.13,0.17): 空转 91% 的帧判为缺席, 同时加载工况只有 0-5% 的帧
+    #     误判 (且那些帧的 a 很小, 上界仍 ≥0.9), 不会打掉加载工况的硬挤压。
+    FreqRegion('2xBPF',    90.0, 105.0, 'BLADE_HARMONIC',  0.90,  4.5, 0.95, 0.80, 0.98,
+               f_anchor=F_2XBPF_ANCHOR, anchor_tol=1.5,
+               p_absent_lo=0.13, p_absent_hi=0.17),
 ]
 
 # 节点数量
@@ -159,24 +179,19 @@ N_PHYSICS_NODES = len(PUMP_TURBINE_REGIONS)
 
 # "软"分量类型: **单帧内**真正弥散的宽带随机分量, 不该被鼓励集中/锐化.
 # RE_2D 熵对这类频段不惩罚 (保留展宽); 其余类型才罚.
-# ⚠ 本轮只保留 HYDRAULIC: LOW_FREQ 的涡带/压力脉动单帧本征展宽 2.789 Hz,
-#   是锁定带 (BPF_LINE 0.584 / 2xBPF 0.650) 的 4-6 倍 —— 硬挤压会把它撕裂成
-#   断续的虚假细丝。BLADE_DRIFT 已裁掉: 它单帧只有 0.686 Hz, 是窄带调频脊线,
-#   本来就该被压缩 (判据见 PUMP_TURBINE_REGIONS 里 BPF_DRIFT 的注释)。
+# 只保留 HYDRAULIC: LOW_FREQ 的涡带/压力脉动单帧本征展宽 2.789 Hz, 是锁定带
+# (BPF 0.584 / 2xBPF 0.650) 的 4-6 倍 —— 硬挤压会把它撕裂成断续的虚假细丝。
 SOFT_F_TYPES = ('HYDRAULIC',)
 
 
 # ── 节点 IF 估计的鲁棒化参数 (见 MSSTNodeExtractor 的聚合逻辑) ──
 # WHY: 区域 bin 的**频率位置**在带内, 不代表它的**IF 估计值**也在带内。
-#   实测 BPF_LINE [48.5,53) 的 bin 会被 MSST 固定点迭代拖到 40-46 Hz,
-#   使 node_if 在单样本内跑出 32.6-60.0 Hz (带本身只有 4.5 Hz 宽), 并经
-#   corr(w, IF)=+0.72 直接驱动 w_i 摆动 → 时频图抖。故按 IF **落点**再过滤一次。
-# 落点容差: IF 必须落在**本带**内才算本带分量。取 0 的理由: 四个频带
-# [2,18) [42,48.5) [48.5,53) [90,105) 是连续铺满的, "落在哪个带就是哪个带的
-# 分量"本身无歧义 (48.5 Hz 共享边两侧由 region_weights 的升余弦过渡带分摊),
-# 不存在双计或缝隙。实测 (hl=1024/num=1, 五类) 容差 1.0/0.5/0.0 下 BPF_LINE
-# 的 node_if 区间: [47.7,51.7] / [48.0,51.7] / [48.5,51.6] —— 只有 0 能让它
-# 严格不出带。
+#   MSST 的 IF 落在哪由相位导数决定, 弱分量/噪声 bin 的 IF 可游走到很远的频率;
+#   不筛的话 node_if 会在单样本内跑出 32-60 Hz (带本身只有十几 Hz 宽), 并经
+#   corr(w, IF) 直接驱动 w_i 摆动 → 时频图抖。故按 IF **落点**再过滤一次。
+# 落点容差取 0: IF 必须落在**本带**内才算本带分量。3 节点后三带为
+# [2,18) [40,53) [90,105), 带与带之间是空白 (不在任何带内的 bin 不参与挤压),
+# 故"IF 落在哪个带"无歧义, 不存在双计。
 IF_LANDING_TOL_HZ = 0.0
 IF_MIN_LANDED_BINS = 2      # 落点 bin 少于此数 → 视为该帧无分量, 走回退
 IF_SNR_FRAC = 0.05          # 带内加权能量 < 本样本中位数×该比例 → 低信噪帧, 走回退
@@ -224,8 +239,7 @@ def region_weights(freqs, regions: Optional[List[FreqRegion]] = None,
     返回类型与 freqs 一致。
 
     规则:
-      1. 区间语义统一为左闭右开 [f_min, f_max)。旧实现两端皆闭, 使 48.0 Hz
-         同时落入 BPF_DRIFT 与 BPF_LINE (双计)。
+      1. 区间语义统一为左闭右开 [f_min, f_max)。
       2. 若 regions[i].f_max == regions[i+1].f_min (共享内部边 b), 则两侧在
          [b-h, b+h] (h = soft_split_hz) 上用互补升余弦过渡:
              w_upper(f) = raised_cosine((f - (b-h)) / 2h)
@@ -233,12 +247,10 @@ def region_weights(freqs, regions: Optional[List[FreqRegion]] = None,
          故 w_lower + w_upper ≡ 1 于整个过渡带 —— **单位分解**, 带能量既不
          重复也不丢失, Σ_n E_n = E_total 成立 (compute_V_obs 的比例运算依赖
          此性质; 若两侧各自独立软窗则需额外重归一化)。
-      3. 间隙侧边界 (18/42、53/90) 无相邻区域, 保持硬 0/1。
-      4. 外缘不加过渡带的理由: 抽水/中负荷真实漂移峰实测达 E峰f = 47.583~
-         47.708 Hz, 若在 BPF_DRIFT 上沿加对称软窗会削掉真实信号。**漂移翼瓣
-         泄漏是单向的** (σ_drift ∈ [1.75, 2.75] bin 即 std 0.875-1.375 Hz,
-         单个 46.9 Hz 源在 σ=2.75 时 18.0% 能量越过 48 Hz; 而 σ_line ∈
-         [0.625, 1.375] bin 几乎不左漏), 故软化只加在这条内部共享边上。
+      3. 间隙侧边界 (18/40、53/90) 无相邻区域, 保持硬 0/1。
+      4. **本机制在当前 3 节点定义下是空转的**: [2,18) [40,53) [90,105) 两两
+         不相邻, canon_split 为空, 所有边界都退化为硬 0/1。保留实现是为兼容
+         调用方的参数, 并避免将来若重新引入相邻带时又要重写一遍。
 
     Args:
         freqs: [F] 频率轴 (Hz)
@@ -424,14 +436,18 @@ class MSSTNodeExtractor:
     Args:
         fs:           采样率 (Hz)
         freq_regions: 频率区域定义列表
-        msst_hlength: MSST 窗长 (默认 round(N/8))
-        msst_num:     MSST 迭代次数 (默认 3)
+        msst_hlength: MSST 窗长 (默认 1024, 与 SastConfig.msst_hlength 一致)
+        msst_num:     MSST 迭代次数 (默认 1, 与 SastConfig.msst_num 一致)
+
+    ⚠ 默认值必须与 SastConfig 一致: 旧默认是 num=3 / hlength=None(=N/8=250),
+      而模型走的是 config 的 1 / 1024 —— 任何"只实例化 extractor"的脚本
+      (如 build_static_prototypes) 都会静默用另一套口径算节点特征。
     """
 
     def __init__(self, fs: float = 1000.0,
                  freq_regions: Optional[List[FreqRegion]] = None,
-                 msst_hlength: Optional[int] = None,
-                 msst_num: int = 3):
+                 msst_hlength: Optional[int] = 1024,
+                 msst_num: int = 1):
         self.fs = fs
         self.regions = freq_regions if freq_regions is not None else PUMP_TURBINE_REGIONS
         self.N_nodes = len(self.regions)

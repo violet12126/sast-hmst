@@ -1,0 +1,51 @@
+Loaded SAST checkpoint: sast_checkpoints/3node_e15/sast_v3_e015.pt
+  d_h=96, n_heads=4, n_layers=2
+  fs=1000 Hz, F_bins=1000
+  C_prior: [0.17832729 0.9091346  0.9092123 ]
+Physics Graph: Heterogeneous Pump-Turbine Structure
+============================================================
+Nodes (4):
+  [0] OP (virtual)
+  [1] LOW_FREQ (physical)
+  [2] BPF (physical)
+  [3] 2xBPF (physical)
+
+Edges (10):
+            OP → LOW_FREQ                w=0.60  [CONDITION]
+            OP → BPF                     w=0.60  [CONDITION]
+            OP → 2xBPF                   w=0.60  [CONDITION]
+      LOW_FREQ → BPF                     w=0.15  [DRIFT]
+           BPF → LOW_FREQ                w=0.15  [DRIFT]
+           BPF → 2xBPF            r=2.0  w=0.80  [INTEGER_HARMONIC]
+      LOW_FREQ → 2xBPF                   w=0.25  [ENERGY_COMPETITION]
+         2xBPF → LOW_FREQ                w=0.25  [ENERGY_COMPETITION]
+           BPF → 2xBPF                   w=0.20  [ENERGY_COMPETITION]
+         2xBPF → BPF                     w=0.20  [ENERGY_COMPETITION]
+
+Design notes:
+  - OP: virtual node, soft-matched from 5 static prototypes (EDA)
+  - 3 physical nodes: LOW_FREQ / BPF / 2xBPF (B4 的 BPF 拆分已撤回)
+  - CONDITION edges: broadcast operating context to frequency nodes
+  - DRIFT edges: energy coupling (vortex <-> blade-pass modulation), non-harmonic
+  - HARMONIC edge: BPF → 2×BPF (r=2.0), sole deterministic relationship;
+    r_obs 在合并带上是带内能量加权 IF 的比值, class 2 读到 ≈2.2 (诊断口径)
+  - No self-loops; no classifier-based condition prediction
+真实样本: class 1, idx=4876
+
+低频带 (真实数据)  (带 = 0.5-25.0 Hz)
+method                        Rényi(全带)         带内有效带宽        峰值集中度
+--------------------------------------------------------------------
+STFT (无挤压)                        16.62       18.59 Hz        7.1%
+MSST num=4 (硬挤压)                  12.48       10.26 Hz       11.1%
+SAST (自适应挤压)                      13.85       16.32 Hz        9.7%
+[Plot] results\squeeze_tradeoff_3node\lowfreq_loss.png
+
+宽带 (合成信号)  (带 = 120.0-180.0 Hz)
+method                        Rényi(全带)         带内有效带宽        峰值集中度
+--------------------------------------------------------------------
+STFT (无挤压)                        17.23       56.87 Hz        1.6%
+MSST num=4 (硬挤压)                  13.26       34.39 Hz        6.3%
+SAST (自适应挤压)                      13.98       54.56 Hz        2.0%
+[Plot] results\squeeze_tradeoff_3node\broadband_distortion.png
+
+输出目录: results\squeeze_tradeoff_3node

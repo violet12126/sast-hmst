@@ -1,0 +1,429 @@
+{
+  "ckpt": "sast_checkpoints/3node_e15/sast_v3_e015.pt",
+  "N": 1160,
+  "class_dist": [
+    38,
+    324,
+    116,
+    615,
+    67
+  ],
+  "nodes": [
+    "LOW_FREQ",
+    "BPF",
+    "2xBPF"
+  ],
+  "edge_retrain": "zero-shot 掩码 (不重训)",
+  "metric1_cos_sim": {
+    "B1": {
+      "LOW_FREQ": 0.6556
+    },
+    "B2": {
+      "LOW_FREQ": 0.5112
+    },
+    "B3": {
+      "LOW_FREQ": 0.9958
+    },
+    "B4": {
+      "LOW_FREQ": 0.9991
+    },
+    "B5a": {
+      "LOW_FREQ": 0.9997
+    },
+    "B5b": {
+      "LOW_FREQ": 0.9973
+    },
+    "Proposed": {
+      "LOW_FREQ": 0.999
+    }
+  },
+  "metric1_top1_frac": {
+    "B1": {
+      "LOW_FREQ": 0.2219
+    },
+    "B2": {
+      "LOW_FREQ": 0.316
+    },
+    "B3": {
+      "LOW_FREQ": 0.0792
+    },
+    "B4": {
+      "LOW_FREQ": 0.0796
+    },
+    "B5a": {
+      "LOW_FREQ": 0.0801
+    },
+    "B5b": {
+      "LOW_FREQ": 0.0791
+    },
+    "Proposed": {
+      "LOW_FREQ": 0.0796
+    }
+  },
+  "metric1_raw_self_cos": {
+    "LOW_FREQ": 1.0
+  },
+  "metric1c_hard_renyi": {
+    "B1": {
+      "BPF": 9.4003,
+      "2xBPF": 8.261,
+      "mean": 8.8306
+    },
+    "B2": {
+      "BPF": 8.9723,
+      "2xBPF": 8.0302,
+      "mean": 8.5012
+    },
+    "B3": {
+      "BPF": 9.3486,
+      "2xBPF": 8.4393,
+      "mean": 8.894
+    },
+    "B4": {
+      "BPF": 10.4149,
+      "2xBPF": 9.9245,
+      "mean": 10.1697
+    },
+    "B5a": {
+      "BPF": 9.3076,
+      "2xBPF": 8.1502,
+      "mean": 8.7289
+    },
+    "B5b": {
+      "BPF": 9.0296,
+      "2xBPF": 8.0723,
+      "mean": 8.551
+    },
+    "Proposed": {
+      "BPF": 8.9951,
+      "2xBPF": 8.0426,
+      "mean": 8.5188
+    }
+  },
+  "metric1c_hard_std_hz": {
+    "B1": {
+      "BPF": 2.6426,
+      "2xBPF": 1.9591,
+      "mean": 2.3008
+    },
+    "B2": {
+      "BPF": 2.566,
+      "2xBPF": 1.8965,
+      "mean": 2.2312
+    },
+    "B3": {
+      "BPF": 2.5927,
+      "2xBPF": 1.9234,
+      "mean": 2.258
+    },
+    "B4": {
+      "BPF": 2.8899,
+      "2xBPF": 2.2633,
+      "mean": 2.5766
+    },
+    "B5a": {
+      "BPF": 2.5938,
+      "2xBPF": 1.9083,
+      "mean": 2.2511
+    },
+    "B5b": {
+      "BPF": 2.5736,
+      "2xBPF": 1.9032,
+      "mean": 2.2384
+    },
+    "Proposed": {
+      "BPF": 2.5698,
+      "2xBPF": 1.8996,
+      "mean": 2.2347
+    }
+  },
+  "metric2": {
+    "B1": {
+      "1nn_acc": 0.8793,
+      "fisher": 0.4496
+    },
+    "B2": {
+      "1nn_acc": 0.8569,
+      "fisher": 0.365
+    },
+    "B3": {
+      "1nn_acc": 0.8733,
+      "fisher": 0.6864
+    },
+    "B4": {
+      "1nn_acc": 0.8707,
+      "fisher": 0.6936
+    },
+    "B5a": {
+      "1nn_acc": 0.8733,
+      "fisher": 0.6919
+    },
+    "B5b": {
+      "1nn_acc": 0.8724,
+      "fisher": 0.6796
+    },
+    "Proposed": {
+      "1nn_acc": 0.8741,
+      "fisher": 0.6962
+    }
+  },
+  "metric2_moments": {
+    "B1": {
+      "1nn_acc": 0.8405,
+      "fisher": 1.1918
+    },
+    "B2": {
+      "1nn_acc": 0.8233,
+      "fisher": 1.1201
+    },
+    "B3": {
+      "1nn_acc": 0.8655,
+      "fisher": 0.7543
+    },
+    "B4": {
+      "1nn_acc": 0.8793,
+      "fisher": 0.755
+    },
+    "B5a": {
+      "1nn_acc": 0.875,
+      "fisher": 0.7521
+    },
+    "B5b": {
+      "1nn_acc": 0.8664,
+      "fisher": 0.7437
+    },
+    "Proposed": {
+      "1nn_acc": 0.875,
+      "fisher": 0.762
+    }
+  },
+  "metric3_idle_pmr": {
+    "B1": 4.0463,
+    "B2": 5.424,
+    "B3": 4.4266,
+    "B4": 1.7323,
+    "B5a": 5.2893,
+    "B5b": 5.2807,
+    "Proposed": 5.3273
+  },
+  "metric3_idle_n": 38,
+  "w_stats": {
+    "B1": null,
+    "B2": {
+      "node_mean": {
+        "LOW_FREQ": 1.0,
+        "BPF": 1.0,
+        "2xBPF": 1.0
+      },
+      "class_mean": {
+        "空转": {
+          "LOW_FREQ": 1.0,
+          "BPF": 1.0,
+          "2xBPF": 1.0
+        },
+        "低负荷": {
+          "LOW_FREQ": 1.0,
+          "BPF": 1.0,
+          "2xBPF": 1.0
+        },
+        "中负荷": {
+          "LOW_FREQ": 1.0,
+          "BPF": 1.0,
+          "2xBPF": 1.0
+        },
+        "高负荷": {
+          "LOW_FREQ": 1.0,
+          "BPF": 1.0,
+          "2xBPF": 1.0
+        },
+        "抽水": {
+          "LOW_FREQ": 1.0,
+          "BPF": 1.0,
+          "2xBPF": 1.0
+        }
+      },
+      "delta_w_BPF": 0.0,
+      "hard_mean": 1.0
+    },
+    "B3": {
+      "node_mean": {
+        "LOW_FREQ": 0.2,
+        "BPF": 0.9,
+        "2xBPF": 0.9
+      },
+      "class_mean": {
+        "空转": {
+          "LOW_FREQ": 0.2,
+          "BPF": 0.9,
+          "2xBPF": 0.9
+        },
+        "低负荷": {
+          "LOW_FREQ": 0.2,
+          "BPF": 0.9,
+          "2xBPF": 0.9
+        },
+        "中负荷": {
+          "LOW_FREQ": 0.2,
+          "BPF": 0.9,
+          "2xBPF": 0.9
+        },
+        "高负荷": {
+          "LOW_FREQ": 0.2,
+          "BPF": 0.9,
+          "2xBPF": 0.9
+        },
+        "抽水": {
+          "LOW_FREQ": 0.2,
+          "BPF": 0.9,
+          "2xBPF": 0.9
+        }
+      },
+      "delta_w_BPF": 0.0,
+      "hard_mean": 0.9
+    },
+    "B4": {
+      "node_mean": {
+        "LOW_FREQ": 0.0948,
+        "BPF": 0.2006,
+        "2xBPF": 0.3539
+      },
+      "class_mean": {
+        "空转": {
+          "LOW_FREQ": 0.104,
+          "BPF": 0.2629,
+          "2xBPF": 0.1467
+        },
+        "低负荷": {
+          "LOW_FREQ": 0.0918,
+          "BPF": 0.2144,
+          "2xBPF": 0.3251
+        },
+        "中负荷": {
+          "LOW_FREQ": 0.1018,
+          "BPF": 0.1932,
+          "2xBPF": 0.3625
+        },
+        "高负荷": {
+          "LOW_FREQ": 0.095,
+          "BPF": 0.1927,
+          "2xBPF": 0.381
+        },
+        "抽水": {
+          "LOW_FREQ": 0.09,
+          "BPF": 0.1839,
+          "2xBPF": 0.3471
+        }
+      },
+      "delta_w_BPF": 0.079,
+      "hard_mean": 0.2773
+    },
+    "B5a": {
+      "node_mean": {
+        "LOW_FREQ": 0.0607,
+        "BPF": 0.8992,
+        "2xBPF": 0.944
+      },
+      "class_mean": {
+        "空转": {
+          "LOW_FREQ": 0.0609,
+          "BPF": 0.9724,
+          "2xBPF": 0.9672
+        },
+        "低负荷": {
+          "LOW_FREQ": 0.06,
+          "BPF": 0.79,
+          "2xBPF": 0.9662
+        },
+        "中负荷": {
+          "LOW_FREQ": 0.0608,
+          "BPF": 0.9011,
+          "2xBPF": 0.9347
+        },
+        "高负荷": {
+          "LOW_FREQ": 0.0611,
+          "BPF": 0.9711,
+          "2xBPF": 0.9312
+        },
+        "抽水": {
+          "LOW_FREQ": 0.061,
+          "BPF": 0.7228,
+          "2xBPF": 0.9572
+        }
+      },
+      "delta_w_BPF": 0.2496,
+      "hard_mean": 0.9216
+    },
+    "B5b": {
+      "node_mean": {
+        "LOW_FREQ": 0.1635,
+        "BPF": 0.9616,
+        "2xBPF": 0.9606
+      },
+      "class_mean": {
+        "空转": {
+          "LOW_FREQ": 0.1942,
+          "BPF": 0.9677,
+          "2xBPF": 0.9656
+        },
+        "低负荷": {
+          "LOW_FREQ": 0.1502,
+          "BPF": 0.9594,
+          "2xBPF": 0.9641
+        },
+        "中负荷": {
+          "LOW_FREQ": 0.1756,
+          "BPF": 0.9639,
+          "2xBPF": 0.9614
+        },
+        "高负荷": {
+          "LOW_FREQ": 0.1604,
+          "BPF": 0.9616,
+          "2xBPF": 0.9576
+        },
+        "抽水": {
+          "LOW_FREQ": 0.2174,
+          "BPF": 0.9645,
+          "2xBPF": 0.9669
+        }
+      },
+      "delta_w_BPF": 0.0082,
+      "hard_mean": 0.9611
+    },
+    "Proposed": {
+      "node_mean": {
+        "LOW_FREQ": 0.1057,
+        "BPF": 0.9799,
+        "2xBPF": 0.98
+      },
+      "class_mean": {
+        "空转": {
+          "LOW_FREQ": 0.0485,
+          "BPF": 0.9801,
+          "2xBPF": 0.9732
+        },
+        "低负荷": {
+          "LOW_FREQ": 0.1065,
+          "BPF": 0.9803,
+          "2xBPF": 0.9803
+        },
+        "中负荷": {
+          "LOW_FREQ": 0.1052,
+          "BPF": 0.9798,
+          "2xBPF": 0.9802
+        },
+        "高负荷": {
+          "LOW_FREQ": 0.1087,
+          "BPF": 0.9796,
+          "2xBPF": 0.9802
+        },
+        "抽水": {
+          "LOW_FREQ": 0.1081,
+          "BPF": 0.9803,
+          "2xBPF": 0.9802
+        }
+      },
+      "delta_w_BPF": 0.0007,
+      "hard_mean": 0.9799
+    }
+  }
+}

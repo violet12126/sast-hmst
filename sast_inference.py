@@ -18,6 +18,11 @@ def _masked_tfr(result):
 
     与 total_sast_loss 里的掩码同源 (physics_band_mask), 保证验证指标与训练
     优化的输入分布一致 —— 否则训练时编码器看带内、验证时看全带, 指标会失真。
+
+    ⚠ 这里**有意**用 tfr_enhanced 而不是 tfr_calibrated: FreqEncoder 的
+    supcon 是在未标定的增强谱上训出来的, 换标定版会让输入分布按带改变
+    (LOW≈1x / BPF≈6.1x 的反向), KNN/质心指标随之失真。标定版只面向
+    可视化与下游分类, 不进编码器。
     """
     tfr, freqs = result['tfr_enhanced'], result['freqs']
     return tfr * physics_band_mask(freqs).to(tfr.dtype).view(1, -1, 1)
@@ -53,7 +58,11 @@ def infer_sast(model: SAST, x, return_all: bool = False) -> Dict[str, np.ndarray
             out[k] = v
 
     if not return_all:
-        return {'tfr_enhanced': out['tfr_enhanced']}
+        # 两个口径都给出: tfr_enhanced = 损失/编码器看到的那份 (重排后原样),
+        # tfr_calibrated = 除以主瓣增益后的那份 (与原始 STFT 同幅度标尺)。
+        # 可视化 / 下游 CNN / SHAP 用后者; 与 FreqEncoder 有关的计算用前者。
+        return {k: out[k] for k in ('tfr_enhanced', 'tfr_calibrated')
+                if k in out}
     return out
 
 

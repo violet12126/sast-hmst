@@ -1036,9 +1036,78 @@ class SAST(nn.Module):
             N_max=n_sqz_max,
         )
 
+        # ── 幅度标定 (输出边界, 与学习无关) ──
+        # 重排核是 Z 归一化的高斯: k ↦ exp(-k²/2σ²) / Z(σ),
+        # Z(σ) = Σ_{k=-K..K} exp(-k²/2σ²), K = ceil(kernel_radius·sigma_max)。
+        # 因此单音经一轮重排后的峰值 = 主瓣质量 / Z(σ), 增益 ≈ W_main/Z(σ)。
+        # W_main 由**实际使用的窗**全谱求和得到 (见 _window_mainlobe_mass),
+        # 不含任何拟合常数; 仅用 Z 与 kernel 同口径的 ±K 截断半径。
+        self.msst_hlength = msst_hlength
+        self.K_pre = int(np.ceil(self.reassigner.kernel_radius
+                                 * self.reassigner.sigma_max))
+        self._w_main_cache: Dict[int, float] = {}
+
     def _extract_nodes_single(self, x_np: np.ndarray) -> NodeFeatures:
         """对单条信号运行 MSST + 节点特征提取 (CPU, numpy)."""
         return self.node_extractor(x_np)
+
+    def _window_mainlobe_mass(self, N: int) -> float:
+        """W_main = Σ_η |H(η)| / |H(0)| —— 窗主瓣吸引盆的等效 bin 数。
+
+        与 `models.tfr.msst` 的窗构造**逐位一致** (高斯窗 exp(-π t²/0.32²),
+        t ∈ [-0.5, 0.5], 长度取奇数), 按同一 `indices = (N+tau) % N` 放置后
+        做 N 点 FFT。对**全谱**求和 (含正负频率的镜像): 重排核在 ω̂±K 上
+        对称收拢整个主瓣, 与只取正频率半边不是一回事。
+
+        N=2000 / hlength=1024 时给出 6.109 (解析高斯和 6.098, 差异来自
+        窗尾在 ±0.5 处的硬截断)。按 N 缓存, 每个模型只算一次。
+        """
+        if N in self._w_main_cache:
+            return self._w_main_cache[N]
+        hl = self.msst_hlength if self.msst_hlength is not None else min(N, 512)
+        hl = hl + 1 - (hl % 2)              # MATLAB: hlength+1-rem(hlength,2)
+        ht = np.linspace(-0.5, 0.5, hl)
+        h = np.exp(-np.pi / 0.32 ** 2 * ht ** 2)
+        Lh = (hl - 1) // 2
+        buf = np.zeros(N, dtype=np.float64)
+        tau = np.arange(-Lh, Lh + 1)
+        buf[(N + tau) % N] = h[Lh + tau]
+        mag = np.abs(np.fft.fft(buf))
+        w_main = float(mag.sum() / mag[0])
+        self._w_main_cache[N] = w_main
+        return w_main
+
+    def _amplitude_calibration(self, w_bin: torch.Tensor,
+                              sigma_bin: torch.Tensor,
+                              band_support: torch.Tensor) -> torch.Tensor:
+        """逐 bin 峰值增益 γ, 用于把 tfr_enhanced 还原到原始 STFT 幅度标尺。
+
+            γ = (1 − g₁) + g₁ · max(1, W_main / Z(σ))
+            g₁ = clamp(w_bin · M, 0, 1)        (第 1 轮门控 = 实际参与度)
+
+        物理含义: g₁=0 的 bin (w 小或带外) 完全没被重排, γ=1; g₁=1 的 bin
+        的峰值被核摊成「主瓣质量 / Z」, 除以该增益即回到原幅度。σ 越大 Z
+        越大 → 增益越小, max(1,·) 保证不放大 (软化只会展宽, 不会增峰)。
+
+        该增益是**纯前向诊断量**, 梯度不参与标定 (调用方 detach)。
+
+        Args:
+            w_bin:        [B, F, T] 逐 bin IF 可信度 (已带外归零)
+            sigma_bin:    [B, F, T] 逐 bin 核宽 (bin)
+            band_support: [F] bool 物理区域支撑掩码
+        Returns:
+            gamma:        [B, F, T] 带外恒为 1
+        """
+        sig = sigma_bin.detach().clamp(self.sigma_min, self.sigma_max)
+        k = torch.arange(-self.K_pre, self.K_pre + 1,
+                         device=sig.device, dtype=sig.dtype)
+        Z = torch.exp(-0.5 * (k / sig.unsqueeze(-1)) ** 2).sum(-1)  # [B,F,T]
+        w_main = self._window_mainlobe_mass(2 * sigma_bin.shape[1])  # N = 2·F_bins
+        gain = (w_main / Z).clamp(min=1.0)
+        g1 = (w_bin.detach() * self.n_sqz_max).clamp(0.0, 1.0)
+        gamma = (1.0 - g1) + g1 * gain
+        support = band_support.to(gamma.dtype).view(1, -1, 1)
+        return 1.0 + (gamma - 1.0) * support
 
     def forward(self, x: torch.Tensor,
                 training: bool = True,
@@ -1267,6 +1336,15 @@ class SAST(nn.Module):
             w_bin=w_bin, M=self.n_sqz_max, gate_mode=self.gate_mode,
         )
 
+        # ── 输出边界幅度标定 (1 + 3 版) ──
+        # tfr_enhanced **原样**喂给损失 (RE_2D / soft_ent / 锚点 / 谐波比) 与
+        # FreqEncoder —— 那些项都是**带内相对**形状指标, 且各节点增益不同
+        # (LOW_FREQ γ≈1, BPF/2xBPF γ≈6.1), 就地除会变成 1:6 的带间重新加权,
+        # 属于语义变更。因此标定只加在**输出边界**: 额外给出一份与原始 STFT
+        # 同一幅度标尺的 TFR, 供可视化 / 下游 CNN / SHAP 使用。
+        gamma_map = self._amplitude_calibration(w_bin, sigma_sq, band_support)
+        tfr_calibrated = tfr_enhanced / gamma_map.detach().clamp(min=1.0)
+
         # ── MSST 硬挤压 (可视化对比基准) ──
         # 与 reassigner 共用 omega_final (omegas[:,-1]), 唯一区别:
         # 硬挤压 (单点 scatter) vs 软高斯重排 (sigma 控宽). 不参与反传.
@@ -1280,6 +1358,9 @@ class SAST(nn.Module):
         # ── 输出 ──
         result = {
             'tfr_enhanced': tfr_enhanced,
+            # 与 tfr_raw 同幅度标尺的增强谱 (tfr_enhanced / γ)。可视化/下游 CNN/
+            # SHAP 用它; 损失函数仍用 tfr_enhanced (见上方注释)。
+            'tfr_calibrated': tfr_calibrated,
             'tfr_raw': tfr_mag,
             'tfr_msst': tfr_msst,       # [B, F, T] MSST 硬挤压 (对比基准)
             'w_i': w_i,
@@ -1317,9 +1398,13 @@ class SAST(nn.Module):
         return result
 
     def get_freq_features(self, x: torch.Tensor) -> torch.Tensor:
-        """DCMR 桥接: 时间池化 SAST TFR -> 增强频域特征."""
+        """DCMR 桥接: 时间池化 SAST TFR -> 增强频域特征.
+
+        用 tfr_calibrated (与原始 STFT 同幅度标尺): 否则 BPF 节点的 6.1x
+        增益会压过 LOW_FREQ, 池化后的频域特征只剩两谐波带。
+        """
         out = self.forward(x)
-        tfr = out['tfr_enhanced']
+        tfr = out['tfr_calibrated']
         freq_feat = tfr.mean(dim=-1) + tfr.max(dim=-1).values
         return freq_feat
 

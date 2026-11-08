@@ -192,7 +192,10 @@ def main():
         features = []
         for i in range(len(X)):
             result = infer_sast(model, X[i], return_all=True)
-            tfr = result['tfr_enhanced']
+            # 下游分类特征走**标定后**的 TFR (与原始 STFT 同幅度标尺):
+            # 未标定时 BPF/2xBPF 的脊线比 LOW_FREQ 高 6.1 倍, 时间池化后
+            # 频域特征被两条谐波带独占。
+            tfr = result['tfr_calibrated']
             freq_feat = tfr.mean(axis=-1) + tfr.max(axis=-1)
             features.append(freq_feat)
         feats = np.stack(features, axis=0)

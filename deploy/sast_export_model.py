@@ -89,7 +89,17 @@ def _estimate_if_export(tfr_complex: torch.Tensor, N: int) -> torch.Tensor:
     omega_cont = torch.diff(unwrapped, dim=-1) * N / (2.0 * math.pi)
     omega_cont = torch.cat([omega_cont, omega_cont[:, -1:]], dim=-1)
     # 保持 int64: ONNX 的 Clip/Sub 对 Python int 常量 (int32) 与 tensor 混用不做类型提升
-    return torch.round(omega_cont).to(torch.int64)
+    #
+    # ── 1-based bin, 0 = 无效 (与 models/msst_torch.py:estimate_if 逐行一致) ──
+    # 相位差分本身给的是 **0-based**: 47.0 Hz @ fs=1000/N=2000 恰好是 bin 94,
+    # 而 bin 94 就是 47.0 Hz。本文件所有消费者 (_extract_nodes_export 的
+    # `omega_f - 1.0`、_multi_round_reassign_export 的 `omega_final_r - 1.0`、
+    # reassigner kernel 的 `omega_hat_int + k`) 都按 1-based 取并 `- 1`,
+    # 所以这里不加 1 会让导出模型的脊线整体偏低 1 bin (0.5 Hz)。
+    # DC 行相位恒定, diff≈0 → +1 后会被误判为"有效"并把直流堆到 0 Hz,
+    # 故首行显式置 0; 用 cat 而非原地赋值, 保持 ONNX 可导出。
+    omega = torch.round(omega_cont).to(torch.int64) + 1
+    return torch.cat([torch.zeros_like(omega[:1]), omega[1:]], dim=0)
 
 
 def _refine_if_export(omega: torch.Tensor, neta: int, num: int):

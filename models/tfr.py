@@ -583,9 +583,19 @@ def msst(x, fs, hlength=None, num=3, save_trajectory=False):
         phase = np.unwrap(np.angle(tfr[i, :]))
         omega[i, :] = np.diff(phase) * N / (2.0 * np.pi)
 
-    # 末列填充 + 四舍五入到整数 bin (MATLAB: omega=round(omega))
+    # 末列填充 + 四舍五入到整数 bin
     omega = np.column_stack([omega, omega[:, -1]])
-    omega = np.round(omega).astype(np.int32)
+    # ── 索引约定: **1-based bin**, 0 = 无效 (与所有下游 `- 1` 的消费者一致) ──
+    # 相位差分给出的是 **0-based** bin: 47.0 Hz 在 fs=1000/N=2000 下是 bin 94,
+    # diff(phase)·N/2π 恰好也等于 94。早先这里直接把它当 1-based 存,
+    # 于是 reassigner 的 `(omega-1)`、`if_map=(omega-1)*fs/N`、`Ts[k-1]`
+    # 全体再减一格 —— 重排落点系统性偏低 1 bin (0.5 Hz)。实测: 47.0 Hz 纯音
+    # 的原始 STFT 峰在 bin 94, 而 MSST / SAST 的峰都在 bin 93 (46.5 Hz)。
+    # 加 1 后所有既有 `- 1` 消费者无需改动即恢复正确。
+    # row 0 (DC) 相位恒定, diff≈0 → 变 1 后被判为"有效", 会把直流堆到 0 Hz;
+    # 显式置 0 保持"0=无效"语义, 与改动前的 DC 行为逐位一致。
+    omega = np.round(omega).astype(np.int32) + 1
+    omega[0, :] = 0
 
     # ═══════════════════════════════════════════════════════════
     # Step 3: IF 迭代精化 (MSST 核心)

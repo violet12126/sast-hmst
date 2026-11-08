@@ -95,7 +95,11 @@ def estimate_if(tfr_complex: torch.Tensor, N: int) -> torch.Tensor:
     unwrapped = phase_unwrap(angle, dim=-1)
     omega_cont = torch.diff(unwrapped, dim=-1) * N / (2.0 * math.pi)
     omega_cont = torch.cat([omega_cont, omega_cont[:, -1:]], dim=-1)
-    return torch.round(omega_cont).to(torch.int32)
+    # 相位差分是 0-based bin, 但本函数契约是 1-based (0=invalid), 下游一律 `- 1`。
+    # 见 models/tfr.py:msst 同一处注释 (修复重排落点偏低 1 bin = 0.5 Hz)。
+    omega = torch.round(omega_cont).to(torch.int32) + 1
+    omega[0, :] = 0          # DC: 相位恒定, 保持"无效"
+    return omega
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -1078,8 +1078,10 @@ class SAST(nn.Module):
         return w_main
 
     def _amplitude_calibration(self, w_bin: torch.Tensor,
-                              sigma_bin: torch.Tensor,
-                              band_support: torch.Tensor) -> torch.Tensor:
+                              sigma_i: torch.Tensor,
+                              band_support: torch.Tensor,
+                              i_star: torch.Tensor,
+                              F_bins: int) -> torch.Tensor:
         """逐 bin 峰值增益 γ, 用于把 tfr_enhanced 还原到原始 STFT 幅度标尺。
 
             γ = (1 − g₁) + g₁ · max(1, W_main / Z(σ))
@@ -1093,16 +1095,25 @@ class SAST(nn.Module):
 
         Args:
             w_bin:        [B, F, T] 逐 bin IF 可信度 (已带外归零)
-            sigma_bin:    [B, F, T] 逐 bin 核宽 (bin)
+            sigma_i:      [B, N_phys, T] 逐节点核宽 (bin) —— **不是**逐 bin。
+                          逐 bin 的 σ 只是 σ_i[:, i_star, :] 的拷贝, 而 Z(σ) 对
+                          σ 的依赖是逐元素的; 在 [B,F,T] 上直接广播会建一个
+                          [B,F,T,2K+1] 张量 (B=10/F=1000/T=2000 时 3.8 亿元素
+                          ≈1.5 GB), 每次前向都分配, 8 GB 卡上会把训练拖到近乎
+                          停滞。σ 只有 N_phys 个不同值, 先在节点空间算再 gather,
+                          张量小 F_bins 倍, 数值逐位相同。
             band_support: [F] bool 物理区域支撑掩码
+            i_star:       [B, F, T] 每个 bin 归属的物理节点 (argmin 距离)
+            F_bins:       int 频点数 (用于由 N = 2·F_bins 取窗主瓣质量)
         Returns:
             gamma:        [B, F, T] 带外恒为 1
         """
-        sig = sigma_bin.detach().clamp(self.sigma_min, self.sigma_max)
+        sig = sigma_i.detach().clamp(self.sigma_min, self.sigma_max)  # [B,N_phys,T]
         k = torch.arange(-self.K_pre, self.K_pre + 1,
                          device=sig.device, dtype=sig.dtype)
-        Z = torch.exp(-0.5 * (k / sig.unsqueeze(-1)) ** 2).sum(-1)  # [B,F,T]
-        w_main = self._window_mainlobe_mass(2 * sigma_bin.shape[1])  # N = 2·F_bins
+        Z_node = torch.exp(-0.5 * (k / sig.unsqueeze(-1)) ** 2).sum(-1)  # [B,N,T]
+        Z = torch.gather(Z_node, 1, i_star)                              # [B,F,T]
+        w_main = self._window_mainlobe_mass(2 * F_bins)                  # N = 2·F_bins
         gain = (w_main / Z).clamp(min=1.0)
         g1 = (w_bin.detach() * self.n_sqz_max).clamp(0.0, 1.0)
         gamma = (1.0 - g1) + g1 * gain
@@ -1342,7 +1353,8 @@ class SAST(nn.Module):
         # (LOW_FREQ γ≈1, BPF/2xBPF γ≈6.1), 就地除会变成 1:6 的带间重新加权,
         # 属于语义变更。因此标定只加在**输出边界**: 额外给出一份与原始 STFT
         # 同一幅度标尺的 TFR, 供可视化 / 下游 CNN / SHAP 使用。
-        gamma_map = self._amplitude_calibration(w_bin, sigma_sq, band_support)
+        gamma_map = self._amplitude_calibration(w_bin, sigma_i, band_support,
+                                                i_star, F_bins)
         tfr_calibrated = tfr_enhanced / gamma_map.detach().clamp(min=1.0)
 
         # ── MSST 硬挤压 (可视化对比基准) ──

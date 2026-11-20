@@ -138,7 +138,8 @@ def renyi_2d_loss(tfr: torch.Tensor,
                    alpha: int = 2,
                    eps: float = 1e-8,
                    presence: Optional[torch.Tensor] = None,
-                   absence: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   absence: Optional[torch.Tensor] = None,
+                   presence_weight: bool = False) -> torch.Tensor:
     """
     Per-region 选择性 Renyi 2D 熵.
 
@@ -159,8 +160,10 @@ def renyi_2d_loss(tfr: torch.Tensor,
         regions: 物理节点频段 (默认 PUMP_TURBINE_REGIONS)
         alpha:   Renyi 阶数
         eps:     数值保护
-        presence: [B, N, T] 兼容旧路径 (按存在度线性加权)
+        presence: [B, N, T] 存在度。``presence_weight=True`` 时作为逐节点
+                  推力系数 (不归一化); 否则仅在无 absence 时作线性加权
         absence:  [B, N, T] 缺席度 (1=缺席), 缺席样本对本项无贡献
+        presence_weight: 是否用 presence 调制推力大小 (2026-11-14 加入)
 
     Returns:
         scalar (lower = HARMONIC 频段更集中; LOW_FREQ 不计入)
@@ -192,7 +195,17 @@ def renyi_2d_loss(tfr: torch.Tensor,
             # 旧的 `(h*w_p)/Σw_p` 是"加权平均", Σw_p 又把权重归一化回去 —— 实测
             # 空转 2xBPF (e=0.074) 的梯度只被压到 ~0.3 倍, 仍足以把 w_3 顶到 0.973。
             trust = (1.0 - absence[:, n, :]).mean(dim=-1).clamp(0.0, 1.0)   # [B]
-            h = (h * trust).sum() / trust.sum().clamp(min=eps)
+            if presence is not None and presence_weight:
+                # 存在度加权 (2026-11-14): 推力 ∝ 该带在未挤压谱上的浓度。
+                # 一阶平衡点 2λ_z·z_w,n* = −presence_n·∂RE_2D/∂z_w,n 因此
+                # 随带内信噪比自然分化: 高浓度锁频带逼近区间上界, 低浓度
+                # 带回落。**分母必须用 trust.sum() 而非 w_n.sum()** —— 用后者
+                # 权重又被归一化掉, 推力大小与存在度无关 (旧实现的教训)。
+                e_n = presence[:, n, :].mean(dim=-1).detach().clamp(0.0, 1.0)
+                w_n = trust * e_n
+            else:
+                w_n = trust
+            h = (h * w_n).sum() / trust.sum().clamp(min=eps)
         elif presence is not None:
             # 兼容旧路径: 按存在度线性加权 (无上界收拢语义, 消融时可复现)
             e_n = presence[:, n, :].mean(dim=-1).clamp(min=0.0)    # [B]
@@ -695,15 +708,22 @@ def node_presence(tfr_mag: torch.Tensor,
         w_in = w_in[m]                                   # [Fn]
         # 过渡带内的 bin 按 w<1 加权 (旧实现为两端皆闭的硬矩形)
         band = (tfr_mag[:, m, :] * w_in.view(1, -1, 1)).clamp(min=0.0)  # [B, Fn, T]
-        # 先沿时间轴平滑 0.2s (201 帧), 滤掉瞬时干涉暗斑与短命噪声团, 再算频域
-        # top-k 集中度。定频锁定线 (高负荷 2xBPF) 沿时间平均后峰仍尖 (presence→1);
+        # 沿**整段** 2.0s 做时间平均 (旧实现是 201 帧滑动窗), 再算频域 top-k
+        # 集中度。定频锁定线 (高负荷 2xBPF) 整段平均后峰仍尖 (presence→1);
         # 随机游走的噪声斑块 (空转 2xBPF) 被抹成平坦直线 (c≈p → presence→0)。
-        band = F.avg_pool1d(F.pad(band, (100, 100), mode='replicate'),
-                            kernel_size=201, stride=1)
+        #
+        # WHY 用整段而不是滑窗 (2026-11-14): 稳态样本里"100 Hz 谐波是否存在"
+        # 是整段样本的全局属性, 逐帧估计没有物理意义, 而且会出事 ——
+        # 空转 c0 的 2xBPF 滑动窗 presence p90 = 0.144, 正好卡在缺席门限
+        # [0.13, 0.17] 上: 样本内任意 0.3s 的噪声波动就能让 absence 从 1 跳到 0,
+        # 进而把饱和的 w_2xBPF 从低值甩到 0.98, 在时频图上切出矩形明暗块。
+        # 取整段均值后 presence/absence 在 2s 内是**常数**, 门控不会帧级抖动。
+        band = band.mean(dim=-1, keepdim=True)           # [B, Fn, 1]
         kk = min(max(1, int(math.ceil(frac * Fn))), Fn)
-        tot = band.sum(dim=1)                            # [B, T]
-        top = band.topk(kk, dim=1).values.sum(dim=1)     # [B, T]
+        tot = band.sum(dim=1)                            # [B, 1]
+        top = band.topk(kk, dim=1).values.sum(dim=1)     # [B, 1]
         c = top / tot.clamp(min=eps)
+        c = c.expand(-1, T)                              # 广播回整段, 逐帧恒定
         # 平坦谱基线: 权重最大的 kk 个 bin 的权重占比 (硬边界下 = kk / Fn)
         p = float(w_in.topk(kk).values.sum().item() /
                   w_in.sum().clamp(min=eps).item())

@@ -18,7 +18,9 @@ hmst_figures/
 
 # Data (large files)
 *.npz
-data/
+/data/
+# 注意: 必须是 /data/ —— 无锚点的 data/ 会把 scripts/data/ 整个目录一起忽略,
+# 导致 build_cnn_tfr_dataset.py 这类管道脚本从未进过版本库 (2026-11-20 修正)
 
 # IDE
 .vscode/
@@ -45,6 +47,16 @@ sast_trace.json
 # 可再生的探查输出 (由 scripts/ 重新生成)
 infer_out_v4/
 tfr_version_probe/
+
+# 生成物: 权重 / 数据集 / 诊断图 / 训练日志 (2026-11-20 补)
+cnn_checkpoints*/
+cnn_tfr_dataset*/
+infer_out_*/
+results/
+logs/
+manifest_*.csv
+*.docx
+*.pdf
 
 # Word 临时/锁定文件
 ~$*
